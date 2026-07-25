@@ -7,6 +7,11 @@ REST API, handling authentication and error responses.
 
 import requests
 from typing import Dict, Any, Optional, List
+from urllib.parse import quote
+
+
+# TrueNAS reports and accepts volsize in bytes; Cinder works in GB.
+GIB = 1024 ** 3
 
 
 class TrueNASClient:
@@ -79,11 +84,31 @@ class TrueNASClient:
         """
         return self._make_request("GET", "/pool")
 
+    @staticmethod
+    def _dataset_id(pool: str, name: str) -> str:
+        """
+        Build the URL-encoded dataset identifier for a zvol.
+
+        TrueNAS addresses datasets by their full ZFS path, with the separator
+        percent-encoded: ``tank/vol1`` becomes ``tank%2Fvol1``. Nested names
+        encode every separator, so ``tank`` + ``proxmox/vm-100`` becomes
+        ``tank%2Fproxmox%2Fvm-100``.
+
+        Args:
+            pool: Pool name
+            name: Zvol name, which may itself contain '/'
+
+        Returns:
+            Percent-encoded dataset identifier
+        """
+        return quote(f"{pool}/{name}", safe="")
+
     def create_zvol(
         self,
         pool: str,
         name: str,
-        size_bytes: int,
+        size_gb: int,
+        sparse: bool = True,
         **kwargs
     ) -> Dict[str, Any]:
         """
@@ -92,27 +117,100 @@ class TrueNASClient:
         Args:
             pool: Name of the pool to create the zvol in
             name: Name for the zvol
-            size_bytes: Size of the zvol in bytes
-            **kwargs: Additional zvol properties
+            size_gb: Size of the zvol in GB
+            sparse: Whether to thin-provision the zvol (default True)
+            **kwargs: Additional dataset properties
 
         Returns:
             Information about the created zvol
         """
         payload = {
             "name": f"{pool}/{name}",
-            "volsize": size_bytes,
+            "type": "VOLUME",
+            "volsize": size_gb * GIB,
+            "volmode": "GEOM",
+            "sparse": sparse,
             **kwargs
         }
-        return self._make_request("POST", "/zfs/zvol", json=payload)
+        return self._make_request("POST", "/pool/dataset", json=payload)
 
-    def delete_zvol(self, id: str) -> None:
+    def get_zvol(self, pool: str, name: str) -> Dict[str, Any]:
         """
-        Delete a zvol by ID.
+        Get a single zvol by pool and name.
 
         Args:
-            id: Zvol ID to delete
+            pool: Pool the zvol lives in
+            name: Zvol name
+
+        Returns:
+            Zvol metadata, including volsize
         """
-        self._make_request("DELETE", f"/zfs/zvol/id/{id}")
+        dataset_id = self._dataset_id(pool, name)
+        return self._make_request("GET", f"/pool/dataset/id/{dataset_id}")
+
+    def delete_zvol(
+        self,
+        pool: str,
+        name: str,
+        recursive: bool = False
+    ) -> None:
+        """
+        Delete a zvol.
+
+        Args:
+            pool: Pool the zvol lives in
+            name: Zvol name
+            recursive: Whether to delete dependent children (default False)
+        """
+        dataset_id = self._dataset_id(pool, name)
+        self._make_request(
+            "DELETE",
+            f"/pool/dataset/id/{dataset_id}",
+            json={"recursive": recursive},
+        )
+
+    def resize_zvol(
+        self,
+        pool: str,
+        name: str,
+        new_size_gb: int
+    ) -> Dict[str, Any]:
+        """
+        Resize an existing zvol.
+
+        ZFS supports online growth, so no iSCSI reconnect is required. This
+        does not shrink a zvol -- ZFS rejects a volsize below current usage.
+
+        Args:
+            pool: Pool the zvol lives in
+            name: Zvol name
+            new_size_gb: New size in GB
+
+        Returns:
+            Updated zvol metadata
+        """
+        dataset_id = self._dataset_id(pool, name)
+        return self._make_request(
+            "PUT",
+            f"/pool/dataset/id/{dataset_id}",
+            json={"volsize": new_size_gb * GIB},
+        )
+
+    def list_zvols(self, pool: str) -> List[Dict[str, Any]]:
+        """
+        List every zvol in a pool.
+
+        Args:
+            pool: Pool to list zvols from
+
+        Returns:
+            List of zvol metadata dictionaries
+        """
+        return self._make_request(
+            "GET",
+            "/pool/dataset",
+            params={"type": "VOLUME", "name__startswith": f"{pool}/"},
+        )
 
     def get_iscsi_target_list(self) -> List[Dict[str, Any]]:
         """
