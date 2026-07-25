@@ -6,9 +6,9 @@ network guard that turns any real HTTP request into an explicit assertion
 failure, so a mock that has stopped working surfaces immediately instead of
 hanging on DNS or silently depending on runner network policy.
 
-These tests pin the client's *current* behaviour. Several endpoint paths and
-the auth scheme are known to be wrong (issues #9 and #10) and will change;
-the assertions here are expected to change with them.
+These tests pin the client's *current* behaviour. The auth scheme is known to
+be wrong (issue #10) and will change; the assertions here are expected to
+change with it. Zvol operations were migrated to ``/pool/dataset`` in #9.
 
 Coverage is deliberately partial. These methods are untested here because the
 issues that rewrite them carry their own test requirements, and pinning the
@@ -161,52 +161,143 @@ class TestPoolOperations(TrueNASClientTestCase):
         self.assertEqual(result[0]["name"], "tank")
 
 
+class TestDatasetIdEncoding(TrueNASClientTestCase):
+    """Dataset IDs are percent-encoded ZFS paths, not URL path segments."""
+
+    def test_simple_name_encodes_separator(self):
+        self.assertEqual(
+            TrueNASClient._dataset_id("tank", "vol1"), "tank%2Fvol1"
+        )
+
+    def test_nested_name_encodes_every_separator(self):
+        # Proxmox-created zvols live under nested datasets, so this is the
+        # shape manage_existing (#20) will actually be handed.
+        self.assertEqual(
+            TrueNASClient._dataset_id("tank", "proxmox/vm-100-disk-0"),
+            "tank%2Fproxmox%2Fvm-100-disk-0",
+        )
+
+    def test_no_raw_slash_survives_encoding(self):
+        encoded = TrueNASClient._dataset_id("tank", "a/b/c")
+        self.assertNotIn("/", encoded)
+
+
 class TestZvolOperations(TrueNASClientTestCase):
-    """Zvol create/delete request shapes."""
+    """Zvol lifecycle against /pool/dataset."""
 
     def test_create_zvol_posts_expected_payload(self):
-        self._set_response({"id": "zvol/1", "name": "tank/volume1"})
+        self._set_response({"id": "tank/volume1", "name": "tank/volume1"})
 
         result = self.client.create_zvol(
             pool="tank",
             name="volume1",
-            size_bytes=1073741824,
+            size_gb=1,
         )
 
         self.session.request.assert_called_once_with(
             "POST",
-            f"{BASE_URL}/zfs/zvol",
-            json={"name": "tank/volume1", "volsize": 1073741824},
+            f"{BASE_URL}/pool/dataset",
+            json={
+                "name": "tank/volume1",
+                "type": "VOLUME",
+                "volsize": 1073741824,
+                "volmode": "GEOM",
+                "sparse": True,
+            },
         )
-        self.assertEqual(result, {"id": "zvol/1", "name": "tank/volume1"})
+        self.assertEqual(result["name"], "tank/volume1")
+
+    def test_create_zvol_converts_gb_to_bytes(self):
+        self._set_response({})
+
+        self.client.create_zvol(pool="tank", name="v", size_gb=10)
+
+        payload = self.session.request.call_args.kwargs["json"]
+        self.assertEqual(payload["volsize"], 10 * 1024 ** 3)
+
+    def test_create_zvol_honours_sparse_false(self):
+        self._set_response({})
+
+        self.client.create_zvol(
+            pool="tank", name="v", size_gb=1, sparse=False
+        )
+
+        payload = self.session.request.call_args.kwargs["json"]
+        self.assertFalse(payload["sparse"])
 
     def test_create_zvol_merges_extra_properties(self):
         self._set_response({})
 
         self.client.create_zvol(
-            pool="tank",
-            name="volume1",
-            size_bytes=1024,
-            sparse=True,
+            pool="tank", name="v", size_gb=1, comments="managed by cinder"
         )
+
+        payload = self.session.request.call_args.kwargs["json"]
+        self.assertEqual(payload["comments"], "managed by cinder")
+        self.assertEqual(payload["type"], "VOLUME")
+
+    def test_get_zvol_uses_encoded_id(self):
+        self._set_response({"name": "tank/volume1"})
+
+        result = self.client.get_zvol("tank", "volume1")
 
         self.session.request.assert_called_once_with(
-            "POST",
-            f"{BASE_URL}/zfs/zvol",
-            json={
-                "name": "tank/volume1",
-                "volsize": 1024,
-                "sparse": True,
-            },
+            "GET", f"{BASE_URL}/pool/dataset/id/tank%2Fvolume1"
         )
+        self.assertEqual(result["name"], "tank/volume1")
 
-    def test_delete_zvol_issues_delete(self):
+    def test_delete_zvol_sends_recursive_flag(self):
         self._set_response({})
 
-        self.client.delete_zvol("tank/volume1")
+        self.client.delete_zvol("tank", "volume1")
 
         self.session.request.assert_called_once_with(
-            "DELETE", f"{BASE_URL}/zfs/zvol/id/tank/volume1"
+            "DELETE",
+            f"{BASE_URL}/pool/dataset/id/tank%2Fvolume1",
+            json={"recursive": False},
+        )
+
+    def test_delete_zvol_recursive_true(self):
+        self._set_response({})
+
+        self.client.delete_zvol("tank", "volume1", recursive=True)
+
+        payload = self.session.request.call_args.kwargs["json"]
+        self.assertTrue(payload["recursive"])
+
+    def test_resize_zvol_puts_new_volsize(self):
+        self._set_response({})
+
+        self.client.resize_zvol("tank", "volume1", new_size_gb=20)
+
+        self.session.request.assert_called_once_with(
+            "PUT",
+            f"{BASE_URL}/pool/dataset/id/tank%2Fvolume1",
+            json={"volsize": 20 * 1024 ** 3},
+        )
+
+    def test_list_zvols_filters_by_type_and_pool(self):
+        self._set_response([{"name": "tank/v1"}])
+
+        result = self.client.list_zvols("tank")
+
+        self.session.request.assert_called_once_with(
+            "GET",
+            f"{BASE_URL}/pool/dataset",
+            params={"type": "VOLUME", "name__startswith": "tank/"},
+        )
+        self.assertEqual(len(result), 1)
+
+    def test_nested_zvol_round_trips_through_delete(self):
+        self._set_response({})
+
+        self.client.delete_zvol("tank", "proxmox/vm-100-disk-0")
+
+        self.session.request.assert_called_once_with(
+            "DELETE",
+            f"{BASE_URL}/pool/dataset/id/"
+            "tank%2Fproxmox%2Fvm-100-disk-0",
+            json={"recursive": False},
         )
 
 
