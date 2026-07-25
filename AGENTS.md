@@ -212,13 +212,27 @@ directly — follows this flow:
    **only** ever closed via the PR that resolves them (on merge), never
    manually and never by a commit. setkeh is both assignee and requested
    reviewer — his approval is the required gate, no one else's.
-6. **Claude review.** `.github/workflows/claude-code-review.yml` is *intended*
-   to trigger Claude on every PR open/push, posting review comments against the
-   conventions in this file — advisory only; it cannot approve, merge, or push
-   commits. **This is not set up yet: there is no `.github/` directory in the
-   repo.** Install it with `/install-github-app`, which adds the Claude GitHub
-   App and a repo secret named `CLAUDE_CODE_OAUTH_TOKEN` (not a raw
+6. **Claude review.** `.github/workflows/claude-code-review.yml` triggers on
+   every PR open/push and posts review comments against the conventions in this
+   file. Set up as of 2026-07-26 via `/install-github-app`, which added the
+   Claude GitHub App and the repo secret `CLAUDE_CODE_OAUTH_TOKEN` (not a raw
    `ANTHROPIC_API_KEY`).
+
+   It **cannot** approve, merge, or push commits — but it is *not* purely
+   advisory: because the ruleset sets `required_review_thread_resolution: true`,
+   **any inline comment it leaves blocks the merge** until a human resolves the
+   thread. The review prompt therefore reserves inline comments for genuinely
+   blocking findings and routes nits into a `### Non-blocking observations`
+   section of the summary comment instead (issue #32). Do not undo that split
+   without understanding the ruleset interaction — it previously caused three
+   consecutive fix-push-renit rounds on #30 with zero real defects found.
+
+   File non-blocking observations as `nit`-labelled issues rather than fixing
+   them in the PR they were raised against.
+
+   Fork PRs are skipped: they receive no secrets, so the action would no-op and
+   still report a green check. Never "fix" that with `pull_request_target` —
+   it runs untrusted code with write permissions.
 7. **Merge after approval**, which closes the linked issue automatically.
 
 **Branch protection is enabled** on `main` via the `Gitops` ruleset (id
