@@ -9,6 +9,19 @@ hanging on DNS or silently depending on runner network policy.
 These tests pin the client's *current* behaviour. Several endpoint paths and
 the auth scheme are known to be wrong (issues #9 and #10) and will change;
 the assertions here are expected to change with them.
+
+Coverage is deliberately partial. These methods are untested here because the
+issues that rewrite them carry their own test requirements, and pinning the
+current shapes would only create churn:
+
+- ``get_iscsi_target_list``, ``create_iscsi_extent``, ``delete_iscsi_extent``,
+  ``delete_iscsi_target``, ``delete_iscsi_target_extent`` -- rewritten by #12
+  (iSCSI pipeline), which replaces the extent ``path``/``type`` shapes.
+- ``get_snapshot_list``, ``create_snapshot``, ``delete_snapshot`` -- rewritten
+  by #13 (snapshot/clone), which changes the signatures from opaque ``id`` and
+  pre-joined ``dataset`` strings to ``pool``/``zvol``/``snap`` components.
+
+Add coverage as part of those issues, not by pinning today's behaviour.
 """
 
 import unittest
