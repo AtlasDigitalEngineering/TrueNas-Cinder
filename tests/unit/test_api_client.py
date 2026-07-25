@@ -107,6 +107,7 @@ class TestClientConstruction(TrueNASClientTestCase):
 
 
 class TestEulaCheck(TrueNASClientTestCase):
+    """EULA status reporting."""
 
     def test_returns_true_when_accepted(self):
         self._set_response({"accepted": True})
@@ -130,6 +131,7 @@ class TestEulaCheck(TrueNASClientTestCase):
 
 
 class TestPoolOperations(TrueNASClientTestCase):
+    """Storage pool queries."""
 
     def test_get_pool_list_returns_payload(self):
         self._set_response([
@@ -147,6 +149,7 @@ class TestPoolOperations(TrueNASClientTestCase):
 
 
 class TestZvolOperations(TrueNASClientTestCase):
+    """Zvol create/delete request shapes."""
 
     def test_create_zvol_posts_expected_payload(self):
         self._set_response({"id": "zvol/1", "name": "tank/volume1"})
@@ -195,6 +198,7 @@ class TestZvolOperations(TrueNASClientTestCase):
 
 
 class TestIscsiOperations(TrueNASClientTestCase):
+    """iSCSI target and target-extent request shapes."""
 
     def test_create_iscsi_target_posts_expected_payload(self):
         self._set_response({
@@ -231,6 +235,7 @@ class TestIscsiOperations(TrueNASClientTestCase):
 
 
 class TestErrorPropagation(TrueNASClientTestCase):
+    """HTTP failures must reach the caller unswallowed."""
 
     def test_http_error_raised_and_json_not_parsed(self):
         response = self._set_response({})

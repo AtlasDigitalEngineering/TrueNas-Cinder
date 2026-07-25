@@ -45,9 +45,11 @@ jobs:
             --cov-report=term-missing
 
       # Exercises tests/__init__.py, which pytest does not need. Without this
-      # the unittest-discover path could rot unnoticed.
+      # the unittest-discover path could rot unnoticed. One leg is enough to
+      # prove discovery works, so this does not double the whole matrix.
       - name: Run unit tests via unittest discover
-        run: python -m unittest discover -s tests -t . -v
+        if: matrix.python-version == '3.10'
+        run: python -m unittest discover -s tests -t .
 
       - name: Upload coverage report
         if: matrix.python-version == '3.10'
