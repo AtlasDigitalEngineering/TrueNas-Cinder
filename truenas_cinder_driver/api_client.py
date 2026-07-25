@@ -35,7 +35,12 @@ class TrueNASClient:
         self.session.auth = (username, password)
         self.session.verify = verify_ssl
 
-    def _make_request(self, method: str, endpoint: str, **kwargs) -> Dict[str, Any]:
+    def _make_request(
+        self,
+        method: str,
+        endpoint: str,
+        **kwargs
+    ) -> Dict[str, Any]:
         """
         Make a request to the TrueNAS API.
 
@@ -49,10 +54,10 @@ class TrueNASClient:
         """
         url = f"{self.base_url}{endpoint}"
         response = self.session.request(method, url, **kwargs)
-        
+
         # Raise an exception for bad status codes
         response.raise_for_status()
-        
+
         return response.json()
 
     def is_eula_accepted(self) -> bool:
@@ -229,7 +234,12 @@ class TrueNASClient:
         """
         return self._make_request("GET", "/zfs/snapshot")
 
-    def create_snapshot(self, dataset: str, name: str, **kwargs) -> Dict[str, Any]:
+    def create_snapshot(
+        self,
+        dataset: str,
+        name: str,
+        **kwargs
+    ) -> Dict[str, Any]:
         """
         Create a new snapshot.
 
