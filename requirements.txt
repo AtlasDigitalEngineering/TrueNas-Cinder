@@ -1,2 +1,9 @@
+# Cinder is NOT installed by CI or by unit tests. This driver is loaded *by* a
+# Cinder deployment, which already provides it; pulling the full Cinder
+# dependency tree into a test environment costs minutes and buys nothing while
+# only api_client.py (requests-only) is under test.
+#
+# Kept here as the declared runtime platform. The proper dependency split
+# between this file, test-requirements.txt, and pyproject.toml is issue #23.
 cinder>=24.0.0
 requests>=2.31.0

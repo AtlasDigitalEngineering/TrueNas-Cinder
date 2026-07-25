@@ -28,7 +28,7 @@ class TestTrueNASClient(unittest.TestCase):
         mock_response = MagicMock()
         mock_response.json.return_value = {"accepted": True}
         mock_response.raise_for_status.return_value = None
-        
+
         # Configure session mock
         mock_session_instance = MagicMock()
         mock_session_instance.get.return_value = mock_response
@@ -50,7 +50,7 @@ class TestTrueNASClient(unittest.TestCase):
         mock_response = MagicMock()
         mock_response.json.return_value = {"accepted": False}
         mock_response.raise_for_status.return_value = None
-        
+
         # Configure session mock
         mock_session_instance = MagicMock()
         mock_session_instance.get.return_value = mock_response
@@ -72,7 +72,7 @@ class TestTrueNASClient(unittest.TestCase):
             "name": "tank/volume1"
         }
         mock_response.raise_for_status.return_value = None
-        
+
         # Configure session mock
         mock_session_instance = MagicMock()
         mock_session_instance.post.return_value = mock_response
@@ -90,7 +90,7 @@ class TestTrueNASClient(unittest.TestCase):
             "name": "tank/volume1",
             "volsize": 1073741824
         }
-        
+
         mock_session_instance.post.assert_called_once_with(
             "https://truenas.example.com:443/api/v2.0/zfs/zvol",
             json=expected_payload
@@ -107,7 +107,7 @@ class TestTrueNASClient(unittest.TestCase):
             {"name": "data", "size": 2147483648}
         ]
         mock_response.raise_for_status.return_value = None
-        
+
         # Configure session mock
         mock_session_instance = MagicMock()
         mock_session_instance.get.return_value = mock_response
@@ -124,7 +124,7 @@ class TestTrueNASClient(unittest.TestCase):
 
     @patch('truenas_cinder_driver.api_client.requests.Session')
     def test_create_iscsi_target(self, mock_session):
-        """Test create_iscsi_target creates a target with correct parameters."""
+        """Test create_iscsi_target passes the correct parameters."""
         # Setup mock response
         mock_response = MagicMock()
         mock_response.json.return_value = {
@@ -132,7 +132,7 @@ class TestTrueNASClient(unittest.TestCase):
             "name": "iqn.2005-10.org.freenas.ctl:volume1"
         }
         mock_response.raise_for_status.return_value = None
-        
+
         # Configure session mock
         mock_session_instance = MagicMock()
         mock_session_instance.post.return_value = mock_response
@@ -148,7 +148,7 @@ class TestTrueNASClient(unittest.TestCase):
             "name": "iqn.2005-10.org.freenas.ctl:volume1",
             "alias": None
         }
-        
+
         mock_session_instance.post.assert_called_once_with(
             "https://truenas.example.com:443/api/v2.0/iscsi/target",
             json=expected_payload
