@@ -221,11 +221,32 @@ directly — follows this flow:
    `ANTHROPIC_API_KEY`).
 7. **Merge after approval**, which closes the linked issue automatically.
 
-**Branch protection is not enabled** on `main` — no rulesets, no protection
-rule, so direct pushes are physically possible. This repo is **public**, which
-means branch protection is available on the free plan; enabling "require PR +
-1 approval, no force-push/deletion" on `main` is an outstanding action, not a
-platform limitation. Treat the flow above as a hard rule regardless.
+**Branch protection is enabled** on `main` via the `Gitops` ruleset (id
+19733864, `enforcement: active`, targets `~DEFAULT_BRANCH`): blocks deletion
+and non-fast-forward, requires signed commits, requires a PR with stale-review
+dismissal and thread resolution, and requires code owner review
+(`.github/CODEOWNERS` → `* @setkeh`).
+
+> **OUTSTANDING — re-enable required status checks when starting #8.**
+> The ruleset has **no `required_status_checks` rule**, so CI is advisory: a
+> PR with a red pipeline can still merge. This was deliberate so #29 could land
+> while the unit suite was still broken. Once #8 turns the suite green, add the
+> rule with contexts `Unit tests (Python 3.10)`, `Unit tests (Python 3.12)`,
+> and `Lint (flake8)`, plus `strict_required_status_checks_policy: true`.
+
+**Signed commits are mandatory** and the signing key lives on a hardware token
+(OpenPGP smartcard). Agents **cannot** commit — gpg needs a PIN via pinentry on
+a TTY. Stage and verify the work, then ask setkeh to run the commit himself.
+Never disable signing to work around this.
+
+**Watch for solo-maintainer deadlocks.** `require_last_push_approval` was
+enabled initially and made every PR permanently unmergeable — setkeh authors
+every PR and GitHub forbids self-approval, with `bypass_actors: []`. It is now
+`false`. `require_code_owner_review: true` carries the same risk once
+`.github/CODEOWNERS` is on `main`; if a PR reports `mergeable_state=blocked`
+with no failing required check, that is the cause. The fix is to add setkeh as
+a bypass actor with `bypass_mode: "pull_request"` — this keeps the rule
+meaningful for future contributors while still forcing the PR flow.
 
 **No AI attribution, anywhere** — not in commit messages, not in PR/issue
 titles or descriptions, not in issue/PR comments. No `Co-Authored-By:

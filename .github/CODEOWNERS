@@ -1,0 +1,11 @@
+# Code owners for TrueNas-Cinder.
+#
+# The `Gitops` ruleset on main has `require_code_owner_review: true`, which is
+# inert without this file. Kept deliberately: the repo is public, and if
+# outside contributors arrive the rule starts doing real work with no further
+# configuration.
+#
+# Ownership is repo-wide for now. Split by path (api client / driver / CI /
+# docs) once there is more than one maintainer.
+
+* @setkeh
