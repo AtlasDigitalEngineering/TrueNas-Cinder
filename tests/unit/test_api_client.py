@@ -232,20 +232,15 @@ class TestIscsiOperations(TrueNASClientTestCase):
 
 class TestErrorPropagation(TrueNASClientTestCase):
 
-    def test_http_error_is_raised_to_caller(self):
+    def test_http_error_raised_and_json_not_parsed(self):
         response = self._set_response({})
         response.raise_for_status.side_effect = requests.HTTPError("401")
 
         with self.assertRaises(requests.HTTPError):
             self.client.get_pool_list()
 
-    def test_json_not_parsed_when_status_check_fails(self):
-        response = self._set_response({})
-        response.raise_for_status.side_effect = requests.HTTPError("500")
-
-        with self.assertRaises(requests.HTTPError):
-            self.client.get_pool_list()
-
+        # raise_for_status() must run *before* json(), so a failed request
+        # never has its body parsed.
         response.json.assert_not_called()
 
 
