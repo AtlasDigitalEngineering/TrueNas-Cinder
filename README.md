@@ -16,29 +16,45 @@ This project provides a Cinder volume driver that enables OpenStack to use TrueN
 
 ```
 TrueNas-Cinder/
-├── docs/               # Project documentation and planning
+├── .github/                # CI workflows and CODEOWNERS
+├── docs/
+│   └── PLANNING.md         # Project roadmap and milestones
 ├── truenas_cinder_driver/
-│   ├── __init__.py     # Package initialization
-│   ├── driver.py       # Core Cinder driver implementation
-│   └── api_client.py   # TrueNAS REST API client wrapper
-├── tests/              # Unit and integration tests
-├── CONTRIBUTING.md     # Contribution guidelines
-└── PLANNING.md         # Project roadmap and milestones
+│   ├── __init__.py         # Package initialization
+│   └── api_client.py       # TrueNAS REST API client wrapper
+├── tests/
+│   └── unit/               # Unit tests
+├── AGENTS.md               # Conventions and workflow for contributors
+└── CONTRIBUTING.md         # Contribution guidelines
 ```
+
+The Cinder driver itself (`driver.py`) is not implemented yet — see the
+roadmap below and the open issues.
 
 ## Development
 
 ### Prerequisites
 
-- Python 3.8+
+- Python 3.10+ — 3.10 is the deployment target (Kolla 2025.1 / Ubuntu Jammy);
+  CI also runs 3.12
 - TrueNAS Scale (v24.x or later)
-- OpenStack Cinder
+- OpenStack Cinder (provided by the deployment; not installed for local
+  development or testing)
 
 ### Setup
 
 1. Clone the repository.
 2. Create a virtual environment: `python -m venv .venv && source .venv/bin/activate`
-3. Install dependencies: `pip install -r requirements.txt`
+3. Install test dependencies: `pip install -r test-requirements.txt`
+
+### Running the tests
+
+```bash
+python -m pytest tests/unit
+```
+
+The package is not installable yet, so use `python -m pytest` rather than bare
+`pytest` — see [AGENTS.md](AGENTS.md) for the detail.
 
 ## Roadmap
 
