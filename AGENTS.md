@@ -18,15 +18,24 @@ The driver talks to TrueNAS over its **REST API v2.0** (`https://<host>:<port>/a
 TrueNAS, created by Proxmox; the `manage_existing` family adopts them in place
 with zero data copy. That constraint drives most of the priority ordering.
 
-**Authoritative implementation reference:** the *TrueNAS Cinder Driver —
-Development Plan & Implementation Spec* document. It carries the exact endpoint
-paths, payload shapes, method signatures, gaps G1–G7, and milestone definitions.
-Where this file and the spec disagree, the spec wins — and fix this file. Note
-the spec is currently an external document, not in `docs/`; issue #5 covers
-bringing it in.
+**What is authoritative, in order:**
+
+1. **The live appliance** for anything about API behaviour — endpoint paths,
+   payload shapes, response shapes, filter syntax. Verify with
+   `tools/verify_endpoints.py`; see "Verifying against real hardware" below.
+2. **The issue tracker** for scope, acceptance criteria, and ordering.
+3. **This file** for conventions and hazards.
+
+There was previously a *TrueNAS Cinder Driver — Development Plan* document
+described here as authoritative. It is a **design doc**, not a specification:
+useful for intent and shape, but it was never verified against hardware, and
+trusting it produced three real defects (`volmode: GEOM`, `name__startswith`,
+and the EULA response shape — all fixed in #35). Its content has been extracted
+into issues #8–#28 and the milestone definitions. Do not treat any document as
+outranking observed behaviour.
 
 Deployment target: Kolla-Ansible, OpenStack 2025.1, Ubuntu Jammy base. Base
-class per the spec is `cinder.volume.drivers.san.san.SanISCSIDriver`.
+class is `cinder.volume.drivers.san.san.SanISCSIDriver`.
 
 ## Layout
 
@@ -43,6 +52,9 @@ tests/
   unit/
     __init__.py
     test_api_client.py
+tools/
+  verify_endpoints.py  # live-appliance verification, reads .env
+.env.example       # template; .env itself is gitignored
 docs/PLANNING.md   # milestones + issue map (predates the spec, see #28)
 tox.ini            # envlist = py310, flake8; also holds [flake8] config
 requirements.txt   # cinder (platform, not installed by CI), requests
@@ -86,16 +98,38 @@ status does **not** belong here — that is what the issue tracker is for. Run
 `gh issue list` for what is open; the milestones `M1 — Minimum viable attach`,
 `M2 — Full lifecycle`, and `M3 — Migration ready` carry the ordering.
 
-**Nothing has ever been verified against a real TrueNAS appliance.** Every
-endpoint path, payload shape, and response shape in `api_client.py` comes from
-the development spec, not from observed behaviour. `/zfs/zvol` shipped in PR #7
-and survived until #9 despite not being a valid endpoint at all. Treat any
-un-exercised path as unproven. Tracked in #35.
+**Only the zvol and auth paths have been verified against real hardware**
+(TrueNAS-25.10.5, #35). The iSCSI pipeline (#12) and snapshot/clone (#13)
+endpoints are still design-doc guesses. Every guess checked so far has had at
+least one error in it — `/zfs/zvol` was not a real endpoint, `volmode: GEOM` is
+FreeBSD-only, `name__startswith` is not a valid operator, and the EULA endpoint
+returns a bare boolean rather than an object. Verify before building on any
+un-exercised path.
+
+Two traps found while verifying, both of which mislead rather than fail loudly:
+an unrecognised key in a `/pool/dataset` create breaks discrimination of the
+`VOLUME` schema variant, so the 422 blames `type` instead of the real culprit;
+and the JSON `filters=[[...]]` query form returns `200` with an empty list
+rather than an error, so a wrong query reads as "nothing exists".
 
 **Never point tests or exploration at the production TrueNAS.** It holds every
-production VM disk as a zvol, and those are the migration's only copy. A
-dedicated test appliance is being provisioned; verify the target host and use a
-scratch pool before issuing anything that is not a read.
+production VM disk as a zvol, and those are the migration's only copy. Use the
+dev appliance and a scratch pool; `tools/verify_endpoints.py` refuses to run
+without both configured, but that check is not a substitute for looking.
+
+## Verifying against real hardware
+
+```bash
+cp .env.example .env     # fill in URL, API key, scratch pool
+python3 tools/verify_endpoints.py            # read-only
+python3 tools/verify_endpoints.py --write    # + throwaway zvol lifecycle
+```
+
+`.env` is gitignored; CI uses the `DEV_TRUENAS_API_KEY` secret. Write mode
+creates exactly one throwaway zvol and removes it in a `finally` block.
+
+Extend this script when adding client methods — the point is that findings can
+be re-checked and re-run against a new TrueNAS release, not taken on trust.
 
 **`api_client.py` is still incomplete** — no typed exceptions, no retry, and no
 request timeout (#11). A hung appliance blocks a `cinder-volume` worker
