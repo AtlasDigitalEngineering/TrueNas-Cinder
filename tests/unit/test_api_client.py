@@ -191,7 +191,9 @@ class TestRequestUrlComposition(TrueNASAPIClientTestCase):
 class TestEmptyResponseBody(TrueNASAPIClientTestCase):
     """DELETE and other 204s carry no body; json() would raise on them."""
 
-    def test_empty_body_returns_empty_dict(self):
+    def test_delete_zvol_does_not_raise_on_empty_body(self):
+        # delete_zvol returns None regardless -- what matters is that
+        # json() is never reached on a bodyless response.
         response = mock.MagicMock()
         response.content = b""
         response.raise_for_status.return_value = None
@@ -203,7 +205,7 @@ class TestEmptyResponseBody(TrueNASAPIClientTestCase):
         self.assertIsNone(result)
         response.json.assert_not_called()
 
-    def test_empty_body_does_not_raise_for_value_returning_calls(self):
+    def test_empty_body_returns_empty_dict(self):
         response = mock.MagicMock()
         response.content = b""
         response.raise_for_status.return_value = None
@@ -223,7 +225,19 @@ class TestEmptyResponseBody(TrueNASAPIClientTestCase):
 
 
 class TestCredentialHandling(TrueNASAPIClientTestCase):
-    """The API key must not leak into anything a caller might log."""
+    """Regression guards against the API key leaking into logged output.
+
+    These are guards, not proof of redaction: there is no redaction
+    mechanism to test. `object.__repr__` never includes instance
+    attributes, so the repr assertion passes trivially today -- its value
+    is failing loudly if someone later adds a `__repr__` that interpolates
+    the session or the key.
+
+    The key *is* present in `session.headers["Authorization"]` by design,
+    so anything that dumps the session wholesale will still expose it.
+    Real redaction, if wanted, belongs with the error handling in #11,
+    where exception messages start carrying request context.
+    """
 
     def test_api_key_absent_from_repr(self):
         client = TrueNASAPIClient(
