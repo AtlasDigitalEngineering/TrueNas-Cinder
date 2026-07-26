@@ -40,7 +40,13 @@ THROWAWAY = "cinder-verify-throwaway"
 
 
 def load_env(path=".env"):
-    """Read KEY=VALUE pairs from a .env file into os.environ."""
+    """Read KEY=VALUE pairs from a .env file into os.environ.
+
+    The file wins over anything already exported. This is deliberate: with
+    `setdefault`, a stale `TRUENAS_API_URL` left in the shell would silently
+    override `.env` and could point a write-mode run at a different
+    appliance than the one the operator just configured.
+    """
     env_file = pathlib.Path(path)
     if not env_file.exists():
         sys.exit(
@@ -50,7 +56,7 @@ def load_env(path=".env"):
         line = line.strip()
         if line and not line.startswith("#") and "=" in line:
             key, value = line.split("=", 1)
-            os.environ.setdefault(key.strip(), value.strip())
+            os.environ[key.strip()] = value.strip()
 
 
 def check(label, fn):
@@ -88,8 +94,18 @@ def main():
             "TRUENAS_API_URL, TRUENAS_API_KEY and TRUENAS_TEST_POOL must all "
             "be set in .env"
         )
-    if pool == "CHANGEME" or "CHANGEME" in url:
-        sys.exit("Refusing to run: .env still contains CHANGEME placeholders.")
+    placeholders = [
+        name for name, value in (
+            ("TRUENAS_API_URL", url),
+            ("TRUENAS_API_KEY", key),
+            ("TRUENAS_TEST_POOL", pool),
+        ) if "CHANGEME" in value
+    ]
+    if placeholders:
+        sys.exit(
+            "Refusing to run: .env still contains CHANGEME placeholders for "
+            + ", ".join(placeholders)
+        )
 
     client = TrueNASAPIClient(url, key, verify_ssl=verify_ssl)
 
@@ -121,7 +137,7 @@ def main():
         lambda: client.create_zvol(pool=pool, name=THROWAWAY, size_gb=1),
     )
     try:
-        if created:
+        if isinstance(created, dict):
             volsize = created.get("volsize")
             nested = isinstance(volsize, dict)
             print(f"        volsize nested? {nested} "
