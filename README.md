@@ -35,15 +35,26 @@ roadmap below and the open issues.
 
 ### Prerequisites
 
-- Python 3.8+
+- Python 3.10+ — 3.10 is the deployment target (Kolla 2025.1 / Ubuntu Jammy);
+  CI also runs 3.12
 - TrueNAS Scale (v24.x or later)
-- OpenStack Cinder
+- OpenStack Cinder (provided by the deployment; not installed for local
+  development or testing)
 
 ### Setup
 
 1. Clone the repository.
 2. Create a virtual environment: `python -m venv .venv && source .venv/bin/activate`
-3. Install dependencies: `pip install -r requirements.txt`
+3. Install test dependencies: `pip install -r test-requirements.txt`
+
+### Running the tests
+
+```bash
+python -m pytest tests/unit
+```
+
+The package is not installable yet, so use `python -m pytest` rather than bare
+`pytest` — see [AGENTS.md](AGENTS.md) for the detail.
 
 ## Roadmap
 
