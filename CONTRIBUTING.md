@@ -31,7 +31,7 @@ By participating in this project, you agree to abide by the code of conduct.
 
 1.  Clone the repository.
 2.  Create a virtual environment.
-3.  Install development dependencies: `pip install -r requirements-dev.txt`.
+3.  Install development dependencies: `pip install -r test-requirements.txt`.
 
 ## Code Style
 
@@ -42,7 +42,7 @@ By participating in this project, you agree to abide by the code of conduct.
 ## Testing
 
 - Write unit tests for new features or bug fixes.
-- Run existing tests before submitting a pull request: `tox -e py39`.
+- Run existing tests before submitting a pull request: `tox -e py310`.
 
 ## Documentation
 

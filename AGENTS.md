@@ -31,144 +31,91 @@ class per the spec is `cinder.volume.drivers.san.san.SanISCSIDriver`.
 ## Layout
 
 ```
+.github/
+  CODEOWNERS               # * @setkeh
+  workflows/test.yml       # unit tests (3.10, 3.12) + flake8
+  workflows/claude-code-review.yml
 truenas_cinder_driver/
   __init__.py      # exports TrueNASClient, __version__ ("0.1.0")
   api_client.py    # TrueNASClient — thin REST wrapper over the TrueNAS v2.0 API
-  driver.py        # TrueNASISCSIDriver — NOT on main yet, see "Current State"
 tests/
+  __init__.py
   unit/
     __init__.py
     test_api_client.py
-docs/PLANNING.md   # milestones + issue map
-tox.ini            # envlist = py39, flake8, coverage
-requirements.txt   # cinder>=24.0.0, requests>=2.31.0
-test-requirements.txt  # pytest, coverage, flake8, tox
+docs/PLANNING.md   # milestones + issue map (predates the spec, see #28)
+tox.ini            # envlist = py310, flake8; also holds [flake8] config
+requirements.txt   # cinder (platform, not installed by CI), requests
+test-requirements.txt  # pytest, pytest-cov, coverage, flake8, tox, requests
 ```
 
+`driver.py` does **not** exist on main. A draft lives on the unmerged
+`origin/feature/driver-core` branch — see #26 for its disposition.
+
 There is **no** `setup.py` / `pyproject.toml` / `setup.cfg` — the package is
-not installable, so tests only import `truenas_cinder_driver` because the repo
-root happens to be on `sys.path`. There is no `.github/` directory at all.
+not installable, so tests import `truenas_cinder_driver` only because the repo
+root is on `sys.path`. That is why CI and tox invoke `python -m pytest` rather
+than bare `pytest`. Issue #23 fixes this properly.
 
 ## Commands
 
 ```bash
-tox                      # full matrix (py39, flake8, coverage) — see caveats
-tox -e py39              # unit tests
-tox -e flake8            # lint: flake8 truenas_cinder_driver tests/
-python -m pytest tests/  # direct test run
+tox                                        # py310 + flake8
+tox -e py310                               # unit tests with coverage
+tox -e flake8                              # lint
+python -m pytest tests/unit                # direct test run
+python -m unittest discover -s tests -t .  # discover path, also run in CI
 ```
 
-**Environment caveats on this machine** (verified 2026-07-25):
+Use `python -m pytest`, not bare `pytest` — see the packaging note above.
+
+**Environment caveats on this machine:**
 - `python3` is 3.14; `python3 -m venv` fails — `python3-venv` is not installed.
-- `pytest`, `flake8`, `tox`, and `cinder` are **not** installed system-wide.
-  Only `requests` is available. Tests can be run with
-  `python3 -m unittest tests.unit.test_api_client` as a fallback.
-- `python3 -m unittest discover -s tests` fails: `tests/` has no `__init__.py`
-  (only `tests/unit/` does). Discovery needs `-t .` plus that missing file.
-- `tox -e py39` will fail as written: the command is
-  `pytest --cov=... --cov-report=xml` but `pytest-cov` is **not** in
-  `test-requirements.txt`.
+- `pytest`, `flake8`, `tox`, and `cinder` are **not** installed system-wide;
+  only `requests` is. Run the suite with
+  `python3 -m unittest discover -s tests -t .` as the fallback — it needs no
+  third-party packages and is what has been used to verify every change so far.
+- Cinder is deliberately not installed by CI. The driver is loaded *by* a Cinder
+  deployment that already provides it, and installing it costs minutes for no
+  benefit while only `api_client.py` (requests-only) is under test.
 
-## Current State (as of 2026-07-25)
+## Standing Hazards
 
-**Merged:** PR #6 (planning docs), PR #7 (API client + its unit tests).
+Long-lived facts about this codebase that are easy to get wrong. Point-in-time
+status does **not** belong here — that is what the issue tracker is for. Run
+`gh issue list` for what is open; the milestones `M1 — Minimum viable attach`,
+`M2 — Full lifecycle`, and `M3 — Migration ready` carry the ordering.
 
-**Issues #1–#5 are all still open** even though #1 and #2 are substantially
-done — PRs #6 and #7 did not carry `Closes #N`, so nothing auto-closed. Close
-them via a PR, not manually (see workflow below).
+**Nothing has ever been verified against a real TrueNAS appliance.** Every
+endpoint path, payload shape, and response shape in `api_client.py` comes from
+the development spec, not from observed behaviour. `/zfs/zvol` shipped in PR #7
+and survived until #9 despite not being a valid endpoint at all. Treat any
+un-exercised path as unproven. Tracked in #35.
 
-**In flight:** remote branch `origin/feature/driver-core` carries two unmerged
-commits (`ce4c543`, `4d05411`) adding `truenas_cinder_driver/driver.py` (449
-lines) and `tests/unit/test_driver.py` (120 lines). **No PR was ever opened
-for it.** This is the issue #3 work. Treat it as a draft: several methods are
-explicit placeholders and it does not import cleanly (see below).
+**Never point tests or exploration at the production TrueNAS.** It holds every
+production VM disk as a zvol, and those are the migration's only copy. A
+dedicated test appliance is being provisioned; verify the target host and use a
+scratch pool before issuing anything that is not a read.
 
-### Known defects — do not assume existing code works
+**`api_client.py` is still incomplete** — no token auth (#10), no typed
+exceptions, retry, or timeouts (#11), and `_make_request` calls
+`response.json()` unconditionally so any empty-bodied response (notably DELETE)
+raises (#11). Check the relevant issue before assuming a capability exists.
 
-These are verified, not speculative. Fix them as part of whatever you touch.
+**The `feature/driver-core` draft does not import.** `driver.py` on that branch
+crashes in `__init__` (`.lower()` on a bool), calls client methods that do not
+exist, treats dict responses as objects, reads config from `os.environ` instead
+of `self.configuration`, and returns the TrueNAS admin password as the CHAP
+secret. Treat it as a design sketch, not a merge candidate — see #26, #14, #15.
 
-**All 5 unit tests in `tests/unit/test_api_client.py` error out.** They patch
-`truenas_cinder_driver.api_client.requests.Session`, but `setUp()` constructs
-the client *before* the `@patch` decorator activates, so `self.client.session`
-is a real `requests.Session` and the tests attempt live DNS/HTTP to
-`truenas.example.com`. They also assert `session.get(...)` / `session.post(...)`
-while `_make_request` calls `session.request(method, url)` — so even with
-working patches the assertions would fail. Patch the instance's `session`
-attribute (or build the client inside the patched test), and assert against
-`session.request`.
+**Issues #1–#5 are umbrella trackers**, not work items. Each carries an audit
+comment mapping it to the development spec. The actual work lives in the
+specific issues they reference. They close via PR like anything else.
 
-**`api_client.py` gaps** vs. what issue #2 asks for:
-- No token authentication — only HTTP basic (`session.auth = (user, pass)`).
-- No 401/500-specific handling and no custom exception types; only
-  `raise_for_status()`, which surfaces raw `requests` exceptions to callers.
-- No request timeout and no retry policy.
-- No `get_zvol_list()` — but `driver.py` calls it.
-- No zvol resize/update method — needed for `extend_volume()`.
-- `_make_request` is annotated `-> Dict[str, Any]` but list endpoints return a
-  list.
-- Endpoint paths need verification against real TrueNAS Scale 24.x/25.x:
-  `create_zvol`/`delete_zvol` use `/zfs/zvol`, but modern TrueNAS manages zvols
-  through `/pool/dataset` with `"type": "VOLUME"`. Confirm before building on
-  this.
-
-**`driver.py` (on `feature/driver-core`) defects:**
-- `self.verify_ssl = kwargs.get('verify_ssl', False).lower() != 'false'` calls
-  `.lower()` on a bool — `__init__` always raises `AttributeError`.
-- Calls `self.client.get_zvol_list()`, which does not exist.
-- Treats API responses as objects (`zvol.name`, `zvol.id`, `snap.dataset_name`)
-  when the client returns plain dicts.
-- Reads config from `kwargs` and `os.environ`. Cinder drivers must declare
-  `oslo_config` opts and read them via `self.configuration.safe_get(...)`.
-- `initialize_connection()` returns hardcoded/mock data and **leaks the TrueNAS
-  admin password as the CHAP password**. Must be replaced with real CHAP
-  credentials and real target/extent lookup.
-- `create_volume_from_snapshot()`, `extend_volume()`, `terminate_connection()`,
-  `ensure_export()`, `remove_export()`, `get_volume_stats()` return placeholder
-  values (including hardcoded 10240/5120 GB capacity).
-- Raises bare `Exception` throughout instead of `cinder.exception.*`.
-- `tests/unit/test_driver.py` has the same patch-ordering bug as the API client
-  tests, and patches `api_client.TrueNASClient` while the driver imports the
-  symbol locally inside `__init__`, so the patch never applies.
-
-**Doc drift to fix when convenient:**
-- `CONTRIBUTING.md` tells contributors to `pip install -r requirements-dev.txt`
-  — that file does not exist; it is `test-requirements.txt`.
-- `README.md`'s repository-structure block lists `driver.py`, which is not on
-  `main`.
-
-## Open Issues
-
-Issues **#1–#5** are the original umbrellas. Each carries an audit comment
-mapping it to the detailed spec; keep them open as trackers and do the work in
-the specific issues below.
-
-| # | Umbrella | State |
-|---|---|---|
-| 1 | Project Structure and Architecture | Delivered by PR #6; packaging + `tests/__init__.py` outstanding |
-| 2 | API Client | Partially delivered by PR #7; wrong endpoints, wrong auth, no error handling |
-| 3 | Cinder Driver Core Logic | Draft on `feature/driver-core`, no PR, does not import |
-| 4 | Testing Framework and CI/CD | Not started — no `.github/`, existing tests broken |
-| 5 | Documentation and User Guide | Not started |
-
-**M1 — minimum viable attach:** #8 (fix test mocks), #9 (`/pool/dataset`
-endpoints), #10 (API-key auth), #11 (error handling/retry/timeouts), #12 (iSCSI
-pipeline methods), #14 (oslo_config + `SanISCSIDriver`), #15 (CHAP credential
-leak), #16 (mapping persistence G2), #22 (CI + branch protection), #26
-(`feature/driver-core` disposition).
-
-**M2 — full lifecycle:** #13 (snapshot clone/promote/pool capacity), #18
-(concurrency locking G6), #21 (clone/extend/stats driver methods), #25
-(functional tests).
-
-**M3 — migration ready:** #17 (IQN/portal discovery G3+G4), #19 (snapshot
-rename verification G1), #20 (`manage_existing` family), #23 (pyproject.toml),
-#24 (Kolla image + deployment), #5 (documentation).
-
-**Unscheduled:** #27 (deferred CHAP G5 + multi-attach G7), #28 (doc drift).
-
-**Start here:** #8 first — the test suite currently provides zero signal and
-everything else builds on it. Then #9/#10/#11 on the API client, since #12 and
-the whole driver layer sit on top.
+**Tests must carry signal, not just pass.** The original suite passed CI review
+twice while silently attempting live DNS. Before claiming a test works, break
+the production code deliberately and confirm the test fails. Mutation runs on
+#30 and #34 are the reference for what that looks like.
 
 ## GitOps Workflow
 
@@ -279,10 +226,27 @@ per-request.
    actually fails when the code is wrong — the existing suite is a cautionary
    example of tests that pass no signal.
 3. **Follow OpenStack Cinder conventions** in `driver.py`: subclass
-   `cinder.volume.driver.ISCSIDriver`, declare config via `oslo_config` opts
-   read through `self.configuration`, and raise `cinder.exception.*` rather
-   than bare `Exception`.
+   `cinder.volume.drivers.san.san.SanISCSIDriver`, declare config via
+   `oslo_config` opts read through `self.configuration`, and raise
+   `cinder.exception.*` rather than bare `Exception`.
 4. **Never log or return credentials.** No passwords in connection-info dicts,
    exception messages, or debug output.
-5. **Follow the GitOps Workflow above** for every task — issue, branch, PR,
+5. **Update this file in the same PR that invalidates it.** If a change makes
+   any statement here wrong — a hazard resolved, a command changed, a file
+   added or removed, a convention revised — fix it in that PR, not later. This
+   file is the first thing an agent reads and it is trusted on sight, so a
+   stale line actively misleads rather than merely aging.
+
+   This is not hypothetical: within one day of work, this file simultaneously
+   claimed the test suite was entirely broken, that no `.github/` directory
+   existed, and that zvols used `/zfs/zvol` — all three fixed by merged PRs,
+   none corrected at the time. Issue #28 exists because of it.
+
+   The structure is built to decay slowly — keep it that way. Point-in-time
+   status (what is merged, what is open, who is working on what) belongs in the
+   issue tracker, never here. "Standing Hazards" holds only durable facts, each
+   pointing at the issue that owns it. Resist re-introducing a dated
+   "Current State" section; it has to be rewritten on every merge and will not
+   be.
+6. **Follow the GitOps Workflow above** for every task — issue, branch, PR,
    review, merge. See that section for the exact conventions.

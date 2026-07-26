@@ -16,15 +16,19 @@ This project provides a Cinder volume driver that enables OpenStack to use TrueN
 
 ```
 TrueNas-Cinder/
-├── docs/               # Project documentation and planning
+├── .github/                # CI workflows and CODEOWNERS
+├── docs/                   # Project documentation and planning
 ├── truenas_cinder_driver/
-│   ├── __init__.py     # Package initialization
-│   ├── driver.py       # Core Cinder driver implementation
-│   └── api_client.py   # TrueNAS REST API client wrapper
-├── tests/              # Unit and integration tests
-├── CONTRIBUTING.md     # Contribution guidelines
-└── PLANNING.md         # Project roadmap and milestones
+│   ├── __init__.py         # Package initialization
+│   └── api_client.py       # TrueNAS REST API client wrapper
+├── tests/unit/             # Unit tests
+├── AGENTS.md               # Conventions and workflow for contributors
+├── CONTRIBUTING.md         # Contribution guidelines
+└── docs/PLANNING.md        # Project roadmap and milestones
 ```
+
+The Cinder driver itself (`driver.py`) is not implemented yet — see the
+roadmap below and the open issues.
 
 ## Development
 

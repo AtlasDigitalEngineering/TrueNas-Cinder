@@ -1,5 +1,17 @@
 # Project Planning and Roadmap
 
+> **Superseded for implementation detail.** This file is a high-level roadmap
+> only. The authoritative reference is the *TrueNAS Cinder Driver — Development
+> Plan & Implementation Spec*, which carries exact endpoint paths, payload
+> shapes, method signatures, the known gaps G1–G7, and the milestone
+> definitions. Where the two disagree, the spec wins. Issue #5 covers bringing
+> that document into `docs/`.
+>
+> Current work is tracked in GitHub issues under the milestones
+> `M1 — Minimum viable attach`, `M2 — Full lifecycle`, and
+> `M3 — Migration ready`. The issue list below is the original set only and no
+> longer reflects scope.
+
 This document outlines the development plan for the TrueNAS Cinder Driver.
 
 ## Key Milestones
