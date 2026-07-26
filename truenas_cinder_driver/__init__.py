@@ -7,6 +7,6 @@ supporting both iSCSI and NFS storage protocols.
 
 __version__ = "0.1.0"
 
-from truenas_cinder_driver.api_client import TrueNASClient
+from truenas_cinder_driver.api_client import TrueNASAPIClient
 
-__all__ = ["TrueNASClient", "__version__"]
+__all__ = ["TrueNASAPIClient", "__version__"]
