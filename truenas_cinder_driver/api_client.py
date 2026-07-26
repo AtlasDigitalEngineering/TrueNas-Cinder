@@ -13,31 +13,37 @@ from urllib.parse import quote
 # TrueNAS reports and accepts volsize in bytes; Cinder works in GB.
 GIB = 1024 ** 3
 
+# Every endpoint hangs off this prefix. Held separately so a configured
+# base_url may include it or not without producing a doubled path.
+API_PREFIX = "/api/v2.0"
 
-class TrueNASClient:
+
+class TrueNASAPIClient:
     """Client for TrueNAS Scale REST API."""
 
     def __init__(
         self,
-        host: str,
-        username: str,
-        password: str,
-        port: int = 443,
-        verify_ssl: bool = False
+        base_url: str,
+        api_key: str,
+        verify_ssl: bool = True
     ):
         """
         Initialize the TrueNAS client.
 
         Args:
-            host: TrueNAS host address (e.g., 'truenas.example.com')
-            username: Username for authentication
-            password: Password for authentication
-            port: API port (default 443)
-            verify_ssl: Whether to verify SSL certificates (default False)
+            base_url: Base URL of the appliance, with or without the
+                ``/api/v2.0`` suffix (e.g. ``https://truenas.example.com``)
+            api_key: TrueNAS API key for a service account
+            verify_ssl: Whether to verify SSL certificates (default True)
         """
-        self.base_url = f"https://{host}:{port}/api/v2.0"
+        self.base_url = base_url.rstrip("/")
+        if self.base_url.endswith(API_PREFIX):
+            self.base_url = self.base_url[:-len(API_PREFIX)]
         self.session = requests.Session()
-        self.session.auth = (username, password)
+        self.session.headers.update({
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        })
         self.session.verify = verify_ssl
 
     def _make_request(
@@ -45,7 +51,7 @@ class TrueNASClient:
         method: str,
         endpoint: str,
         **kwargs
-    ) -> Dict[str, Any]:
+    ) -> Any:
         """
         Make a request to the TrueNAS API.
 
@@ -55,13 +61,18 @@ class TrueNASClient:
             **kwargs: Additional arguments to pass to requests
 
         Returns:
-            JSON response as dictionary
+            Decoded JSON body, or ``{}`` when the response has no body.
+            List endpoints return a list, so callers must not assume a dict.
         """
-        url = f"{self.base_url}{endpoint}"
+        url = f"{self.base_url}{API_PREFIX}{endpoint}"
         response = self.session.request(method, url, **kwargs)
 
         # Raise an exception for bad status codes
         response.raise_for_status()
+
+        # DELETE and other 204s return an empty body; json() would raise.
+        if not response.content:
+            return {}
 
         return response.json()
 

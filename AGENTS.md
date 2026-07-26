@@ -36,8 +36,8 @@ class per the spec is `cinder.volume.drivers.san.san.SanISCSIDriver`.
   workflows/test.yml       # unit tests (3.10, 3.12) + flake8
   workflows/claude-code-review.yml
 truenas_cinder_driver/
-  __init__.py      # exports TrueNASClient, __version__ ("0.1.0")
-  api_client.py    # TrueNASClient — thin REST wrapper over the TrueNAS v2.0 API
+  __init__.py      # exports TrueNASAPIClient, __version__ ("0.1.0")
+  api_client.py    # TrueNASAPIClient — thin REST wrapper over the TrueNAS v2.0 API
 tests/
   __init__.py
   unit/
@@ -97,10 +97,16 @@ production VM disk as a zvol, and those are the migration's only copy. A
 dedicated test appliance is being provisioned; verify the target host and use a
 scratch pool before issuing anything that is not a read.
 
-**`api_client.py` is still incomplete** — no token auth (#10), no typed
-exceptions, retry, or timeouts (#11), and `_make_request` calls
-`response.json()` unconditionally so any empty-bodied response (notably DELETE)
-raises (#11). Check the relevant issue before assuming a capability exists.
+**`api_client.py` is still incomplete** — no typed exceptions, no retry, and no
+request timeout (#11). A hung appliance blocks a `cinder-volume` worker
+indefinitely, and callers see raw `requests` exceptions. Check the relevant
+issue before assuming a capability exists.
+
+**Auth is a Bearer API key, not a password** (#10). `truenas_api_key` is a
+service-account key and must be declared `secret=True` in `oslo_config` so it
+is redacted from logged config dumps. `verify_ssl` defaults to **True** — do
+not flip it back to make a self-signed certificate work; fix the certificate or
+set the option explicitly per deployment.
 
 **The `feature/driver-core` draft does not import.** `driver.py` on that branch
 crashes in `__init__` (`.lower()` on a bool), calls client methods that do not
