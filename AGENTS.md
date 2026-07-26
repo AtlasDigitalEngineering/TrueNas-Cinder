@@ -125,8 +125,15 @@ python3 tools/verify_endpoints.py            # read-only
 python3 tools/verify_endpoints.py --write    # + throwaway zvol lifecycle
 ```
 
-`.env` is gitignored; CI uses the `DEV_TRUENAS_API_KEY` secret. Write mode
-creates exactly one throwaway zvol and removes it in a `finally` block.
+`.env` is gitignored. Write mode creates exactly one throwaway zvol and removes
+it in a `finally` block.
+
+**This is a manual, local step — CI does not run it.** No workflow invokes
+`tools/verify_endpoints.py`, and nothing consumes the `DEV_TRUENAS_API_KEY`
+repo secret, which exists only in anticipation of the functional suite in #25.
+Wiring it into CI is not simply a matter of adding a job: GitHub-hosted runners
+have no route to a private-LAN appliance, so it needs a self-hosted runner or a
+reachable test target. Re-verification happens when someone runs the script.
 
 Extend this script when adding client methods — the point is that findings can
 be re-checked and re-run against a new TrueNAS release, not taken on trust.
