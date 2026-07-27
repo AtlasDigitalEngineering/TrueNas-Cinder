@@ -80,11 +80,13 @@ class TrueNASAPIClient:
         """
         Check if the TrueNAS End-User License Agreement (EULA) is accepted.
 
+        The endpoint returns a bare JSON boolean (``true``/``false``), not an
+        object -- verified against TrueNAS-25.10.5 in #35.
+
         Returns:
             True if EULA is accepted, False otherwise
         """
-        data = self._make_request("GET", "/truenas/is_eula_accepted")
-        return bool(data.get("accepted", False))
+        return bool(self._make_request("GET", "/truenas/is_eula_accepted"))
 
     def get_pool_list(self) -> List[Dict[str, Any]]:
         """
@@ -135,11 +137,15 @@ class TrueNASAPIClient:
         Returns:
             Information about the created zvol
         """
+        # No `volmode`: it is FreeBSD terminology and TrueNAS Scale rejects
+        # it. Worse, an unrecognised key breaks discrimination of the VOLUME
+        # schema variant, so the request falls through to the FILESYSTEM
+        # schema and every volume-only field is reported as unexpected --
+        # a 422 that points at `type` rather than the real culprit. See #35.
         payload = {
             "name": f"{pool}/{name}",
             "type": "VOLUME",
             "volsize": size_gb * GIB,
-            "volmode": "GEOM",
             "sparse": sparse,
             **kwargs
         }
@@ -217,10 +223,14 @@ class TrueNASAPIClient:
         Returns:
             List of zvol metadata dictionaries
         """
+        # `name__^` is TrueNAS's startswith operator. `name__startswith` is
+        # rejected with "Invalid operation: startswith", and the JSON
+        # `filters=[[...]]` form is worse -- it returns 200 with an empty
+        # list, so a wrong query reads as "no volumes exist". See #35.
         return self._make_request(
             "GET",
             "/pool/dataset",
-            params={"type": "VOLUME", "name__startswith": f"{pool}/"},
+            params={"type": "VOLUME", "name__^": f"{pool}/"},
         )
 
     def get_iscsi_target_list(self) -> List[Dict[str, Any]]:

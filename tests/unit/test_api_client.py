@@ -253,10 +253,16 @@ class TestCredentialHandling(TrueNASAPIClientTestCase):
 
 
 class TestEulaCheck(TrueNASAPIClientTestCase):
-    """EULA status reporting."""
+    """EULA status reporting.
 
-    def test_returns_true_when_accepted(self):
-        self._set_response({"accepted": True})
+    The endpoint returns a bare JSON boolean, not an object. The client
+    previously did ``data.get("accepted", False)``, which raised
+    ``AttributeError: 'bool' object has no attribute 'get'`` on the very
+    first call `do_setup()` makes. Verified against TrueNAS-25.10.5 in #35.
+    """
+
+    def test_returns_true_for_bare_true(self):
+        self._set_response(True)
 
         result = self.client.is_eula_accepted()
 
@@ -265,15 +271,20 @@ class TestEulaCheck(TrueNASAPIClientTestCase):
             "GET", f"{BASE_URL}/truenas/is_eula_accepted"
         )
 
-    def test_returns_false_when_not_accepted(self):
-        self._set_response({"accepted": False})
+    def test_returns_false_for_bare_false(self):
+        self._set_response(False)
 
         self.assertFalse(self.client.is_eula_accepted())
 
-    def test_returns_false_when_key_absent(self):
-        self._set_response({})
+    def test_bare_boolean_does_not_raise(self):
+        # Regression guard for the original defect: any dict-style access
+        # on the response would raise here.
+        self._set_response(False)
 
-        self.assertFalse(self.client.is_eula_accepted())
+        try:
+            self.client.is_eula_accepted()
+        except AttributeError as exc:
+            self.fail(f"treated a bare boolean as an object: {exc}")
 
 
 class TestPoolOperations(TrueNASAPIClientTestCase):
@@ -334,11 +345,21 @@ class TestZvolOperations(TrueNASAPIClientTestCase):
                 "name": "tank/volume1",
                 "type": "VOLUME",
                 "volsize": 1073741824,
-                "volmode": "GEOM",
                 "sparse": True,
             },
         )
         self.assertEqual(result["name"], "tank/volume1")
+
+    def test_create_zvol_omits_volmode(self):
+        # volmode is FreeBSD terminology and Scale rejects it. An
+        # unrecognised key breaks VOLUME schema discrimination, producing a
+        # 422 that misleadingly points at `type`. Verified in #35.
+        self._set_response({})
+
+        self.client.create_zvol(pool="tank", name="v", size_gb=1)
+
+        payload = self.session.request.call_args.kwargs["json"]
+        self.assertNotIn("volmode", payload)
 
     def test_create_zvol_converts_gb_to_bytes(self):
         self._set_response({})
@@ -417,7 +438,7 @@ class TestZvolOperations(TrueNASAPIClientTestCase):
         self.session.request.assert_called_once_with(
             "GET",
             f"{BASE_URL}/pool/dataset",
-            params={"type": "VOLUME", "name__startswith": "tank/"},
+            params={"type": "VOLUME", "name__^": "tank/"},
         )
         self.assertEqual(len(result), 1)
 

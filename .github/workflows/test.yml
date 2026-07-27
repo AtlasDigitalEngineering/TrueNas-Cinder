@@ -78,4 +78,4 @@ jobs:
           pip install flake8
 
       - name: Run flake8
-        run: flake8 truenas_cinder_driver tests
+        run: flake8 truenas_cinder_driver tests tools
