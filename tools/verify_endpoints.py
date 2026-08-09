@@ -33,7 +33,10 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from truenas_cinder_driver.api_client import (  # noqa: E402
+    TrueNASAPIAuthError,
     TrueNASAPIClient,
+    TrueNASAPIError,
+    TrueNASAPINotFoundError,
 )
 
 THROWAWAY = "cinder-verify-throwaway"
@@ -60,7 +63,15 @@ def load_env(path=".env"):
 
 
 def check(label, fn):
-    """Run a probe, reporting the outcome without aborting the run."""
+    """Run a probe, reporting the outcome without aborting the run.
+
+    Args:
+        label: Human-readable description of what is being probed
+        fn: Zero-argument callable performing the probe
+
+    Returns:
+        Whatever ``fn`` returned, or None if it raised
+    """
     try:
         result = fn()
     except Exception as exc:                     # noqa: BLE001
@@ -72,6 +83,45 @@ def check(label, fn):
         rendered = rendered[:200] + "..."
     print(f"  ok    {label}\n        -> {rendered}")
     return result
+
+
+def expect_raises(label, expected, fn, but_not=None):
+    """Probe an error path, asserting which exception type comes back.
+
+    The error mapping in ``api_client`` is the part most likely to drift on
+    a TrueNAS upgrade: it depends on undocumented status codes and on the
+    ``errno`` in a 422 body. A silent change here would turn an idempotent
+    delete back into a hard failure, so these are checked explicitly rather
+    than eyeballed.
+
+    Args:
+        label: Human-readable description of the probe
+        expected: Exception class the call is required to raise
+        fn: Zero-argument callable expected to raise
+        but_not: Subclass of ``expected`` that must *not* be raised. Needed
+            because every mapping here is a ``TrueNASAPIError``, so
+            asserting the base class alone passes vacuously.
+
+    Returns:
+        True if the probe matched
+    """
+    try:
+        result = fn()
+    except expected as exc:
+        if but_not is not None and isinstance(exc, but_not):
+            print(f"  FAIL  {label}\n        got {type(exc).__name__}, which "
+                  f"must not be a {but_not.__name__}: {str(exc)[:160]}")
+            return False
+        print(f"  ok    {label}\n        -> {type(exc).__name__}: "
+              f"{str(exc)[:160]}")
+        return True
+    except Exception as exc:                     # noqa: BLE001
+        print(f"  FAIL  {label}\n        expected {expected.__name__}, got "
+              f"{type(exc).__name__}: {str(exc)[:160]}")
+        return False
+    print(f"  FAIL  {label}\n        expected {expected.__name__}, but the "
+          f"call succeeded: {str(result)[:160]}")
+    return False
 
 
 def main():
@@ -126,6 +176,53 @@ def main():
     check("is_eula_accepted() parses it", client.is_eula_accepted)
     check("list_zvols() filter syntax", lambda: client.list_zvols(pool))
 
+    print("\nError mapping (#11)")
+    missing = "cinder-verify-does-not-exist"
+    expect_raises(
+        "GET missing dataset -> NotFound (404)",
+        TrueNASAPINotFoundError,
+        lambda: client.get_zvol(pool, missing),
+    )
+    # The important one. DELETE answers 422 with errno 2, not 404, so this
+    # is what idempotent delete_volume actually relies on.
+    expect_raises(
+        "DELETE missing dataset -> NotFound (422, errno 2)",
+        TrueNASAPINotFoundError,
+        lambda: client.delete_zvol(pool, missing),
+    )
+    expect_raises(
+        "PUT missing dataset -> NotFound (422, errno 2)",
+        TrueNASAPINotFoundError,
+        lambda: client.resize_zvol(pool, missing, new_size_gb=2),
+    )
+    expect_raises(
+        "DELETE missing iSCSI extent -> NotFound (422, errno 2)",
+        TrueNASAPINotFoundError,
+        lambda: client.delete_iscsi_extent(999999),
+    )
+    # errno 22 with a "does not exist" message. Must NOT read as NotFound,
+    # or a failed create against a misconfigured pool would be reported as
+    # a successful delete. Creates nothing -- the pool does not exist -- so
+    # this is safe in read-only mode.
+    expect_raises(
+        "create into a nonexistent pool -> plain error, NOT NotFound "
+        "(422, errno 22)",
+        TrueNASAPIError,
+        lambda: client.create_zvol(
+            pool="CinderVerifyNoSuchPool", name=missing, size_gb=1
+        ),
+        but_not=TrueNASAPINotFoundError,
+    )
+
+    bad_key_client = TrueNASAPIClient(
+        url, "1-invalidkey", verify_ssl=verify_ssl
+    )
+    expect_raises(
+        "bad API key -> AuthError (401)",
+        TrueNASAPIAuthError,
+        bad_key_client.get_pool_list,
+    )
+
     if not args.write:
         print("\nSkipping write probes. Re-run with --write to exercise "
               "create/resize/delete.")
@@ -165,7 +262,8 @@ def main():
         print(f"  ok    volumes remaining in {pool}: {remaining}")
 
     if version:
-        print(f"\nVerified against {version}. Record findings on #35.")
+        print(f"\nVerified against {version}. Record findings on the issue "
+              f"that owns the endpoint you were checking.")
 
 
 if __name__ == "__main__":

@@ -45,8 +45,8 @@ class is `cinder.volume.drivers.san.san.SanISCSIDriver`.
   workflows/test.yml       # unit tests (3.10, 3.12) + flake8
   workflows/claude-code-review.yml
 truenas_cinder_driver/
-  __init__.py      # exports TrueNASAPIClient, __version__ ("0.1.0")
-  api_client.py    # TrueNASAPIClient — thin REST wrapper over the TrueNAS v2.0 API
+  __init__.py      # exports TrueNASAPIClient, the exception hierarchy, __version__
+  api_client.py    # TrueNASAPIClient + TrueNASAPIError hierarchy — REST wrapper
 tests/
   __init__.py
   unit/
@@ -55,7 +55,7 @@ tests/
 tools/
   verify_endpoints.py  # live-appliance verification, reads .env
 .env.example       # template; .env itself is gitignored
-docs/PLANNING.md   # milestones + issue map (predates the spec, see #28)
+docs/PLANNING.md   # milestones + issue map (predates the current issues, see #28)
 tox.ini            # envlist = py310, flake8; also holds [flake8] config
 requirements.txt   # cinder (platform, not installed by CI), requests
 test-requirements.txt  # pytest, pytest-cov, coverage, flake8, tox, requests
@@ -98,9 +98,9 @@ status does **not** belong here — that is what the issue tracker is for. Run
 `gh issue list` for what is open; the milestones `M1 — Minimum viable attach`,
 `M2 — Full lifecycle`, and `M3 — Migration ready` carry the ordering.
 
-**Only the zvol and auth paths have been verified against real hardware**
-(TrueNAS-25.10.5, #35). The iSCSI pipeline (#12) and snapshot/clone (#13)
-endpoints are still design-doc guesses. Every guess checked so far has had at
+**Only the zvol, auth and error-mapping paths have been verified against real
+hardware** (TrueNAS-25.10.5, #35 and #11). The iSCSI pipeline (#12) and
+snapshot/clone (#13) endpoints are still design-doc guesses. Every guess checked so far has had at
 least one error in it — `/zfs/zvol` was not a real endpoint, `volmode: GEOM` is
 FreeBSD-only, `name__startswith` is not a valid operator, and the EULA endpoint
 returns a bare boolean rather than an object. Verify before building on any
@@ -126,7 +126,11 @@ python3 tools/verify_endpoints.py --write    # + throwaway zvol lifecycle
 ```
 
 `.env` is gitignored. Write mode creates exactly one throwaway zvol and removes
-it in a `finally` block.
+it in a `finally` block. Read-only mode also asserts the error mapping —
+`expect_raises` checks that each not-found form still produces
+`TrueNASAPINotFoundError` and that an errno-22 validation error still does
+not. That mapping rests on undocumented status codes, so it is the part most
+likely to drift on a TrueNAS upgrade.
 
 **This is a manual, local step — CI does not run it.** No workflow invokes
 `tools/verify_endpoints.py`, and nothing consumes the `DEV_TRUENAS_API_KEY`
@@ -138,16 +142,53 @@ reachable test target. Re-verification happens when someone runs the script.
 Extend this script when adding client methods — the point is that findings can
 be re-checked and re-run against a new TrueNAS release, not taken on trust.
 
-**`api_client.py` is still incomplete** — no typed exceptions, no retry, and no
-request timeout (#11). A hung appliance blocks a `cinder-volume` worker
-indefinitely, and callers see raw `requests` exceptions. Check the relevant
-issue before assuming a capability exists.
+**Every client failure is a `TrueNASAPIError` subclass** (#11) — including
+network ones, so a caller never sees a raw `requests` exception and `#14` can
+translate to `VolumeBackendAPIException` with one `except`. Requests carry a
+default `(10s, 60s)` timeout; 429 and 503 are retried with backoff. **Timeouts
+are deliberately not retried** — a read timeout does not mean the appliance
+stopped working on the request, so replaying a create or delete on top of one
+is worse than failing. Making retry idempotency-aware is #12's problem.
+
+**"Object not found" has two forms, and the obvious one is the wrong one.**
+Verified on TrueNAS-25.10.5 (#11):
+
+| Operation                        | Status | Body            |
+| -------------------------------- | ------ | --------------- |
+| `GET /pool/dataset/id/<missing>`  | 404    | `{"message": ""}` |
+| `DELETE /pool/dataset/id/<missing>` | 422  | `errno: 2`      |
+| `PUT /pool/dataset/id/<missing>`  | 422    | `errno: 2`      |
+| `DELETE /iscsi/extent/id/<missing>` | 422  | `errno: 2`      |
+
+`DELETE` — the one operation idempotent deletes depend on — is in the 422
+group, so a 404-only mapping compiles, passes review, and never fires where it
+matters. Match on **`errno`, never the message text**: creating into a
+nonexistent pool returns errno `22` with the message `zpool (X) does not
+exist.`, and string matching would report that failed create as a successful
+delete. `_is_enoent` requires *every* reported error to be ENOENT, because a
+false "already gone" loses a volume while a false "still there" only fails a
+no-op.
+
+**A mistyped endpoint also returns 404**, so a caller swallowing
+`TrueNASAPINotFoundError` for idempotency will read a wrong path as a
+successful delete. Run `tools/verify_endpoints.py` against real hardware
+before trusting any new path.
 
 **Auth is a Bearer API key, not a password** (#10). `truenas_api_key` is a
 service-account key and must be declared `secret=True` in `oslo_config` so it
 is redacted from logged config dumps. `verify_ssl` defaults to **True** — do
 not flip it back to make a self-signed certificate work; fix the certificate or
 set the option explicitly per deployment.
+
+A `base_url` containing inline credentials (`https://user:pass@host`) is
+**rejected at construction** (#11), for two verified reasons: requests turns
+the userinfo into a Basic header that *overwrites* the Bearer key, silently
+discarding the API key; and it keeps the userinfo in `response.url`, which
+`raise_for_status()` bakes into the `HTTPError` chained as `__cause__` — so
+`LOG.exception` prints the password no matter how carefully this module words
+its own messages. **Wording your own exception messages carefully is not a
+credential guarantee** when you chain an upstream exception; check what the
+whole formatted chain contains, not just `str(err)`.
 
 **The `feature/driver-core` draft does not import.** `driver.py` on that branch
 crashes in `__init__` (`.lower()` on a bool), calls client methods that do not
