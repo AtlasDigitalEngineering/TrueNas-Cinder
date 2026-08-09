@@ -14,7 +14,7 @@ import logging
 import time
 import requests
 from typing import Callable, Dict, Any, Optional, List, Tuple, Union
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 
 LOG = logging.getLogger(__name__)
@@ -164,10 +164,34 @@ class TrueNASAPIClient:
             backoff_factor: Base delay in seconds for exponential backoff
 
         Raises:
-            ValueError: If max_attempts is less than 1
+            ValueError: If max_attempts is less than 1, or if base_url
+                carries inline credentials
         """
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
+        # Reject https://user:pass@host outright. Two independent reasons,
+        # both verified against requests 2.x:
+        #
+        # 1. It does not work. PreparedRequest.prepare_auth() turns the
+        #    userinfo into a Basic header that *overwrites* the Bearer key
+        #    set below, so the API key is silently discarded and every call
+        #    401s.
+        # 2. It leaks. requests keeps the userinfo in `response.url`, and
+        #    Response.raise_for_status() builds its message as
+        #    "<status> <reason> for url: <url>". That HTTPError is chained
+        #    as __cause__ of the typed error raised here, so LOG.exception
+        #    or any traceback formatting prints the password -- regardless
+        #    of how carefully this module words its own messages.
+        #
+        # Nothing here supports inline credentials (auth is a Bearer API
+        # key, #10), so failing loudly beats silently reinterpreting it.
+        if urlsplit(base_url).username is not None:
+            raise ValueError(
+                "base_url must not contain inline credentials "
+                "(https://user:pass@host). Authentication uses the "
+                "truenas_api_key Bearer token; a userinfo component "
+                "overrides it and leaks into logged tracebacks."
+            )
         self.base_url = base_url.rstrip("/")
         if self.base_url.endswith(API_PREFIX):
             self.base_url = self.base_url[:-len(API_PREFIX)]
@@ -180,6 +204,22 @@ class TrueNASAPIClient:
             "Content-Type": "application/json",
         })
         self.session.verify = verify_ssl
+
+    def _timeout_description(self) -> str:
+        """
+        Render the configured timeout for a log or error message.
+
+        The default is a ``(connect, read)`` pair, which interpolates as
+        "(10.0, 60.0)s" and reads poorly in a log line -- and hides which
+        half of the budget was actually exceeded.
+
+        Returns:
+            Human-readable description of the timeout budget
+        """
+        if isinstance(self.timeout, (tuple, list)):
+            connect, read = self.timeout
+            return f"connect {connect}s, read {read}s"
+        return f"{self.timeout}s"
 
     @staticmethod
     def _response_detail(response: Any, limit: int = 500) -> str:
@@ -284,9 +324,11 @@ class TrueNASAPIClient:
         except requests.HTTPError as exc:
             status = response.status_code
             detail = self._response_detail(response)
-            # `endpoint`, never the full URL: a base_url carrying inline
-            # credentials (https://user:pass@host) would otherwise put them
-            # in an exception message that is very likely to be logged.
+            # `endpoint`, not the full URL. This alone is not a credential
+            # guarantee -- the chained HTTPError below carries requests'
+            # own "for url: <url>" message, which is outside this module's
+            # control. The actual guarantee comes from __init__ refusing a
+            # base_url with userinfo; this just keeps the message tidy.
             message = f"TrueNAS API {method} {endpoint} failed: HTTP {status}"
             if detail:
                 message = f"{message}: {detail}"
@@ -346,9 +388,9 @@ class TrueNASAPIClient:
                 response = self.session.request(method, url, **kwargs)
             except requests.Timeout as exc:
                 raise TrueNASAPITimeoutError(
-                    f"TrueNAS API {method} {endpoint} timed out after "
-                    f"{self.timeout}s. The appliance may still be processing "
-                    f"it.",
+                    f"TrueNAS API {method} {endpoint} timed out "
+                    f"({self._timeout_description()}). The appliance may "
+                    f"still be processing it.",
                     method=method,
                     endpoint=endpoint,
                 ) from exc

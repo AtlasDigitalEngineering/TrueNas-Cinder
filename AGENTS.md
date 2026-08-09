@@ -180,6 +180,16 @@ is redacted from logged config dumps. `verify_ssl` defaults to **True** — do
 not flip it back to make a self-signed certificate work; fix the certificate or
 set the option explicitly per deployment.
 
+A `base_url` containing inline credentials (`https://user:pass@host`) is
+**rejected at construction** (#11), for two verified reasons: requests turns
+the userinfo into a Basic header that *overwrites* the Bearer key, silently
+discarding the API key; and it keeps the userinfo in `response.url`, which
+`raise_for_status()` bakes into the `HTTPError` chained as `__cause__` — so
+`LOG.exception` prints the password no matter how carefully this module words
+its own messages. **Wording your own exception messages carefully is not a
+credential guarantee** when you chain an upstream exception; check what the
+whole formatted chain contains, not just `str(err)`.
+
 **The `feature/driver-core` draft does not import.** `driver.py` on that branch
 crashes in `__init__` (`.lower()` on a bool), calls client methods that do not
 exist, treats dict responses as objects, reads config from `os.environ` instead

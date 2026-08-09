@@ -29,6 +29,7 @@ Add coverage as part of those issues, not by pinning today's behaviour.
 
 import json
 import logging
+import traceback
 import unittest
 from unittest import mock
 
@@ -322,32 +323,111 @@ class TestCredentialHandling(TrueNASAPIClientTestCase):
 
         self.assertNotIn("super-secret-key", str(ctx.exception))
 
-    def test_inline_url_credentials_absent_from_exception_message(self):
-        # Why error messages carry `endpoint` and not the full URL. A
-        # base_url with inline credentials is legal and requests honours
-        # it, so interpolating the URL would put a password into a message
-        # that Cinder will log.
-        client = self._failing_client(
-            "https://admin:hunter2@nas.internal", API_KEY
-        )
+    def test_endpoint_not_url_in_message(self):
+        client = self._failing_client("https://nas.internal", API_KEY)
 
         with self.assertRaises(TrueNASAPIError) as ctx:
             client.get_pool_list()
 
-        self.assertNotIn("hunter2", str(ctx.exception))
         self.assertIn("/pool", str(ctx.exception))
+        self.assertNotIn("nas.internal", str(ctx.exception))
 
-    def test_inline_url_credentials_absent_from_timeout_message(self):
+
+class TestCredentialsInExceptionChain(TrueNASAPIClientTestCase):
+    """The typed exception is not the only thing that gets logged.
+
+    ``raise ... from exc`` keeps the original ``requests.HTTPError`` as
+    ``__cause__``, and *its* message is built by
+    ``Response.raise_for_status()`` as ``"<status> <reason> for url:
+    <response.url>"``. requests does not strip userinfo from that URL, so
+    a ``base_url`` carrying inline credentials puts a password into
+    anything that formats the chain -- ``LOG.exception``,
+    ``traceback.format_exc``, Cinder's unhandled-exception logging.
+
+    Asserting on ``str(typed_error)`` alone cannot see this, and a mocked
+    ``HTTPError`` never builds the offending message in the first place.
+    These tests therefore use real ``requests.Response`` objects and format
+    the whole chain. Found in review of #11.
+    """
+
+    @staticmethod
+    def _real_response(url, status=401, body=b"Invalid API key"):
+        """A genuine requests.Response, not a mock.
+
+        The leak lives in requests' own message construction, so a
+        MagicMock cannot reproduce it.
+        """
+        response = requests.Response()
+        response.status_code = status
+        response.reason = "Unauthorized"
+        response.url = url
+        response._content = body
+        return response
+
+    def test_requests_really_does_leak_userinfo(self):
+        # Pins the upstream behaviour the __init__ guard exists for. If
+        # requests ever starts redacting, this fails and the guard can be
+        # reconsidered rather than cargo-culted.
+        response = self._real_response(
+            "https://admin:hunter2@nas.internal/api/v2.0/pool"
+        )
+
+        with self.assertRaises(requests.HTTPError) as ctx:
+            response.raise_for_status()
+
+        self.assertIn("hunter2", str(ctx.exception))
+
+    def test_inline_credentials_rejected_at_construction(self):
+        with self.assertRaises(ValueError) as ctx:
+            TrueNASAPIClient(
+                base_url="https://admin:hunter2@nas.internal",
+                api_key=API_KEY,
+            )
+
+        # The rejection itself must not echo what it rejected.
+        self.assertNotIn("hunter2", str(ctx.exception))
+
+    def test_username_without_password_also_rejected(self):
+        # Still overrides the Bearer header, so still broken.
+        with self.assertRaises(ValueError):
+            TrueNASAPIClient(
+                base_url="https://admin@nas.internal", api_key=API_KEY
+            )
+
+    def test_inline_credentials_would_have_broken_bearer_auth(self):
+        # The second reason for rejecting rather than sanitising: requests
+        # replaces our Bearer header with Basic derived from the userinfo,
+        # so the API key is silently discarded.
+        session = requests.Session()
+        session.headers.update({"Authorization": "Bearer my-api-key"})
+        prepared = session.prepare_request(
+            requests.Request("GET", "https://admin:hunter2@nas.internal/x")
+        )
+
+        self.assertNotIn("Bearer", prepared.headers["Authorization"])
+
+    def test_full_exception_chain_carries_no_credentials(self):
+        # End to end, formatted the way LOG.exception would format it.
         client = TrueNASAPIClient(
-            base_url="https://admin:hunter2@nas.internal", api_key=API_KEY
+            base_url="https://nas.internal", api_key="super-secret-key"
         )
         client.session = mock.MagicMock()
-        client.session.request.side_effect = requests.ReadTimeout("slow")
+        client.session.request.return_value = self._real_response(
+            "https://nas.internal/api/v2.0/pool"
+        )
 
         with self.assertRaises(TrueNASAPIError) as ctx:
             client.get_pool_list()
 
-        self.assertNotIn("hunter2", str(ctx.exception))
+        rendered = "".join(
+            traceback.format_exception(
+                type(ctx.exception), ctx.exception,
+                ctx.exception.__traceback__,
+            )
+        )
+        self.assertIn("__cause__", dir(ctx.exception))
+        self.assertNotIn("super-secret-key", rendered)
+        self.assertNotIn("hunter2", rendered)
 
 
 class TestEulaCheck(TrueNASAPIClientTestCase):
@@ -877,6 +957,27 @@ class TestTimeouts(TrueNASAPIClientTestCase):
             self.client.delete_zvol("tank", "v")
 
         self.assertIn("may still be processing", str(ctx.exception))
+
+    def test_timeout_message_names_both_halves_of_the_budget(self):
+        # "(10.0, 60.0)s" hides which half was exceeded.
+        self.session.request.side_effect = requests.ReadTimeout("slow")
+
+        with self.assertRaises(TrueNASAPITimeoutError) as ctx:
+            self.client.get_pool_list()
+
+        self.assertIn("connect 10.0s, read 60.0s", str(ctx.exception))
+
+    def test_scalar_timeout_rendered_plainly(self):
+        client = TrueNASAPIClient(
+            base_url="https://nas.internal", api_key=API_KEY, timeout=30
+        )
+        client.session = mock.MagicMock()
+        client.session.request.side_effect = requests.ReadTimeout("slow")
+
+        with self.assertRaises(TrueNASAPITimeoutError) as ctx:
+            client.get_pool_list()
+
+        self.assertIn("30s", str(ctx.exception))
 
     def test_connection_error_becomes_typed_error(self):
         self.session.request.side_effect = requests.ConnectionError("refused")
