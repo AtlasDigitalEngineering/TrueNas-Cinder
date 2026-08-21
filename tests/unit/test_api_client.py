@@ -7,24 +7,23 @@ failure, so a mock that has stopped working surfaces immediately instead of
 hanging on DNS or silently depending on runner network policy.
 
 These tests pin the client's *current* behaviour. Zvol operations moved to
-``/pool/dataset`` in #9, auth moved to a Bearer API key in #10, and error
-handling gained typed exceptions, timeouts and retry in #11. The zvol, auth
-and error-mapping paths have been checked against a real appliance
-(TrueNAS-25.10.5) in #35 and #11; the status codes and 422 bodies asserted
-below are transcribed from that appliance, not invented.
+``/pool/dataset`` in #9, auth moved to a Bearer API key in #10, error handling
+gained typed exceptions, timeouts and retry in #11, and the iSCSI pipeline
+landed in #12. The zvol, auth, error-mapping and iSCSI paths have all been
+checked against a real appliance (TrueNAS-25.10.5) in #35, #11 and #12; the
+status codes, 422 bodies and payload shapes asserted below are transcribed
+from that appliance, not invented.
 
-Coverage is deliberately partial. These methods are untested here because the
-issues that rewrite them carry their own test requirements, and pinning the
-current shapes would only create churn:
+Several iSCSI tests assert what the client must *not* send -- title-case
+``type``, a zvol in ``path``, ``auth_network``, ``delete_extents``. Those are
+not hypothetical: each is a payload the appliance rejected or a flag that
+would cause data loss, and a plain "does it work" test would not catch their
+return.
 
-- ``get_iscsi_target_list``, ``create_iscsi_extent``, ``delete_iscsi_extent``,
-  ``delete_iscsi_target``, ``delete_iscsi_target_extent`` -- rewritten by #12
-  (iSCSI pipeline), which replaces the extent ``path``/``type`` shapes.
-- ``get_snapshot_list``, ``create_snapshot``, ``delete_snapshot`` -- rewritten
-  by #13 (snapshot/clone), which changes the signatures from opaque ``id`` and
-  pre-joined ``dataset`` strings to ``pool``/``zvol``/``snap`` components.
-
-Add coverage as part of those issues, not by pinning today's behaviour.
+Coverage is deliberately partial. ``get_snapshot_list``, ``create_snapshot``
+and ``delete_snapshot`` are untested here because #13 rewrites them: they
+currently target ``/zfs/snapshot``, which is a **404** on 25.10.5, so pinning
+today's behaviour would pin a bug. Add coverage as part of that issue.
 """
 
 import json
@@ -640,34 +639,340 @@ class TestZvolOperations(TrueNASAPIClientTestCase):
         )
 
 
-class TestIscsiOperations(TrueNASAPIClientTestCase):
-    """iSCSI target and target-extent request shapes."""
+VOLUME = "volume-4d9e1a5c-8f3b-4a21-9c77-2e6b0f1d3a84"
+IQN_A = "iqn.2005-03.org.open-iscsi:nova-compute-01"
+IQN_B = "iqn.2005-03.org.open-iscsi:nova-compute-02"
 
-    def test_create_iscsi_target_posts_expected_payload(self):
+
+class IscsiTestCase(TrueNASAPIClientTestCase):
+    """Adds a helper for probes that make more than one request."""
+
+    def _set_responses(self, *payloads):
+        """Queue one canned JSON response per subsequent request."""
+        responses = []
+        for payload in payloads:
+            response = mock.MagicMock()
+            response.json.return_value = payload
+            response.raise_for_status.return_value = None
+            responses.append(response)
+        self.session.request.side_effect = responses
+        return responses
+
+    def _payload(self, call_index=0):
+        """Return the JSON body of the nth request the client made."""
+        return self.session.request.call_args_list[call_index].kwargs["json"]
+
+
+class TestIscsiGlobalAndPortal(IscsiTestCase):
+    """Global config and portal discovery/creation."""
+
+    def test_zvol_disk_path_has_no_dev_prefix(self):
+        # Verified against GET /iscsi/extent/disk_choices, which returned
+        # exactly "zvol/Dev-Pool/<name>" as an acceptable `disk` value.
+        self.assertEqual(
+            self.client.zvol_disk_path("Dev-Pool", VOLUME),
+            f"zvol/Dev-Pool/{VOLUME}",
+        )
+
+    def test_zvol_disk_path_rejects_the_shipped_dev_form(self):
+        self.assertNotIn(
+            "/dev/", self.client.zvol_disk_path("Dev-Pool", VOLUME)
+        )
+
+    def test_get_iscsi_global_config_reads_basename(self):
         self._set_response({
             "id": 1,
-            "name": "iqn.2005-10.org.freenas.ctl:volume1",
+            "basename": "iqn.2005-10.org.freenas.ctl",
+            "listen_port": 3260,
         })
 
-        result = self.client.create_iscsi_target(
-            name="iqn.2005-10.org.freenas.ctl:volume1"
+        result = self.client.get_iscsi_global_config()
+
+        self.session.request.assert_called_once_with(
+            "GET", f"{BASE_URL}/iscsi/global", timeout=DEFAULT_TIMEOUT,
         )
+        self.assertEqual(result["basename"], "iqn.2005-10.org.freenas.ctl")
+
+    def test_get_portals_returns_empty_list_on_clean_appliance(self):
+        # The design spec assumed portals pre-exist. A fresh appliance has
+        # none, so callers must cope with [].
+        self._set_response([])
+
+        self.assertEqual(self.client.get_portals(), [])
+
+    def test_create_portal_defaults_to_all_addresses(self):
+        self._set_response({"id": 1, "listen": [{"ip": "0.0.0.0",
+                                                 "port": 3260}], "tag": 1})
+
+        portal_id = self.client.create_portal()
+
+        self.session.request.assert_called_once_with(
+            "POST",
+            f"{BASE_URL}/iscsi/portal",
+            json={"listen": [{"ip": "0.0.0.0"}], "comment": ""},
+            timeout=DEFAULT_TIMEOUT,
+        )
+        self.assertEqual(portal_id, 1)
+
+    def test_create_portal_wraps_each_ip_in_an_object(self):
+        # `listen` items are objects with an `ip` key, not bare strings.
+        self._set_response({"id": 2})
+
+        self.client.create_portal(listen_ips=["10.0.0.5", "10.0.0.6"])
+
+        self.assertEqual(
+            self._payload()["listen"],
+            [{"ip": "10.0.0.5"}, {"ip": "10.0.0.6"}],
+        )
+
+    def test_create_portal_does_not_send_a_port(self):
+        # `port` is response-only; it comes from the global listen_port.
+        self._set_response({"id": 3})
+
+        self.client.create_portal()
+
+        for item in self._payload()["listen"]:
+            self.assertNotIn("port", item)
+
+
+class TestInitiatorGroups(IscsiTestCase):
+    """get_or_create_initiator_group deduplication."""
+
+    def test_reuses_an_exact_match_without_posting(self):
+        self._set_response([
+            {"id": 4, "initiators": [IQN_A]},
+        ])
+
+        group_id = self.client.get_or_create_initiator_group([IQN_A])
+
+        self.assertEqual(group_id, 4)
+        self.session.request.assert_called_once_with(
+            "GET", f"{BASE_URL}/iscsi/initiator", timeout=DEFAULT_TIMEOUT,
+        )
+
+    def test_match_ignores_ordering(self):
+        self._set_response([
+            {"id": 5, "initiators": [IQN_B, IQN_A]},
+        ])
+
+        self.assertEqual(
+            self.client.get_or_create_initiator_group([IQN_A, IQN_B]), 5
+        )
+
+    def test_creates_when_nothing_matches(self):
+        self._set_responses([{"id": 4, "initiators": [IQN_B]}], {"id": 9})
+
+        group_id = self.client.get_or_create_initiator_group([IQN_A])
+
+        self.assertEqual(group_id, 9)
+        self.assertEqual(self.session.request.call_count, 2)
+        self.assertEqual(self._payload(1), {"initiators": [IQN_A]})
+
+    def test_subset_is_not_a_match(self):
+        # A group permitting two hosts must not be reused for one host --
+        # that would silently widen access.
+        self._set_responses([{"id": 4, "initiators": [IQN_A, IQN_B]}],
+                            {"id": 10})
+
+        self.assertEqual(
+            self.client.get_or_create_initiator_group([IQN_A]), 10
+        )
+
+    def test_superset_is_not_a_match(self):
+        self._set_responses([{"id": 4, "initiators": [IQN_A]}], {"id": 11})
+
+        self.assertEqual(
+            self.client.get_or_create_initiator_group([IQN_A, IQN_B]), 11
+        )
+
+    def test_group_with_no_initiators_is_never_reused(self):
+        # An empty `initiators` list means "allow every initiator" on
+        # TrueNAS. Reusing it would export the volume to the whole network.
+        self._set_responses([{"id": 1, "initiators": []}], {"id": 12})
+
+        self.assertEqual(
+            self.client.get_or_create_initiator_group([IQN_A]), 12
+        )
+
+    def test_empty_request_is_refused(self):
+        with self.assertRaises(ValueError) as caught:
+            self.client.get_or_create_initiator_group([])
+
+        self.assertIn("allow all initiators", str(caught.exception))
+        self.session.request.assert_not_called()
+
+    def test_missing_initiators_key_does_not_crash(self):
+        self._set_responses([{"id": 1}], {"id": 13})
+
+        self.assertEqual(
+            self.client.get_or_create_initiator_group([IQN_A]), 13
+        )
+
+    def test_does_not_send_auth_network(self):
+        # The design spec's payload included `auth_network`. That field does
+        # not exist on /iscsi/initiator -- auth_networks lives on the target.
+        self._set_responses([], {"id": 14})
+
+        self.client.get_or_create_initiator_group([IQN_A])
+
+        self.assertNotIn("auth_network", self._payload(1))
+        self.assertNotIn("auth_networks", self._payload(1))
+
+
+class TestExtents(IscsiTestCase):
+    """Extent creation -- the payload the shipped client got wrong twice."""
+
+    def test_create_extent_sends_name_and_disk_only(self):
+        self._set_response({"id": 2, "name": VOLUME})
+
+        extent_id = self.client.create_extent(
+            f"zvol/Dev-Pool/{VOLUME}", VOLUME
+        )
+
+        self.session.request.assert_called_once_with(
+            "POST",
+            f"{BASE_URL}/iscsi/extent",
+            json={"name": VOLUME, "disk": f"zvol/Dev-Pool/{VOLUME}"},
+            timeout=DEFAULT_TIMEOUT,
+        )
+        self.assertEqual(extent_id, 2)
+
+    def test_create_extent_never_sends_title_case_type(self):
+        # The appliance rejects type "Disk": the enum is ['DISK', 'FILE'].
+        # Omitting the field entirely gets the right default.
+        self._set_response({"id": 2})
+
+        self.client.create_extent(f"zvol/Dev-Pool/{VOLUME}", VOLUME)
+
+        self.assertNotEqual(self._payload().get("type"), "Disk")
+
+    def test_create_extent_never_sends_the_zvol_as_path(self):
+        # `path` is the FILE-extent field. Sending the zvol there fails
+        # with "iscsi_extent_create.disk: This field is required".
+        self._set_response({"id": 2})
+
+        self.client.create_extent(f"zvol/Dev-Pool/{VOLUME}", VOLUME)
+
+        self.assertNotIn("path", self._payload())
+
+    def test_create_extent_returns_id_not_dict(self):
+        self._set_response({"id": 42, "name": VOLUME, "naa": "0x6589cfc0"})
+
+        self.assertEqual(
+            self.client.create_extent("zvol/Dev-Pool/x", "x"), 42
+        )
+
+    def test_create_extent_rejects_a_response_without_an_id(self):
+        self._set_response({"name": VOLUME})
+
+        with self.assertRaises(TrueNASAPIError) as caught:
+            self.client.create_extent("zvol/Dev-Pool/x", "x")
+
+        self.assertIn("no usable id", str(caught.exception))
+
+    def test_delete_extent_sends_no_destructive_options(self):
+        # `remove` deletes the backing file and `force` deletes an extent
+        # in use. Both default to false; sending nothing keeps them there.
+        self._set_response({})
+
+        self.client.delete_extent(7)
+
+        self.session.request.assert_called_once_with(
+            "DELETE", f"{BASE_URL}/iscsi/extent/id/7",
+            timeout=DEFAULT_TIMEOUT,
+        )
+
+    def test_get_extents_lists(self):
+        self._set_response([{"id": 1, "name": VOLUME}])
+
+        self.assertEqual(len(self.client.get_extents()), 1)
+        self.session.request.assert_called_once_with(
+            "GET", f"{BASE_URL}/iscsi/extent", timeout=DEFAULT_TIMEOUT,
+        )
+
+
+class TestTargets(IscsiTestCase):
+    """Target creation, validation and deletion."""
+
+    def test_create_target_binds_portal_and_initiator(self):
+        self._set_response({"id": 3, "name": VOLUME})
+
+        target_id = self.client.create_target(VOLUME, 4, 1)
 
         self.session.request.assert_called_once_with(
             "POST",
             f"{BASE_URL}/iscsi/target",
             json={
-                "name": "iqn.2005-10.org.freenas.ctl:volume1",
-                "alias": None,
+                "name": VOLUME,
+                "groups": [{
+                    "portal": 1,
+                    "initiator": 4,
+                    "authmethod": "NONE",
+                }],
             },
             timeout=DEFAULT_TIMEOUT,
         )
-        self.assertEqual(result["id"], 1)
+        self.assertEqual(target_id, 3)
 
-    def test_create_iscsi_target_extent_posts_ids(self):
-        self._set_response({"id": 7})
+    def test_create_target_uses_no_chap(self):
+        # CHAP is deferred past v1 (#27) and the driver must never invent a
+        # secret (#15).
+        self._set_response({"id": 3})
 
-        self.client.create_iscsi_target_extent(
+        self.client.create_target(VOLUME, 4, 1)
+
+        group = self._payload()["groups"][0]
+        self.assertEqual(group["authmethod"], "NONE")
+        self.assertNotIn("auth", group)
+
+    def test_delete_target_never_sends_delete_extents(self):
+        # `delete_extents: true` would widen an export teardown into
+        # destroying the extent behind a volume that still exists.
+        self._set_response({})
+
+        self.client.delete_target(3)
+
+        self.session.request.assert_called_once_with(
+            "DELETE", f"{BASE_URL}/iscsi/target/id/3",
+            timeout=DEFAULT_TIMEOUT,
+        )
+
+    def test_validate_target_name_returns_none_when_acceptable(self):
+        self._set_response(None)
+
+        self.assertIsNone(self.client.validate_target_name(VOLUME))
+        self.session.request.assert_called_once_with(
+            "POST",
+            f"{BASE_URL}/iscsi/target/validate_name",
+            json={"name": VOLUME},
+            timeout=DEFAULT_TIMEOUT,
+        )
+
+    def test_get_targets_lists(self):
+        self._set_response([{"id": 3, "name": VOLUME, "groups": []}])
+
+        self.assertEqual(len(self.client.get_targets()), 1)
+        self.session.request.assert_called_once_with(
+            "GET", f"{BASE_URL}/iscsi/target", timeout=DEFAULT_TIMEOUT,
+        )
+
+    def test_validate_target_name_returns_the_reason_when_not(self):
+        reason = ("Only lowercase alphanumeric characters plus dot (.), "
+                  "dash (-), and colon (:) are allowed.")
+        self._set_response(reason)
+
+        self.assertEqual(
+            self.client.validate_target_name("Volume_1"), reason
+        )
+
+
+class TestTargetExtents(IscsiTestCase):
+    """Target-to-extent association."""
+
+    def test_create_target_extent_posts_ids(self):
+        self._set_response({"id": 7, "target": 1, "extent": 2, "lunid": 3})
+
+        link_id = self.client.create_target_extent(
             target_id=1, extent_id=2, lun_id=3
         )
 
@@ -677,6 +982,103 @@ class TestIscsiOperations(TrueNASAPIClientTestCase):
             json={"target": 1, "extent": 2, "lunid": 3},
             timeout=DEFAULT_TIMEOUT,
         )
+        self.assertEqual(link_id, 7)
+
+    def test_lun_defaults_to_zero(self):
+        self._set_response({"id": 7})
+
+        self.client.create_target_extent(target_id=1, extent_id=2)
+
+        self.assertEqual(self._payload()["lunid"], 0)
+
+    def test_get_target_extents_lists(self):
+        self._set_response([
+            {"id": 3, "target": 3, "extent": 3, "lunid": 0},
+        ])
+
+        self.assertEqual(len(self.client.get_target_extents()), 1)
+        self.session.request.assert_called_once_with(
+            "GET", f"{BASE_URL}/iscsi/targetextent", timeout=DEFAULT_TIMEOUT,
+        )
+
+    def test_delete_target_extent_uses_the_id_path(self):
+        self._set_response({})
+
+        self.client.delete_target_extent(7)
+
+        self.session.request.assert_called_once_with(
+            "DELETE", f"{BASE_URL}/iscsi/targetextent/id/7",
+            timeout=DEFAULT_TIMEOUT,
+        )
+
+    def test_already_cascaded_link_surfaces_as_not_found(self):
+        # Deleting either end cascades the link, so an explicit delete
+        # afterwards hits 422/errno 2. That must map to NotFound, which is
+        # what makes best_effort_delete swallow it.
+        self._set_error(422, {
+            "null": [
+                {"message": "iSCSITargetToExtent 7 does not exist",
+                 "errno": 2}
+            ]
+        })
+
+        with self.assertRaises(TrueNASAPINotFoundError):
+            self.client.delete_target_extent(7)
+
+
+class TestIscsiService(IscsiTestCase):
+    """Service state -- the difference between reload and start."""
+
+    def test_get_iscsi_service_filters_and_unwraps(self):
+        self._set_response([
+            {"id": 7, "service": "iscsitarget", "enable": False,
+             "state": "STOPPED"},
+        ])
+
+        service = self.client.get_iscsi_service()
+
+        self.session.request.assert_called_once_with(
+            "GET", f"{BASE_URL}/service",
+            params={"service": "iscsitarget"},
+            timeout=DEFAULT_TIMEOUT,
+        )
+        self.assertEqual(service["state"], "STOPPED")
+
+    def test_get_iscsi_service_raises_when_absent(self):
+        self._set_response([])
+
+        with self.assertRaises(TrueNASAPIError) as caught:
+            self.client.get_iscsi_service()
+
+        self.assertIn("iscsitarget", str(caught.exception))
+
+    def test_start_posts_the_service_name(self):
+        self._set_response(True)
+
+        self.assertTrue(self.client.start_iscsi_service())
+        self.session.request.assert_called_once_with(
+            "POST", f"{BASE_URL}/service/start",
+            json={"service": "iscsitarget"},
+            timeout=DEFAULT_TIMEOUT,
+        )
+
+    def test_reload_posts_the_service_name(self):
+        self._set_response(True)
+
+        self.assertTrue(self.client.reload_iscsi_service())
+        self.session.request.assert_called_once_with(
+            "POST", f"{BASE_URL}/service/reload",
+            json={"service": "iscsitarget"},
+            timeout=DEFAULT_TIMEOUT,
+        )
+
+    def test_reload_reports_false_against_a_stopped_service(self):
+        # The appliance answers `false` and leaves the service stopped.
+        # Returning that verbatim is what lets a caller notice the config
+        # it just wrote is inert.
+        self._set_response(False)
+
+        self.assertFalse(self.client.reload_iscsi_service())
 
 
 # Error bodies below are transcribed verbatim from TrueNAS-25.10.5. The field
