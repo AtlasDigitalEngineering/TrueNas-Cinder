@@ -948,6 +948,14 @@ class TestTargets(IscsiTestCase):
             timeout=DEFAULT_TIMEOUT,
         )
 
+    def test_get_targets_lists(self):
+        self._set_response([{"id": 3, "name": VOLUME, "groups": []}])
+
+        self.assertEqual(len(self.client.get_targets()), 1)
+        self.session.request.assert_called_once_with(
+            "GET", f"{BASE_URL}/iscsi/target", timeout=DEFAULT_TIMEOUT,
+        )
+
     def test_validate_target_name_returns_the_reason_when_not(self):
         reason = ("Only lowercase alphanumeric characters plus dot (.), "
                   "dash (-), and colon (:) are allowed.")
@@ -982,6 +990,16 @@ class TestTargetExtents(IscsiTestCase):
         self.client.create_target_extent(target_id=1, extent_id=2)
 
         self.assertEqual(self._payload()["lunid"], 0)
+
+    def test_get_target_extents_lists(self):
+        self._set_response([
+            {"id": 3, "target": 3, "extent": 3, "lunid": 0},
+        ])
+
+        self.assertEqual(len(self.client.get_target_extents()), 1)
+        self.session.request.assert_called_once_with(
+            "GET", f"{BASE_URL}/iscsi/targetextent", timeout=DEFAULT_TIMEOUT,
+        )
 
     def test_delete_target_extent_uses_the_id_path(self):
         self._set_response({})
