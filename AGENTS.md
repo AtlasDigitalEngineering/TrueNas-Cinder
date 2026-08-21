@@ -81,15 +81,27 @@ python -m unittest discover -s tests -t .  # discover path, also run in CI
 
 Use `python -m pytest`, not bare `pytest` — see the packaging note above.
 
-**Environment caveats on this machine:**
-- `python3` is 3.14; `python3 -m venv` fails — `python3-venv` is not installed.
-- `pytest`, `flake8`, `tox`, and `cinder` are **not** installed system-wide;
-  only `requests` is. Run the suite with
-  `python3 -m unittest discover -s tests -t .` as the fallback — it needs no
-  third-party packages and is what has been used to verify every change so far.
+**Environment caveats.** Don't assume a usable interpreter is on `PATH` — the
+dev machines differ:
+- On the **NixOS** workstation there is no system `python3` at all. Everything
+  runs through a shell:
+  ```bash
+  nix-shell -p python3 python3Packages.requests python3Packages.flake8 \
+    --run 'python3 -m flake8 truenas_cinder_driver tools tests'
+  nix-shell -p python3 python3Packages.requests \
+    --run 'python3 -m unittest discover -s tests -t .'
+  ```
+- Where a system Python does exist, `pytest`, `flake8`, `tox` and `cinder` are
+  generally *not* installed, so
+  `python3 -m unittest discover -s tests -t .` is the dependable fallback — it
+  needs nothing beyond `requests`.
 - Cinder is deliberately not installed by CI. The driver is loaded *by* a Cinder
   deployment that already provides it, and installing it costs minutes for no
   benefit while only `api_client.py` (requests-only) is under test.
+- **Clear `__pycache__` before trusting a test result after a scripted edit.**
+  A same-size change written within the same mtime second leaves a stale `.pyc`
+  that Python considers valid, so tests run against the *previous* source. This
+  produced a phantom failure during #12's mutation run. `python3 -B` avoids it.
 
 ## Standing Hazards
 
@@ -98,13 +110,20 @@ status does **not** belong here — that is what the issue tracker is for. Run
 `gh issue list` for what is open; the milestones `M1 — Minimum viable attach`,
 `M2 — Full lifecycle`, and `M3 — Migration ready` carry the ordering.
 
-**Only the zvol, auth and error-mapping paths have been verified against real
-hardware** (TrueNAS-25.10.5, #35 and #11). The iSCSI pipeline (#12) and
-snapshot/clone (#13) endpoints are still design-doc guesses. Every guess checked so far has had at
-least one error in it — `/zfs/zvol` was not a real endpoint, `volmode: GEOM` is
-FreeBSD-only, `name__startswith` is not a valid operator, and the EULA endpoint
-returns a bare boolean rather than an object. Verify before building on any
-un-exercised path.
+**The zvol, auth, error-mapping and iSCSI-pipeline paths have been verified
+against real hardware** (TrueNAS-25.10.5, #35, #11 and #12). The snapshot and
+clone endpoints (#13) have not — and are known to be **wrong**: see below.
+Every design-doc guess checked so far has had at least one error in it —
+`/zfs/zvol` was not a real endpoint, `volmode: GEOM` is FreeBSD-only,
+`name__startswith` is not a valid operator, the EULA endpoint returns a bare
+boolean rather than an object, and the iSCSI extent payload was wrong in two
+fields at once. Verify before building on any un-exercised path.
+
+The appliance serves its own OpenAPI document at `/api/v2.0/openapi.json`
+(610 paths). It is authoritative for field names, types, enums and defaults,
+and is far cheaper than guessing and then probing. Read it first; probe to
+confirm behaviour the schema cannot express (cascades, defaults that lie,
+silent no-ops).
 
 Two traps found while verifying, both of which mislead rather than fail loudly:
 an unrecognised key in a `/pool/dataset` create breaks discrimination of the
@@ -125,8 +144,14 @@ python3 tools/verify_endpoints.py            # read-only
 python3 tools/verify_endpoints.py --write    # + throwaway zvol lifecycle
 ```
 
-`.env` is gitignored. Write mode creates exactly one throwaway zvol and removes
-it in a `finally` block. Read-only mode also asserts the error mapping —
+`.env` is gitignored. Write mode creates exactly one throwaway zvol, exports it
+through the full iSCSI pipeline (portal → initiator group → extent → target →
+target-extent link, plus a service start), and removes every resource in a
+`finally` block — including returning `iscsitarget` to the state it was found
+in. It asserts the four pipeline traps listed above rather than merely
+exercising them, so a behaviour change on a future TrueNAS release fails loudly
+instead of silently invalidating the client. Read-only mode also asserts the
+error mapping —
 `expect_raises` checks that each not-found form still produces
 `TrueNASAPINotFoundError` and that an errno-22 validation error still does
 not. That mapping rests on undocumented status codes, so it is the part most
@@ -173,6 +198,54 @@ no-op.
 `TrueNASAPINotFoundError` for idempotency will read a wrong path as a
 successful delete. Run `tools/verify_endpoints.py` against real hardware
 before trusting any new path.
+
+**The snapshot methods on `main` cannot work.** `/zfs/snapshot` is a 404 on
+25.10.5 — the whole family moved to `/pool/snapshot` (#13). `get_snapshot_list`,
+`create_snapshot` and `delete_snapshot` all still target the dead path. The 404
+comes back as *plain text*, which is the mistyped-endpoint hazard below in its
+most dangerous form: a caller swallowing `TrueNASAPINotFoundError` for
+idempotency would have read every delete as a success, forever. Related:
+`/pool/snapshot/rename` exists and works, so #19's fallback is unnecessary —
+but never pass `force: true`, which renames a dataset that is in use and can
+disrupt a live iSCSI target.
+
+**The iSCSI pipeline has four traps, all verified in #12.**
+
+1. **Portals are not pre-existing.** The design doc called them read-only from
+   the driver's perspective; a clean appliance has *zero*. `get_portals()`
+   returns `[]` and there is no portal ID to create a target with. Whether the
+   driver creates one or demands one is #14/#17's call.
+2. **A reload does not start a stopped service.** On a fresh appliance
+   `iscsitarget` is `STOPPED` with `enable: false`. `POST /service/reload`
+   returns `false` and changes nothing, so every target and extent written is
+   inert and *nothing reports an error*. Check `get_iscsi_service()` before
+   trusting a reload. `start_iscsi_service()` does not survive a reboot either;
+   that needs `enable: true` via `POST /service/update`.
+3. **TrueNAS does cascade**, contrary to the design doc. Deleting either a
+   target or an extent removes the target-extent link between them; the other
+   end survives. Explicit ordered teardown still works, because the redundant
+   delete returns 422/errno 2 and lands in `TrueNASAPINotFoundError`. Do not
+   "fix" a rollback path to depend on the absence of cascading.
+4. **Duplicate initiator groups are allowed.** Posting identical `initiators`
+   twice yields two groups — TrueNAS enforces no uniqueness — so
+   `get_or_create_initiator_group` dedupes client-side, on set equality. An
+   *empty* initiators list means "allow every initiator", so the client refuses
+   one rather than silently exporting a volume to the whole network.
+
+**Never send the destructive delete options.** `DELETE /iscsi/target` accepts
+`delete_extents`, `DELETE /iscsi/extent` accepts `remove`, and both accept
+`force`. All default to false and the client sends none of them; `delete_extents`
+in particular would turn detaching a volume into destroying its export.
+
+**Target and extent names are constrained**: lowercase alphanumerics plus `.`,
+`-` and `:` only. Cinder's default `volume-<uuid>` passes, but a deployment that
+puts an underscore or a capital in `volume_name_template` fails at first attach.
+`validate_target_name()` is the appliance's own pre-flight check for this.
+
+A zvol backs **at most one extent** — a second attempt fails with "Disk
+currently in use by extent \<name\>" (errno 22, not ENOENT). That 1:1
+constraint is enforced appliance-side, which is what makes name-based
+re-derivation viable for #16.
 
 **Auth is a Bearer API key, not a password** (#10). `truenas_api_key` is a
 service-account key and must be declared `secret=True` in `oslo_config` so it
@@ -276,12 +349,9 @@ and non-fast-forward, requires signed commits, requires a PR with stale-review
 dismissal and thread resolution, and requires code owner review
 (`.github/CODEOWNERS` → `* @setkeh`).
 
-> **OUTSTANDING — re-enable required status checks when starting #8.**
-> The ruleset has **no `required_status_checks` rule**, so CI is advisory: a
-> PR with a red pipeline can still merge. This was deliberate so #29 could land
-> while the unit suite was still broken. Once #8 turns the suite green, add the
-> rule with contexts `Unit tests (Python 3.10)`, `Unit tests (Python 3.12)`,
-> and `Lint (flake8)`, plus `strict_required_status_checks_policy: true`.
+Required status checks **are** enforced: contexts `Unit tests (Python 3.10)`,
+`Unit tests (Python 3.12)` and `Lint (flake8)`, with
+`strict_required_status_checks_policy: true`. A red pipeline blocks the merge.
 
 **Signed commits are mandatory** and the signing key lives on a hardware token
 (OpenPGP smartcard). Agents **cannot** commit — gpg needs a PIN via pinentry on

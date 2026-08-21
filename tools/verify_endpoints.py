@@ -41,6 +41,12 @@ from truenas_cinder_driver.api_client import (  # noqa: E402
 
 THROWAWAY = "cinder-verify-throwaway"
 
+# Target and extent names must be lowercase alphanumerics plus '.', '-' and
+# ':' -- anything else is rejected by /iscsi/target/validate_name.
+TARGET_NAME = "cinder-verify-target"
+EXTENT_NAME = "cinder-verify-extent"
+VERIFY_IQN = "iqn.2005-03.org.open-iscsi:cinder-verify-probe"
+
 
 def load_env(path=".env"):
     """Read KEY=VALUE pairs from a .env file into os.environ.
@@ -124,6 +130,196 @@ def expect_raises(label, expected, fn, but_not=None):
     return False
 
 
+def verify_iscsi_pipeline(client, pool, zvol_name):
+    """Build a complete iSCSI export around a zvol, then tear it down.
+
+    This is the #12 pipeline end to end: portal, initiator group, extent,
+    target, target-extent link, service start. Every resource is removed in
+    a ``finally`` block, and the iscsitarget service is returned to whatever
+    state it was in beforehand.
+
+    Two behaviours here contradicted the design spec and are asserted rather
+    than merely exercised, because both would fail silently if they changed:
+    a reload does not start a stopped service, and deleting either end of a
+    target-extent link cascades the link.
+
+    Args:
+        client: A configured TrueNASAPIClient
+        pool: Pool the zvol lives in
+        zvol_name: Name of the throwaway zvol to export
+
+    Returns:
+        True if every probe passed
+    """
+    ok = True
+    created = []                    # LIFO: (label, callable)
+
+    service_before = client.get_iscsi_service()
+    print(f"  ..    iscsitarget before: state={service_before['state']} "
+          f"enable={service_before['enable']}")
+
+    try:
+        disk = client.zvol_disk_path(pool, zvol_name)
+        choices = check(
+            "extent disk_choices offers the zvol",
+            lambda: client._make_request("GET", "/iscsi/extent/disk_choices"),
+        )
+        if isinstance(choices, dict) and disk not in choices:
+            print(f"  FAIL  zvol_disk_path() built {disk!r}, which is not "
+                  f"one of the appliance's accepted values "
+                  f"{list(choices)[:4]}")
+            ok = False
+
+        portal_id = check(
+            "create_portal()",
+            lambda: client.create_portal(comment="cinder-verify"),
+        )
+        if portal_id:
+            created.append((f"portal {portal_id}",
+                            lambda: client._make_request(
+                                "DELETE", f"/iscsi/portal/id/{portal_id}")))
+
+        group_id = check(
+            "get_or_create_initiator_group()",
+            lambda: client.get_or_create_initiator_group([VERIFY_IQN]),
+        )
+        if group_id:
+            created.append((f"initiator group {group_id}",
+                            lambda: client._make_request(
+                                "DELETE", f"/iscsi/initiator/id/{group_id}")))
+            # The dedupe is the whole point of the method: TrueNAS applies
+            # no uniqueness constraint, so a second call must not create a
+            # second group.
+            again = check(
+                "get_or_create_initiator_group() reuses, does not duplicate",
+                lambda: client.get_or_create_initiator_group([VERIFY_IQN]),
+            )
+            if again != group_id:
+                print(f"  FAIL  expected the same group id {group_id}, got "
+                      f"{again} -- a duplicate group was created")
+                ok = False
+
+        extent_id = check(
+            "create_extent()", lambda: client.create_extent(disk, EXTENT_NAME),
+        )
+        if extent_id:
+            created.append((f"extent {extent_id}",
+                            lambda: client.delete_extent(extent_id)))
+
+        ok &= expect_raises(
+            "a second extent on the same zvol is refused",
+            TrueNASAPIError,
+            lambda: client.create_extent(disk, EXTENT_NAME + "-dup"),
+            but_not=TrueNASAPINotFoundError,
+        )
+
+        target_id = None
+        if portal_id and group_id:
+            target_id = check(
+                "create_target()",
+                lambda: client.create_target(TARGET_NAME, group_id,
+                                             portal_id),
+            )
+        if target_id:
+            created.append((f"target {target_id}",
+                            lambda: client.delete_target(target_id)))
+
+        link_id = None
+        if target_id and extent_id:
+            link_id = check(
+                "create_target_extent()",
+                lambda: client.create_target_extent(target_id, extent_id),
+            )
+        if link_id:
+            created.append((f"target-extent {link_id}",
+                            lambda: client.delete_target_extent(link_id)))
+
+        # Reload against a stopped service is a no-op that reports no error.
+        # If this ever starts returning True, the docstring on
+        # reload_iscsi_service() is wrong and callers may stop checking.
+        if service_before["state"] == "STOPPED":
+            reloaded = check(
+                "reload on a STOPPED service is a silent no-op",
+                client.reload_iscsi_service,
+            )
+            state = check("service still stopped after reload",
+                          lambda: client.get_iscsi_service()["state"])
+            if reloaded or state != "STOPPED":
+                print("  FAIL  a reload started the service -- "
+                      "reload_iscsi_service()'s docstring is now wrong")
+                ok = False
+
+        check("start_iscsi_service()", client.start_iscsi_service)
+        state = check("service state after start",
+                      lambda: client.get_iscsi_service()["state"])
+        if state != "RUNNING":
+            print(f"  FAIL  expected RUNNING after start, got {state!r}")
+            ok = False
+        if service_before["state"] != "RUNNING":
+            created.append(("iscsitarget service (back to STOPPED)",
+                            lambda: client._make_request(
+                                "POST", "/service/stop",
+                                json={"service": "iscsitarget"})))
+
+        check("reload_iscsi_service() on a running service",
+              client.reload_iscsi_service)
+
+        glob = check("get_iscsi_global_config()",
+                     client.get_iscsi_global_config)
+        if glob and target_id:
+            print(f"  ok    full IQN a Nova initiator would log in to\n"
+                  f"        -> {glob['basename']}:{TARGET_NAME}")
+
+        # Cascade: deleting the target removes the link but keeps the
+        # extent. The spec claimed TrueNAS does not cascade at all.
+        if target_id and link_id:
+            check("DELETE target (cascade probe)",
+                  lambda: client.delete_target(target_id))
+            links = check("target-extent links after target delete",
+                          client.get_target_extents)
+            if links:
+                print("  FAIL  the target-extent link survived its target -- "
+                      "delete_target()'s cascade note is now wrong")
+                ok = False
+            extents = check("extent survives its target",
+                            client.get_extents)
+            if not extents:
+                print("  FAIL  deleting the target destroyed the extent -- "
+                      "check that delete_extents is not being sent")
+                ok = False
+    finally:
+        print("\n  Teardown (reverse order)")
+        for label, remove in reversed(created):
+            try:
+                remove()
+                print(f"  ok    removed {label}")
+            except TrueNASAPINotFoundError:
+                print(f"  ok    {label} was already gone (cascaded)")
+            except Exception as exc:                 # noqa: BLE001
+                print(f"  FAIL  could not remove {label}: "
+                      f"{type(exc).__name__}: {str(exc)[:160]}")
+                ok = False
+
+        leftovers = {
+            name: client._make_request("GET", f"/iscsi/{name}")
+            for name in ("targetextent", "target", "extent", "initiator",
+                         "portal")
+        }
+        for name, rows in leftovers.items():
+            if rows:
+                print(f"  FAIL  /iscsi/{name} still holds {rows}")
+                ok = False
+        service_after = client.get_iscsi_service()
+        if service_after["state"] != service_before["state"]:
+            print(f"  FAIL  iscsitarget left {service_after['state']}, "
+                  f"was {service_before['state']}")
+            ok = False
+        else:
+            print(f"  ok    iscsitarget back to {service_after['state']}")
+
+    return ok
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -176,6 +372,23 @@ def main():
     check("is_eula_accepted() parses it", client.is_eula_accepted)
     check("list_zvols() filter syntax", lambda: client.list_zvols(pool))
 
+    print("\niSCSI read-only probes (#12)")
+    check("get_iscsi_global_config() -- basename for #17",
+          client.get_iscsi_global_config)
+    portals = check("get_portals()", client.get_portals)
+    if portals == []:
+        print("  ..    no portals configured. That is normal on a clean "
+              "appliance and is why the driver cannot assume one exists.")
+    check("get_initiator_groups()", client.get_initiator_groups)
+    check("get_iscsi_service() state",
+          lambda: {k: client.get_iscsi_service()[k]
+                   for k in ("state", "enable")})
+    check("validate_target_name() accepts a Cinder-style name",
+          lambda: client.validate_target_name(
+              "volume-4d9e1a5c-8f3b-4a21-9c77-2e6b0f1d3a84"))
+    check("validate_target_name() rejects uppercase and underscores",
+          lambda: client.validate_target_name("Volume_1"))
+
     print("\nError mapping (#11)")
     missing = "cinder-verify-does-not-exist"
     expect_raises(
@@ -198,7 +411,7 @@ def main():
     expect_raises(
         "DELETE missing iSCSI extent -> NotFound (422, errno 2)",
         TrueNASAPINotFoundError,
-        lambda: client.delete_iscsi_extent(999999),
+        lambda: client.delete_extent(999999),
     )
     # errno 22 with a "does not exist" message. Must NOT read as NotFound,
     # or a failed create against a misconfigured pool would be reported as
@@ -250,6 +463,12 @@ def main():
             lambda: client.resize_zvol(pool, THROWAWAY, new_size_gb=2)
             .get("volsize"),
         )
+
+        print(f"\niSCSI pipeline probes (#12), exporting {THROWAWAY}")
+        if verify_iscsi_pipeline(client, pool, THROWAWAY):
+            print("  ->    pipeline verified and fully torn down")
+        else:
+            print("  ->    PIPELINE PROBES REPORTED FAILURES (see above)")
     finally:
         # Cleanup must run even if a probe above raised.
         check(

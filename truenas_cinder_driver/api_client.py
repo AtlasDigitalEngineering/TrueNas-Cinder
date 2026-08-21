@@ -439,16 +439,16 @@ class TrueNASAPIClient:
         a less useful one, so this swallows and logs -- the one place in this
         module where a bare ``except`` is correct.
 
-        The pipeline sequencing itself lives in the driver (#12); this is only
-        the primitive it needs::
+        The pipeline sequencing itself lives in the driver; this is only the
+        primitive it needs::
 
-            extent = client.create_iscsi_extent(...)
+            extent_id = client.create_extent(zvol_path, name)
             try:
-                target = client.create_iscsi_target(...)
+                target_id = client.create_target(name, group_id, portal_id)
             except TrueNASAPIError:
                 client.best_effort_delete(
-                    client.delete_iscsi_extent, extent["id"],
-                    what=f"iSCSI extent {extent['id']}")
+                    client.delete_extent, extent_id,
+                    what=f"iSCSI extent {extent_id}")
                 raise
 
         Args:
@@ -631,116 +631,451 @@ class TrueNASAPIClient:
             params={"type": "VOLUME", "name__^": f"{pool}/"},
         )
 
-    def get_iscsi_target_list(self) -> List[Dict[str, Any]]:
+    # ------------------------------------------------------------------
+    # iSCSI pipeline
+    #
+    # Attaching one volume wires five resources together:
+    #
+    #   portal        the IP:port the target listens on (appliance-wide)
+    #   initiator     the group of IQNs permitted to connect
+    #   extent        the zvol presented as a logical unit
+    #   target        the thing an initiator logs in to
+    #   targetextent  joins a target to an extent at a LUN
+    #
+    # Every payload below was verified against TrueNAS-25.10.5 (#12), and
+    # the appliance's own OpenAPI document is the source for the field
+    # names and enums. Two of the design spec's assumptions were wrong --
+    # see `create_extent` and the delete methods.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _created_id(response: Any, what: str) -> int:
         """
-        Get list of iSCSI targets.
+        Pull the new resource's ID out of a create response.
+
+        Args:
+            response: Decoded body of the create request
+            what: Description of the resource, for the error message
 
         Returns:
-            List of iSCSI target information dictionaries
+            The new resource's numeric ID
+
+        Raises:
+            TrueNASAPIError: If the response carried no usable ID, which
+                means the appliance's contract changed under us
+        """
+        if isinstance(response, dict) and isinstance(
+            response.get("id"), int
+        ):
+            return response["id"]
+        raise TrueNASAPIError(
+            f"TrueNAS accepted the {what} but returned no usable id: "
+            f"{TrueNASAPIClient._truncate(response)}"
+        )
+
+    @staticmethod
+    def _truncate(value: Any, limit: int = 200) -> str:
+        """
+        Render a value for an error message, bounded in length.
+
+        Args:
+            value: Value to render
+            limit: Maximum characters to keep
+
+        Returns:
+            Truncated string form of the value
+        """
+        text = str(value)
+        return text[:limit] + "..." if len(text) > limit else text
+
+    @staticmethod
+    def zvol_disk_path(pool: str, name: str) -> str:
+        """
+        Build the value the extent ``disk`` field expects for a zvol.
+
+        ``zvol/{pool}/{name}`` -- note the absence of a leading ``/dev/``.
+        Verified against ``GET /iscsi/extent/disk_choices``, which is the
+        appliance's own list of acceptable values and returned exactly
+        ``zvol/Dev-Pool/<name>`` for a freshly created zvol (#12).
+
+        Args:
+            pool: Pool the zvol lives in
+            name: Zvol name
+
+        Returns:
+            Value for the extent's ``disk`` field
+        """
+        return f"zvol/{pool}/{name}"
+
+    def get_iscsi_global_config(self) -> Dict[str, Any]:
+        """
+        Get the appliance-wide iSCSI configuration.
+
+        The useful field is ``basename`` -- the IQN prefix every target
+        name hangs off, e.g. ``iqn.2005-10.org.freenas.ctl``. A target's
+        full IQN is ``{basename}:{target_name}``, which is what
+        ``initialize_connection`` must hand Nova. Reading it here is what
+        lets #17 stop hardcoding the prefix.
+
+        Returns:
+            Global config, including ``basename`` and ``listen_port``
+        """
+        return self._make_request("GET", "/iscsi/global")
+
+    def get_portals(self) -> List[Dict[str, Any]]:
+        """
+        List the configured iSCSI portals.
+
+        **A fresh appliance has none.** The design spec described portals
+        as pre-existing and read-only from the driver's perspective; on a
+        clean TrueNAS install this returns ``[]`` (#12). Callers must
+        handle that rather than assuming a portal is available.
+
+        Returns:
+            List of portals, each with ``id``, ``listen`` and ``tag``
+        """
+        return self._make_request("GET", "/iscsi/portal")
+
+    def create_portal(
+        self,
+        listen_ips: Optional[List[str]] = None,
+        comment: str = "",
+    ) -> int:
+        """
+        Create an iSCSI portal.
+
+        Only the addresses offered by ``/iscsi/portal/listen_ip_choices``
+        are accepted; on a single-NIC appliance that is ``0.0.0.0`` and
+        ``::`` only. The port is not settable per portal -- it comes from
+        ``listen_port`` in the global config.
+
+        Whether the driver should create a portal on demand or require one
+        to pre-exist is a policy decision left to #14/#17. This is only the
+        primitive.
+
+        Args:
+            listen_ips: Addresses to listen on (default ``["0.0.0.0"]``)
+            comment: Optional description stored on the portal
+
+        Returns:
+            ID of the new portal
+        """
+        payload = {
+            "listen": [{"ip": ip} for ip in (listen_ips or ["0.0.0.0"])],
+            "comment": comment,
+        }
+        response = self._make_request("POST", "/iscsi/portal", json=payload)
+        return self._created_id(response, "iSCSI portal")
+
+    def get_initiator_groups(self) -> List[Dict[str, Any]]:
+        """
+        List the configured initiator groups.
+
+        Returns:
+            List of groups, each with ``id`` and ``initiators``
+        """
+        return self._make_request("GET", "/iscsi/initiator")
+
+    def get_or_create_initiator_group(
+        self,
+        initiator_iqns: List[str],
+    ) -> int:
+        """
+        Find an initiator group holding exactly these IQNs, or create one.
+
+        **TrueNAS enforces no uniqueness here.** Posting the same
+        ``initiators`` list twice yields two separate groups (verified in
+        #12), so the deduplication has to happen on this side or every
+        attach leaks a new group. Matching is on set equality, since the
+        order TrueNAS stores the list in is not guaranteed to be the order
+        it was sent in.
+
+        This is a read-modify-write and races under concurrent attach --
+        two workers can both miss and both create. #18 owns the locking.
+
+        Args:
+            initiator_iqns: IQNs permitted to connect. Must not be empty.
+
+        Returns:
+            ID of the matching or newly created group
+
+        Raises:
+            ValueError: If ``initiator_iqns`` is empty. TrueNAS reads an
+                empty list as "allow every initiator", so an accidental
+                empty list would silently expose the volume to the whole
+                network rather than failing.
+        """
+        if not initiator_iqns:
+            raise ValueError(
+                "initiator_iqns must not be empty: TrueNAS treats an empty "
+                "initiators list as 'allow all initiators', which would "
+                "expose the volume to every host that can reach the portal."
+            )
+        wanted = set(initiator_iqns)
+        for group in self.get_initiator_groups():
+            if set(group.get("initiators") or []) == wanted:
+                LOG.debug(
+                    "Reusing iSCSI initiator group %s for %s.",
+                    group.get("id"), sorted(wanted),
+                )
+                return group["id"]
+        response = self._make_request(
+            "POST", "/iscsi/initiator", json={"initiators": initiator_iqns},
+        )
+        return self._created_id(response, "iSCSI initiator group")
+
+    def get_extents(self) -> List[Dict[str, Any]]:
+        """
+        List the configured iSCSI extents.
+
+        Returns:
+            List of extents, each with ``id``, ``name`` and ``disk``
+        """
+        return self._make_request("GET", "/iscsi/extent")
+
+    def create_extent(self, zvol_path: str, extent_name: str) -> int:
+        """
+        Present a zvol as an iSCSI extent.
+
+        ``type`` and ``blocksize`` are deliberately not sent: the
+        appliance defaults them to ``DISK`` and ``512``, which is what we
+        want, and every field omitted is one that cannot drift.
+
+        The shipped payload this replaces was wrong twice over, both
+        confirmed by sending it (#12): ``type: "Disk"`` is rejected
+        because the enum is ``['DISK', 'FILE']``, and passing the zvol as
+        ``path`` fails with "iscsi_extent_create.disk: This field is
+        required" -- ``path`` is the *file*-extent field. The response
+        echoes the value back in both ``disk`` and ``path``, which is
+        probably where the original mistake came from.
+
+        A zvol can back at most one extent; a second attempt fails with
+        "Disk currently in use by extent <name>" (errno 22, *not* ENOENT,
+        so it surfaces as a plain :class:`TrueNASAPIError`).
+
+        Args:
+            zvol_path: Value for ``disk``, as built by
+                :meth:`zvol_disk_path` -- ``zvol/{pool}/{name}``
+            extent_name: Name for the extent
+
+        Returns:
+            ID of the new extent
+        """
+        payload = {"name": extent_name, "disk": zvol_path}
+        response = self._make_request("POST", "/iscsi/extent", json=payload)
+        return self._created_id(response, "iSCSI extent")
+
+    def delete_extent(self, extent_id: int) -> None:
+        """
+        Delete an iSCSI extent.
+
+        Sends no options, which matters. ``remove`` would delete the
+        backing file of a file-based extent and ``force`` would delete an
+        extent that is in use; both default to false and the driver must
+        leave them there.
+
+        Deleting an extent **cascades to its target-extent link** (#12) --
+        contrary to the design spec's claim that TrueNAS does not cascade.
+        The target survives.
+
+        Args:
+            extent_id: Extent ID to delete
+        """
+        self._make_request("DELETE", f"/iscsi/extent/id/{extent_id}")
+
+    def get_targets(self) -> List[Dict[str, Any]]:
+        """
+        List the configured iSCSI targets.
+
+        Returns:
+            List of targets, each with ``id``, ``name`` and ``groups``
         """
         return self._make_request("GET", "/iscsi/target")
 
-    def create_iscsi_target(
-        self,
-        name: str,
-        alias: Optional[str] = None,
-        **kwargs
-    ) -> Dict[str, Any]:
+    def validate_target_name(self, name: str) -> Optional[str]:
         """
-        Create a new iSCSI target.
+        Ask the appliance whether a target name is acceptable.
+
+        TrueNAS allows only lowercase alphanumerics plus ``.``, ``-`` and
+        ``:``. Cinder's default ``volume-<uuid>`` passes, but a deployment
+        that sets ``volume_name_template`` with an underscore or any
+        uppercase letter does not -- and would otherwise only discover
+        that at first attach. #14 should call this during ``do_setup``.
 
         Args:
-            name: Name for the iSCSI target
-            alias: Optional alias for the target
-            **kwargs: Additional target properties
+            name: Candidate target name
 
         Returns:
-            Information about the created target
+            None if the name is acceptable, otherwise the appliance's
+            explanation of why it is not
         """
-        payload = {
-            "name": name,
-            "alias": alias,
-            **kwargs
-        }
-        return self._make_request("POST", "/iscsi/target", json=payload)
+        return self._make_request(
+            "POST", "/iscsi/target/validate_name", json={"name": name},
+        )
 
-    def delete_iscsi_target(self, id: int) -> None:
-        """
-        Delete an iSCSI target by ID.
-
-        Args:
-            id: Target ID to delete
-        """
-        self._make_request("DELETE", f"/iscsi/target/id/{id}")
-
-    def create_iscsi_extent(
+    def create_target(
         self,
-        name: str,
-        path: str,
-        disk_type: str = "Disk",
-        **kwargs
-    ) -> Dict[str, Any]:
+        target_name: str,
+        initiator_group_id: int,
+        portal_id: int,
+    ) -> int:
         """
-        Create a new iSCSI extent (maps a zvol to an iSCSI target).
+        Create an iSCSI target bound to a portal and initiator group.
+
+        ``authmethod`` is left at ``NONE``. CHAP is deferred past v1 (#27),
+        and the driver must never invent a secret -- see #15.
 
         Args:
-            name: Name for the extent
-            path: Path to the zvol (e.g., "/dev/zvol/tank/volume1")
-            disk_type: Type of disk (default "Disk")
-            **kwargs: Additional extent properties
+            target_name: Name for the target. Becomes the suffix of the
+                full IQN, ``{basename}:{target_name}``.
+            initiator_group_id: Group of IQNs permitted to connect
+            portal_id: Portal the target listens on
 
         Returns:
-            Information about the created extent
+            ID of the new target
         """
         payload = {
-            "name": name,
-            "type": disk_type,
-            "path": path,
-            **kwargs
+            "name": target_name,
+            "groups": [{
+                "portal": portal_id,
+                "initiator": initiator_group_id,
+                "authmethod": "NONE",
+            }],
         }
-        return self._make_request("POST", "/iscsi/extent", json=payload)
+        response = self._make_request("POST", "/iscsi/target", json=payload)
+        return self._created_id(response, "iSCSI target")
 
-    def delete_iscsi_extent(self, id: int) -> None:
+    def delete_target(self, target_id: int) -> None:
         """
-        Delete an iSCSI extent by ID.
+        Delete an iSCSI target.
+
+        Sends no options. ``delete_extents`` would widen this into
+        deleting the backing extents too, which for a Cinder volume means
+        destroying the export of a volume that still exists. ``force``
+        would delete a target with a live session. Both default to false
+        and must stay there.
+
+        Deleting a target **cascades to its target-extent links** (#12).
+        The extent survives.
 
         Args:
-            id: Extent ID to delete
+            target_id: Target ID to delete
         """
-        self._make_request("DELETE", f"/iscsi/extent/id/{id}")
+        self._make_request("DELETE", f"/iscsi/target/id/{target_id}")
 
-    def create_iscsi_target_extent(
+    def get_target_extents(self) -> List[Dict[str, Any]]:
+        """
+        List the configured target-to-extent associations.
+
+        Returns:
+            List of links, each with ``id``, ``target``, ``extent`` and
+            ``lunid``
+        """
+        return self._make_request("GET", "/iscsi/targetextent")
+
+    def create_target_extent(
         self,
         target_id: int,
         extent_id: int,
-        lun_id: int = 0
-    ) -> Dict[str, Any]:
+        lun_id: int = 0,
+    ) -> int:
         """
-        Associate an iSCSI extent with a target.
+        Associate an extent with a target at a LUN.
 
         Args:
-            target_id: ID of the iSCSI target
-            extent_id: ID of the iSCSI extent
+            target_id: ID of the target
+            extent_id: ID of the extent
             lun_id: LUN number (default 0)
 
         Returns:
-            Information about the created association
+            ID of the new association
         """
         payload = {
             "target": target_id,
             "extent": extent_id,
-            "lunid": lun_id
+            "lunid": lun_id,
         }
-        return self._make_request("POST", "/iscsi/targetextent", json=payload)
+        response = self._make_request(
+            "POST", "/iscsi/targetextent", json=payload,
+        )
+        return self._created_id(response, "iSCSI target-extent link")
 
-    def delete_iscsi_target_extent(self, id: int) -> None:
+    def delete_target_extent(self, targetextent_id: int) -> None:
         """
-        Delete an iSCSI target-extent association by ID.
+        Delete a target-to-extent association.
+
+        Safe to call after deleting either end: the link is cascaded from
+        both sides, and the resulting "does not exist" comes back as 422
+        with errno 2, which maps to :class:`TrueNASAPINotFoundError` and
+        is swallowed by :meth:`best_effort_delete`.
 
         Args:
-            id: Target-extent association ID to delete
+            targetextent_id: Association ID to delete
         """
-        self._make_request("DELETE", f"/iscsi/targetextent/id/{id}")
+        self._make_request(
+            "DELETE", f"/iscsi/targetextent/id/{targetextent_id}",
+        )
+
+    def get_iscsi_service(self) -> Dict[str, Any]:
+        """
+        Get the state of the ``iscsitarget`` service.
+
+        Returns:
+            Service record, including ``state`` ("RUNNING"/"STOPPED") and
+            ``enable`` (whether it starts at boot)
+
+        Raises:
+            TrueNASAPIError: If the appliance reports no such service
+        """
+        services = self._make_request(
+            "GET", "/service", params={"service": "iscsitarget"},
+        )
+        if not services:
+            raise TrueNASAPIError(
+                "TrueNAS reported no 'iscsitarget' service. The appliance "
+                "may not support iSCSI, or the API contract has changed.",
+                method="GET",
+                endpoint="/service",
+            )
+        return services[0]
+
+    def start_iscsi_service(self) -> bool:
+        """
+        Start the ``iscsitarget`` service.
+
+        On a clean appliance the service is ``STOPPED`` with
+        ``enable: false``, and **nothing in the pipeline works until it is
+        running** -- a reload does not start it (see
+        :meth:`reload_iscsi_service`). This does not make the service
+        survive a reboot; that needs ``enable: true`` via
+        ``POST /service/update``.
+
+        Returns:
+            True if the service is running afterwards
+        """
+        return bool(self._make_request(
+            "POST", "/service/start", json={"service": "iscsitarget"},
+        ))
+
+    def reload_iscsi_service(self) -> bool:
+        """
+        Reload the ``iscsitarget`` service so config changes take effect.
+
+        Target and extent changes are inert until this runs -- which is
+        why the client had no working pipeline before #12.
+
+        **A reload does not start a stopped service.** Against a stopped
+        service this returns ``False`` and the state stays ``STOPPED``
+        (verified in #12), so a caller that only ever reloads will write
+        config that never activates and get no error saying so. Check
+        :meth:`get_iscsi_service` first.
+
+        Returns:
+            True if the reload was performed
+        """
+        return bool(self._make_request(
+            "POST", "/service/reload", json={"service": "iscsitarget"},
+        ))
 
     def get_snapshot_list(self) -> List[Dict[str, Any]]:
         """
