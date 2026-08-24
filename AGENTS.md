@@ -110,9 +110,9 @@ status does **not** belong here — that is what the issue tracker is for. Run
 `gh issue list` for what is open; the milestones `M1 — Minimum viable attach`,
 `M2 — Full lifecycle`, and `M3 — Migration ready` carry the ordering.
 
-**The zvol, auth, error-mapping and iSCSI-pipeline paths have been verified
-against real hardware** (TrueNAS-25.10.5, #35, #11 and #12). The snapshot and
-clone endpoints (#13) have not — and are known to be **wrong**: see below.
+**The zvol, auth, error-mapping, iSCSI-pipeline and snapshot paths have been
+verified against real hardware** (TrueNAS-25.10.5, #35, #11, #12 and #42). The
+clone, rollback and promote endpoints (#13, #21) have not.
 Every design-doc guess checked so far has had at least one error in it —
 `/zfs/zvol` was not a real endpoint, `volmode: GEOM` is FreeBSD-only,
 `name__startswith` is not a valid operator, the EULA endpoint returns a bare
@@ -144,13 +144,13 @@ python3 tools/verify_endpoints.py            # read-only
 python3 tools/verify_endpoints.py --write    # + throwaway zvol lifecycle
 ```
 
-`.env` is gitignored. Write mode creates exactly one throwaway zvol, exports it
-through the full iSCSI pipeline (portal → initiator group → extent → target →
-target-extent link, plus a service start), and removes every resource in a
-`finally` block — including returning `iscsitarget` to the state it was found
-in. It asserts the four pipeline traps listed above rather than merely
-exercising them, so a behaviour change on a future TrueNAS release fails loudly
-instead of silently invalidating the client. Read-only mode also asserts the
+`.env` is gitignored. Write mode creates exactly one throwaway zvol, takes a
+snapshot of it, exports it through the full iSCSI pipeline (portal → initiator
+group → extent → target → target-extent link, plus a service start), and
+removes every resource in a `finally` block — including returning `iscsitarget`
+to the state it was found in. It asserts the pipeline and snapshot traps listed
+above rather than merely exercising them, so a behaviour change on a future
+TrueNAS release fails loudly instead of silently invalidating the client. Read-only mode also asserts the
 error mapping —
 `expect_raises` checks that each not-found form still produces
 `TrueNASAPINotFoundError` and that an errno-22 validation error still does
@@ -199,12 +199,35 @@ no-op.
 successful delete. Run `tools/verify_endpoints.py` against real hardware
 before trusting any new path.
 
-**The snapshot methods on `main` cannot work.** `/zfs/snapshot` is a 404 on
-25.10.5 — the whole family moved to `/pool/snapshot` (#13). `get_snapshot_list`,
-`create_snapshot` and `delete_snapshot` all still target the dead path. The 404
-comes back as *plain text*, which is the mistyped-endpoint hazard below in its
-most dangerous form: a caller swallowing `TrueNASAPINotFoundError` for
-idempotency would have read every delete as a success, forever. Related:
+**Snapshots live under `/pool/snapshot`, and their ids must be percent-encoded.**
+A snapshot id is `{pool}/{dataset}@{snapshot}`. Interpolated raw into a URL the
+`/` characters become extra path segments and the appliance answers **404**, so
+`delete_snapshot` percent-encodes via `_snapshot_path` (#42).
+
+That combination is the sharpest example of the mistyped-endpoint hazard in this
+codebase, and worth understanding rather than just obeying. Before #42 these
+methods had **two** independent bugs — the legacy `/zfs/snapshot` base path
+(404, in *plain text*) and the unencoded id (also 404) — and both produced a
+`TrueNASAPINotFoundError`, which callers swallow to make deletes idempotent. Two
+stacked bugs therefore cancelled into a method that reported success on every
+call while deleting nothing, forever. Neither a green unit suite nor a code
+review catches that; only exercising the path against hardware does.
+`tools/verify_endpoints.py` now asserts both wrong forms are *still* wrong, so
+reintroducing either fails loudly.
+
+Three more verified snapshot behaviours:
+
+- **A zvol with a live snapshot refuses a non-recursive delete** — "volume has
+  children ... use '-r'", a plain error rather than ENOENT. `delete_zvol`
+  defaults to `recursive=False`, which is correct: silently destroying a
+  volume's snapshots is not something `delete_volume` should do by accident.
+- **Creating a snapshot that already exists is errno 17 (EEXIST), not 2.** It
+  surfaces as a plain `TrueNASAPIError` and must never be read as "already
+  gone".
+- **The unfiltered snapshot list includes the appliance's boot-pool snapshots**
+  — eight on a clean 25.10.5 install. Pass `dataset=` unless you truly want
+  everything.
+
 `/pool/snapshot/rename` exists and works, so #19's fallback is unnecessary —
 but never pass `force: true`, which renames a dataset that is in use and can
 disrupt a live iSCSI target.

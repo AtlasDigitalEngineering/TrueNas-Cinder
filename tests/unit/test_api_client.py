@@ -20,10 +20,15 @@ not hypothetical: each is a payload the appliance rejected or a flag that
 would cause data loss, and a plain "does it work" test would not catch their
 return.
 
-Coverage is deliberately partial. ``get_snapshot_list``, ``create_snapshot``
-and ``delete_snapshot`` are untested here because #13 rewrites them: they
-currently target ``/zfs/snapshot``, which is a **404** on 25.10.5, so pinning
-today's behaviour would pin a bug. Add coverage as part of that issue.
+The snapshot tests are the sharpest case of that. Before #42 those methods had
+two stacked bugs -- the dead ``/zfs/snapshot`` path and an unencoded snapshot
+id -- which both produced a 404, mapped to ``TrueNASAPINotFoundError``, and
+were swallowed as "already deleted". The result reported success on every call
+while deleting nothing. So the tests assert the *absence* of ``/zfs/`` and the
+*presence* of percent-encoding, not merely that the happy path works.
+
+Coverage is deliberately partial: clone, rollback and promote are untested
+here because #13 and #21 add them along with their own test requirements.
 """
 
 import json
@@ -1079,6 +1084,123 @@ class TestIscsiService(IscsiTestCase):
         self._set_response(False)
 
         self.assertFalse(self.client.reload_iscsi_service())
+
+
+SNAP = "snapshot-7f2c1b9e-3a44-4d61-8e05-9b7c2f0a1d38"
+DATASET = f"Dev-Pool/{VOLUME}"
+SNAPSHOT_ID = f"{DATASET}@{SNAP}"
+# Transcribed from the appliance: deleting a snapshot that is not there.
+SNAPSHOT_ENOENT_BODY = {
+    "null": [
+        {"message": f"Snapshot {SNAPSHOT_ID} not found", "errno": 2}
+    ]
+}
+
+
+class TestSnapshotOperations(IscsiTestCase):
+    """Snapshots live under /pool/snapshot, with percent-encoded ids (#42)."""
+
+    def test_snapshot_id_joins_with_an_at_sign(self):
+        self.assertEqual(
+            self.client.snapshot_id("Dev-Pool", VOLUME, SNAP), SNAPSHOT_ID
+        )
+
+    def test_get_snapshot_list_unfiltered(self):
+        self._set_response([])
+
+        self.client.get_snapshot_list()
+
+        self.session.request.assert_called_once_with(
+            "GET", f"{BASE_URL}/pool/snapshot", timeout=DEFAULT_TIMEOUT,
+        )
+
+    def test_get_snapshot_list_filters_by_dataset(self):
+        # Unfiltered, this returns the appliance's boot-pool snapshots too.
+        self._set_response([])
+
+        self.client.get_snapshot_list(dataset=DATASET)
+
+        self.session.request.assert_called_once_with(
+            "GET", f"{BASE_URL}/pool/snapshot",
+            params={"dataset": DATASET},
+            timeout=DEFAULT_TIMEOUT,
+        )
+
+    def test_create_snapshot_posts_to_pool_snapshot(self):
+        self._set_response({"id": SNAPSHOT_ID})
+
+        result = self.client.create_snapshot(DATASET, SNAP)
+
+        self.session.request.assert_called_once_with(
+            "POST", f"{BASE_URL}/pool/snapshot",
+            json={"dataset": DATASET, "name": SNAP},
+            timeout=DEFAULT_TIMEOUT,
+        )
+        self.assertEqual(result["id"], SNAPSHOT_ID)
+
+    def test_create_snapshot_merges_extra_options(self):
+        self._set_response({"id": SNAPSHOT_ID})
+
+        self.client.create_snapshot(DATASET, SNAP, recursive=True)
+
+        self.assertTrue(self._payload()["recursive"])
+
+    def test_delete_snapshot_percent_encodes_the_id(self):
+        # A raw id turns '/' into extra path segments and 404s -- which the
+        # client maps to NotFound, which an idempotent caller swallows. That
+        # is how the pre-#42 method deleted nothing and reported success.
+        self._set_response({})
+
+        self.client.delete_snapshot(SNAPSHOT_ID)
+
+        url = self.session.request.call_args.args[1]
+        self.assertIn("%2F", url)
+        self.assertIn("%40", url)
+        self.assertNotIn(f"/{VOLUME}@", url)
+
+    def test_delete_snapshot_uses_the_expected_url(self):
+        self._set_response({})
+
+        self.client.delete_snapshot(SNAPSHOT_ID)
+
+        encoded = SNAPSHOT_ID.replace("/", "%2F").replace("@", "%40")
+        self.session.request.assert_called_once_with(
+            "DELETE", f"{BASE_URL}/pool/snapshot/id/{encoded}",
+            json={"defer": False},
+            timeout=DEFAULT_TIMEOUT,
+        )
+
+    def test_delete_snapshot_defers_when_asked(self):
+        self._set_response({})
+
+        self.client.delete_snapshot(SNAPSHOT_ID, defer=True)
+
+        self.assertTrue(self._payload()["defer"])
+
+    def test_missing_snapshot_delete_maps_to_not_found(self):
+        # 422/errno 2, same shape as a missing dataset -- this is what makes
+        # an idempotent delete_snapshot possible.
+        self._set_error(422, SNAPSHOT_ENOENT_BODY)
+
+        with self.assertRaises(TrueNASAPINotFoundError):
+            self.client.delete_snapshot(SNAPSHOT_ID)
+
+    def test_no_snapshot_method_touches_the_legacy_zfs_path(self):
+        # /zfs/snapshot is a 404 on 25.10.5. It answers in *plain text*, so
+        # a caller swallowing NotFound for idempotency reads a dead path as
+        # a successful delete -- this guards the whole family at once.
+        for call in (
+            lambda: self.client.get_snapshot_list(),
+            lambda: self.client.get_snapshot_list(dataset=DATASET),
+            lambda: self.client.create_snapshot(DATASET, SNAP),
+            lambda: self.client.delete_snapshot(SNAPSHOT_ID),
+        ):
+            self.session.reset_mock()
+            self._set_response({"id": SNAPSHOT_ID})
+            call()
+            url = self.session.request.call_args.args[1]
+            self.assertNotIn("/zfs/", url)
+            self.assertIn("/pool/snapshot", url)
 
 
 # Error bodies below are transcribed verbatim from TrueNAS-25.10.5. The field
