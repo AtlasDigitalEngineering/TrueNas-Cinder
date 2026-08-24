@@ -1077,14 +1077,81 @@ class TrueNASAPIClient:
             "POST", "/service/reload", json={"service": "iscsitarget"},
         ))
 
-    def get_snapshot_list(self) -> List[Dict[str, Any]]:
+    # ------------------------------------------------------------------
+    # Snapshots
+    #
+    # These live under /pool/snapshot. The legacy /zfs/snapshot path these
+    # methods used until #42 is a 404 on 25.10.5 -- see the hazard note in
+    # AGENTS.md for why that failed silently rather than loudly.
+    #
+    # A snapshot's id is `{pool}/{dataset}@{snapshot}` and **must** be
+    # percent-encoded into the URL; the raw form 404s.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _snapshot_path(snapshot_id: str) -> str:
         """
-        Get list of snapshots.
+        Build the URL-encoded path segment for a snapshot id.
+
+        A snapshot id contains both ``/`` and ``@``
+        (``Dev-Pool/volume-abc@snap-1``). Interpolated raw, the ``/``
+        characters become extra path segments and the appliance answers
+        **404** -- verified in #42.
+
+        That 404 is the dangerous kind: `_raise_for_status` maps it to
+        :class:`TrueNASAPINotFoundError`, which a caller swallows to make
+        deletes idempotent. Before #42 this bug stacked on top of the wrong
+        base path, so ``delete_snapshot`` would have reported success on
+        every call while deleting nothing, forever.
+
+        Args:
+            snapshot_id: Full snapshot id, ``pool/dataset@snapshot``
 
         Returns:
-            List of snapshot information dictionaries
+            Percent-encoded path segment
         """
-        return self._make_request("GET", "/zfs/snapshot")
+        return quote(snapshot_id, safe="")
+
+    @staticmethod
+    def snapshot_id(pool: str, name: str, snapshot: str) -> str:
+        """
+        Build a snapshot's id from its parts.
+
+        Args:
+            pool: Pool the zvol lives in
+            name: Zvol name
+            snapshot: Snapshot name, without the ``@``
+
+        Returns:
+            Full snapshot id, ``pool/name@snapshot``
+        """
+        return f"{pool}/{name}@{snapshot}"
+
+    def get_snapshot_list(
+        self,
+        dataset: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        List snapshots, optionally for one dataset only.
+
+        **Pass ``dataset`` unless you genuinely want everything.** The
+        unfiltered list includes the appliance's own boot-pool snapshots --
+        eight of them on a freshly installed 25.10.5 with no user data --
+        so an unfiltered call is both wasteful and easy to misread as
+        "these are our snapshots".
+
+        Args:
+            dataset: Full dataset path (``pool/name``) to filter by
+
+        Returns:
+            List of snapshots. Each carries ``id``, ``name``, ``dataset``,
+            ``snapshot_name``, ``pool``, ``type`` and ``properties``.
+        """
+        if dataset is None:
+            return self._make_request("GET", "/pool/snapshot")
+        return self._make_request(
+            "GET", "/pool/snapshot", params={"dataset": dataset},
+        )
 
     def create_snapshot(
         self,
@@ -1095,26 +1162,44 @@ class TrueNASAPIClient:
         """
         Create a new snapshot.
 
+        Creating a snapshot that already exists fails with errno 17
+        (EEXIST), *not* ENOENT, so it surfaces as a plain
+        :class:`TrueNASAPIError` rather than being mistaken for a missing
+        object.
+
         Args:
-            dataset: Dataset name (e.g., "tank/volume1")
-            name: Snapshot name
-            **kwargs: Additional snapshot options
+            dataset: Dataset path (e.g. ``"tank/volume1"``)
+            name: Snapshot name, without the ``@``
+            **kwargs: Additional options -- ``recursive``, ``exclude``,
+                ``properties``, ``vmware_sync``
 
         Returns:
-            Information about the created snapshot
+            The created snapshot, including its ``id``
         """
         payload = {
             "dataset": dataset,
             "name": name,
             **kwargs
         }
-        return self._make_request("POST", "/zfs/snapshot", json=payload)
+        return self._make_request("POST", "/pool/snapshot", json=payload)
 
-    def delete_snapshot(self, id: str) -> None:
+    def delete_snapshot(self, id: str, defer: bool = False) -> None:
         """
         Delete a snapshot by ID.
 
+        Deleting a snapshot that does not exist answers 422 with errno 2,
+        which maps to :class:`TrueNASAPINotFoundError` -- the same shape as
+        a missing dataset, so idempotent deletes work the same way.
+
         Args:
-            id: Snapshot ID to delete
+            id: Full snapshot id, ``pool/dataset@snapshot``
+            defer: Defer destruction until the last reference is released.
+                Needed when a clone still depends on the snapshot; ZFS
+                refuses an immediate destroy in that case. #21 owns the
+                clone lifecycle that decides when to set this.
         """
-        self._make_request("DELETE", f"/zfs/snapshot/id/{id}")
+        self._make_request(
+            "DELETE",
+            f"/pool/snapshot/id/{self._snapshot_path(id)}",
+            json={"defer": defer},
+        )

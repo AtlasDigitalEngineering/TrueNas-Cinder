@@ -46,6 +46,7 @@ THROWAWAY = "cinder-verify-throwaway"
 TARGET_NAME = "cinder-verify-target"
 EXTENT_NAME = "cinder-verify-extent"
 VERIFY_IQN = "iqn.2005-03.org.open-iscsi:cinder-verify-probe"
+SNAPSHOT_NAME = "cinder-verify-snap"
 
 
 def load_env(path=".env"):
@@ -128,6 +129,118 @@ def expect_raises(label, expected, fn, but_not=None):
     print(f"  FAIL  {label}\n        expected {expected.__name__}, but the "
           f"call succeeded: {str(result)[:160]}")
     return False
+
+
+def verify_snapshots(client, pool, zvol_name):
+    """Exercise the snapshot lifecycle against the appliance.
+
+    Guards the two defects fixed in #42, both of which failed *silently*:
+    the legacy ``/zfs/snapshot`` base path, and interpolating an unencoded
+    snapshot id into the URL. Each produced a 404, which the client maps to
+    ``TrueNASAPINotFoundError``, which an idempotent caller swallows -- so
+    the broken form reported success on every call while deleting nothing.
+
+    Both wrong forms are asserted to still be wrong, not merely unused. A
+    test that only exercises the correct path cannot detect the day someone
+    reintroduces the old one.
+
+    Args:
+        client: A configured TrueNASAPIClient
+        pool: Pool the zvol lives in
+        zvol_name: Zvol to snapshot
+
+    Returns:
+        True if every probe passed
+    """
+    ok = True
+    dataset = f"{pool}/{zvol_name}"
+    snapshot_id = client.snapshot_id(pool, zvol_name, SNAPSHOT_NAME)
+
+    # The legacy path must stay dead. If a future release resurrects it,
+    # this fires -- better than silently keeping a second code path alive.
+    ok &= expect_raises(
+        "legacy /zfs/snapshot is still a 404",
+        TrueNASAPINotFoundError,
+        lambda: client._make_request("GET", "/zfs/snapshot"),
+    )
+
+    created = check(
+        "create_snapshot()",
+        lambda: client.create_snapshot(dataset, SNAPSHOT_NAME),
+    )
+    if isinstance(created, dict):
+        if created.get("id") != snapshot_id:
+            print(f"  FAIL  snapshot_id() built {snapshot_id!r} but the "
+                  f"appliance called it {created.get('id')!r}")
+            ok = False
+        else:
+            print(f"  ok    snapshot_id() matches the appliance\n"
+                  f"        -> {snapshot_id}")
+
+    try:
+        listed = check(
+            "get_snapshot_list(dataset=...) filters to just this zvol",
+            lambda: [s.get("id")
+                     for s in client.get_snapshot_list(dataset=dataset)],
+        )
+        if listed != [snapshot_id]:
+            print(f"  FAIL  expected exactly [{snapshot_id!r}], got {listed}")
+            ok = False
+
+        unfiltered = client.get_snapshot_list()
+        if len(unfiltered) <= len(listed or []):
+            print("  FAIL  the unfiltered list is no larger than the "
+                  "filtered one -- the dataset filter may be ignored")
+            ok = False
+        else:
+            print(f"  ok    unfiltered list is larger ({len(unfiltered)} "
+                  f"snapshots, incl. boot-pool) -- filter is doing work")
+
+        # An unencoded id becomes extra path segments and 404s. This is the
+        # bug that made the old delete_snapshot a permanent no-op.
+        ok &= expect_raises(
+            "an UNENCODED snapshot id still 404s (why encoding is required)",
+            TrueNASAPINotFoundError,
+            lambda: client._make_request(
+                "GET", f"/pool/snapshot/id/{snapshot_id}"),
+        )
+
+        # errno 17, not 2 -- must not be mistaken for "already gone".
+        ok &= expect_raises(
+            "duplicate create -> plain error, NOT NotFound (errno 17)",
+            TrueNASAPIError,
+            lambda: client.create_snapshot(dataset, SNAPSHOT_NAME),
+            but_not=TrueNASAPINotFoundError,
+        )
+
+        # What idempotent delete_snapshot depends on.
+        ok &= expect_raises(
+            "DELETE a missing snapshot -> NotFound (422, errno 2)",
+            TrueNASAPINotFoundError,
+            lambda: client.delete_snapshot(
+                client.snapshot_id(pool, zvol_name, "cinder-verify-nope")),
+        )
+
+        # A zvol with a live snapshot cannot be deleted non-recursively.
+        # delete_volume needs to know this is a hard error, not a no-op.
+        ok &= expect_raises(
+            "zvol with a snapshot refuses a non-recursive delete",
+            TrueNASAPIError,
+            lambda: client.delete_zvol(pool, zvol_name, recursive=False),
+            but_not=TrueNASAPINotFoundError,
+        )
+    finally:
+        check("delete_snapshot() cleanup",
+              lambda: client.delete_snapshot(snapshot_id))
+        remaining = client.get_snapshot_list(dataset=dataset)
+        if remaining:
+            print(f"  FAIL  snapshot survived deletion: "
+                  f"{[s.get('id') for s in remaining]}")
+            ok = False
+        else:
+            print("  ok    snapshot is gone")
+
+    return ok
 
 
 def verify_iscsi_pipeline(client, pool, zvol_name):
@@ -463,6 +576,12 @@ def main():
             lambda: client.resize_zvol(pool, THROWAWAY, new_size_gb=2)
             .get("volsize"),
         )
+
+        print(f"\nSnapshot probes (#42), on {THROWAWAY}")
+        if verify_snapshots(client, pool, THROWAWAY):
+            print("  ->    snapshot lifecycle verified")
+        else:
+            print("  ->    SNAPSHOT PROBES REPORTED FAILURES (see above)")
 
         print(f"\niSCSI pipeline probes (#12), exporting {THROWAWAY}")
         if verify_iscsi_pipeline(client, pool, THROWAWAY):
