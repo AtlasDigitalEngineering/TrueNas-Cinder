@@ -501,11 +501,19 @@ per-request.
    docstrings, Google-style docstrings with `Args:`/`Returns:` on every public
    method, `typing` annotations on signatures. Keep lines within flake8's
    default 79 columns unless a config says otherwise.
-2. **Tests required** for new functions — add to `tests/unit/test_<module>.py`
-   (note: `test_*.py`, not `*_tests.py`). Mock at the `requests.Session`
-   boundary; unit tests must never make a real network call. Verify a new test
-   actually fails when the code is wrong — the existing suite is a cautionary
-   example of tests that pass no signal.
+2. **Tests required** for new functions (note: `test_*.py`, not `*_tests.py`).
+   Which suite, and what to mock, depends on what is under test:
+   - `api_client.py` → `tests/unit/test_api_client.py`, mocking at the
+     **`requests.Session`** boundary. This suite must keep running without
+     Cinder installed.
+   - `driver.py` → `tests/driver/test_driver.py`, mocking at the
+     **API-client** boundary. The client's own behaviour is already covered
+     exhaustively and verified against hardware, so re-mocking HTTP there
+     would test the wrong thing.
+
+   No test may make a real network call. Verify a new test actually fails when
+   the code is wrong — the original suite is a cautionary example of tests that
+   passed no signal.
 3. **Follow OpenStack Cinder conventions** in `driver.py`: subclass
    `cinder.volume.drivers.san.san.SanISCSIDriver`, declare config via
    `oslo_config` opts read through `self.configuration`, and raise

@@ -116,10 +116,12 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
     def do_setup(self, context):
         """Build the API client from configuration.
 
-        Deliberately does no validation and makes no requests: Cinder calls
-        :meth:`check_for_setup_error` immediately afterwards, and keeping
-        the two apart means a configuration error is reported by the method
-        whose job that is.
+        Makes no requests. It does check that the required options are
+        set, because constructing the client without them fails less
+        clearly than saying which are missing; everything that needs to
+        ask the appliance a question belongs to
+        :meth:`check_for_setup_error`, which Cinder calls immediately
+        afterwards.
 
         Args:
             context: Security context, unused
@@ -360,18 +362,25 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         after deployment looked successful.
 
         Raises:
-            InvalidInput: If the rendered name would be rejected
+            InvalidInput: If the template cannot be rendered at all, or the
+                name it produces would be rejected by the appliance
             VolumeBackendAPIException: If the name cannot be validated
         """
         template = (self.configuration.safe_get('volume_name_template')
                     or DEFAULT_VOLUME_NAME_TEMPLATE)
         try:
             sample = template % SAMPLE_VOLUME_ID
-        except TypeError:
+        except (TypeError, ValueError) as exc:
+            # TypeError covers the wrong number of placeholders; ValueError
+            # covers a stray percent sign ('volume-%s-100%' -> "incomplete
+            # format") or an unknown conversion ('%q'). Both are plausible
+            # typos, and neither should escape as a raw formatting error.
             raise exception.InvalidInput(
-                reason=_('volume_name_template = %r does not contain a '
-                         'single %%s placeholder for the volume id.')
-                % template)
+                reason=_('volume_name_template = %(template)r cannot be '
+                         'rendered with a volume id: %(err)s. It needs '
+                         'exactly one %%s placeholder, and any literal '
+                         'percent sign must be written as %%%%.')
+                % {'template': template, 'err': exc})
 
         try:
             reason = self.client.validate_target_name(sample)

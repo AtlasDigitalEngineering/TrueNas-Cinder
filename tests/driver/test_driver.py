@@ -340,6 +340,26 @@ class TestSetupValidation(DriverTestCase):
         with self.assertRaises(exception.InvalidInput):
             driver.check_for_setup_error()
 
+    def test_template_with_a_stray_percent_is_refused(self):
+        # '%' formatting raises ValueError, not TypeError, for an
+        # incomplete or unknown conversion. Catching only TypeError let it
+        # escape check_for_setup_error as a raw formatting error.
+        for template in ('volume-%s-100%', 'volume-%s%', 'volume-%q'):
+            driver = self._driver(volume_name_template=template)
+
+            with self.assertRaises(exception.InvalidInput) as caught:
+                driver.check_for_setup_error()
+
+            self.assertIn('volume_name_template', str(caught.exception))
+
+    def test_unrenderable_template_is_never_sent_to_the_appliance(self):
+        driver = self._driver(volume_name_template='volume-%q')
+
+        with self.assertRaises(exception.InvalidInput):
+            driver.check_for_setup_error()
+
+        driver.client.validate_target_name.assert_not_called()
+
 
 class TestVolumeStats(DriverTestCase):
     """Capacity reporting -- without it the backend is unschedulable."""
