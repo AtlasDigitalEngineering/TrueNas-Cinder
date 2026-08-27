@@ -255,6 +255,29 @@ disrupt a live iSCSI target.
    *empty* initiators list means "allow every initiator", so the client refuses
    one rather than silently exporting a volume to the whole network.
 
+**Server-side filters work on the iSCSI collections, but a wrong field fails
+silently.** `GET /iscsi/target?name=<name>` and `GET /iscsi/extent?name=<name>`
+filter on the appliance — verified in #16 by creating *two* exports and
+confirming each name returned exactly its own row, which an ignored filter
+could not fake. Use `params={"name": ...}`, as `list_zvols` does; never the
+`filters=[[...]]` JSON form.
+
+The asymmetry to remember: an invalid **operator** fails loudly
+(`name__startswith` → 422 "Invalid operation: startswith") but an unrecognised
+**field** does not — it returns `200 []`, confirmed against a collection holding
+seven rows. **An empty result is therefore not evidence that a name is absent**;
+it may mean the filter was never applied. `_get_one_by_name` raises on more than
+one row for the mirror image of the same reason: a filter that was ignored
+returns the whole collection, and taking `[0]` would hand back a different
+volume's export to be deleted.
+
+Name lookup is the **authoritative** way to find a volume's target and extent at
+teardown (#16). Nothing cached is trusted for deletion: TrueNAS ids are small
+integers, so a stale id could address another volume's export, and guarding
+against that costs the same one request as looking it up by name. `provider_id`
+records `target:extent` for diagnostics, orphan reconciliation and #20 — never
+to skip a lookup.
+
 **Never send the destructive delete options.** `DELETE /iscsi/target` accepts
 `delete_extents`, `DELETE /iscsi/extent` accepts `remove`, and both accept
 `force`. All default to false and the client sends none of them; `delete_extents`

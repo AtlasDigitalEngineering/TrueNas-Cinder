@@ -347,6 +347,54 @@ def verify_iscsi_pipeline(client, pool, zvol_name):
             created.append((f"target-extent {link_id}",
                             lambda: client.delete_target_extent(link_id)))
 
+        # Name-based lookup (#16). This is the authoritative teardown path,
+        # so it is asserted rather than exercised. An unrecognised filter
+        # field is not rejected -- the appliance answers 200 with an empty
+        # list -- so a broken filter would read as "already gone" and
+        # silently orphan every export.
+        print("\n  Name lookup (#16)")
+        found_target = check(
+            "get_target_by_name() finds the target we just made",
+            lambda: client.get_target_by_name(TARGET_NAME),
+        )
+        if not found_target or found_target.get("id") != target_id:
+            print(f"  FAIL  expected target id {target_id}, got "
+                  f"{found_target.get('id') if found_target else None}")
+            ok = False
+
+        found_extent = check(
+            "get_extent_by_name() finds the extent we just made",
+            lambda: client.get_extent_by_name(EXTENT_NAME),
+        )
+        if not found_extent or found_extent.get("id") != extent_id:
+            print(f"  FAIL  expected extent id {extent_id}, got "
+                  f"{found_extent.get('id') if found_extent else None}")
+            ok = False
+
+        # Deliberately not using check() here. It returns None when the
+        # probe *raises*, and None is also the expected pass value for this
+        # assertion -- so a lookup that threw would be scored as a pass.
+        # An assertion whose expected value is None has to distinguish
+        # "returned None" from "blew up", or it reports success on failure.
+        for label, lookup in (
+            ("target", client.get_target_by_name),
+            ("extent", client.get_extent_by_name),
+        ):
+            try:
+                missing = lookup("cinder-verify-no-such-name")
+            except Exception as exc:                 # noqa: BLE001
+                print(f"  FAIL  unknown {label} name raised "
+                      f"{type(exc).__name__}: {str(exc)[:160]}")
+                ok = False
+            else:
+                if missing is None:
+                    print(f"  ok    unknown {label} name -> None "
+                          f"(not a stray match)")
+                else:
+                    print(f"  FAIL  expected None for an unknown {label} "
+                          f"name, got {missing}")
+                    ok = False
+
         # Reload against a stopped service is a no-op that reports no error.
         # If this ever starts returning True, the docstring on
         # reload_iscsi_service() is wrong and callers may stop checking.
