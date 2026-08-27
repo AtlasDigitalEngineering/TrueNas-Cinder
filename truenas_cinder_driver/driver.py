@@ -1,24 +1,12 @@
 """
 OpenStack Cinder volume driver for TrueNAS Scale over iSCSI.
 
-This module holds the driver skeleton: configuration, setup validation and
-capacity reporting. The volume lifecycle (`create_volume`, `delete_volume`)
-and the export/connection path (`create_export`, `remove_export`,
-`initialize_connection`) are issue #3 and are inherited as
+Configuration, setup validation and capacity reporting. The volume lifecycle
+and the export/connection path are issue #3, inherited as
 ``NotImplementedError`` until then.
 
-**Base class.** ``SanISCSIDriver`` puts ``ISCSIDriver`` in the MRO, which is
-where ``_get_iscsi_properties()`` lives -- the method that turns
-``provider_location`` into a connection dict, including the multipath form,
-without the driver building it by hand. See :meth:`check_for_setup_error`
-for the one piece of ``SanDriver`` this driver deliberately does not use.
-
-**The driver never initialises appliance state.** It does not create a
-portal and does not start the iSCSI service. Both are appliance-wide, shared
-by every volume and by every ``cinder-volume`` worker, so creating them as a
-side effect of provisioning is surprising and races between workers. Instead
-setup validates its preconditions and fails with a message naming the
-offending value, the option involved, and the remedy.
+Setup validates the appliance and never changes it: it does not create a
+portal or start the iSCSI service. See AGENTS.md for the reasoning.
 """
 
 from oslo_config import cfg
@@ -36,16 +24,11 @@ LOG = logging.getLogger(__name__)
 
 GIB = 1024 ** 3
 
-# Cinder's own default, used when the option is not reachable from this
-# process. Only ever used to build a sample name for validation.
+# Cinder's default, for when the option is not registered in this process.
 DEFAULT_VOLUME_NAME_TEMPLATE = 'volume-%s'
-
-# A UUID-shaped sample for validating the rendered target name. Never used
-# as a real volume name.
 SAMPLE_VOLUME_ID = 'ffffffff-ffff-ffff-ffff-ffffffffffff'
 
-# Wildcards a portal may bind. Valid on the appliance, useless to a compute
-# node, which cannot connect to them.
+# Accepted by the appliance, unreachable from a compute node.
 WILDCARD_ADDRESSES = ('0.0.0.0', '::')
 
 truenas_opts = [
@@ -116,12 +99,9 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
     def do_setup(self, context):
         """Build the API client from configuration.
 
-        Makes no requests. It does check that the required options are
-        set, because constructing the client without them fails less
-        clearly than saying which are missing; everything that needs to
-        ask the appliance a question belongs to
-        :meth:`check_for_setup_error`, which Cinder calls immediately
-        afterwards.
+        Checks the required options are set -- constructing the client
+        without them fails less clearly. Anything that has to ask the
+        appliance a question belongs to :meth:`check_for_setup_error`.
 
         Args:
             context: Security context, unused
@@ -155,12 +135,10 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
     def check_for_setup_error(self):
         """Verify every precondition the driver depends on.
 
-        **Deliberately does not call super().** ``SanDriver`` requires
-        ``san_ip`` plus one of ``san_password`` / ``san_private_key``,
-        because it drives an array over SSH. This driver talks to the REST
-        API with a Bearer key and never opens an SSH connection, so those
-        options are unused -- demanding a password nothing reads would be
-        worse than skipping the check. Do not "restore" the super() call.
+        **Deliberately does not call super().** ``SanDriver`` demands
+        ``san_ip`` and an SSH password or key, none of which this driver
+        uses. ``test_does_not_require_ssh_configuration`` fails if the
+        call is restored.
 
         Raises:
             InvalidInput: If configuration is wrong in a way the operator
@@ -224,10 +202,9 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
     def _require_iscsi_service_running(self):
         """Confirm the appliance's iSCSI service is running.
 
-        The most consequential check here. With the service stopped the
-        driver still creates targets and extents successfully and reports
-        no error -- a reload does not start it -- and nothing attaches.
-        Verified against TrueNAS-25.10.5 (#12).
+        The check that matters most: with the service stopped the
+        appliance still accepts target and extent configuration, reports no
+        error, and nothing attaches (#12).
 
         Raises:
             InvalidInput: If the service is not running
@@ -316,10 +293,9 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
     def _resolve_portal_addresses(self, portal):
         """Decide which addresses to advertise to compute nodes.
 
-        The configured list wins outright. It is the operator's statement
-        of what is actually routable, and on a multi-homed appliance
-        nothing else can know that. Listing more than one advertises
-        multipath.
+        The configured list wins: on a multi-homed appliance only the
+        operator knows which addresses are routable. Several of them
+        advertise multipath.
 
         Args:
             portal: The selected portal
@@ -355,11 +331,9 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
     def _require_usable_volume_name_template(self):
         """Confirm rendered volume names are valid iSCSI target names.
 
-        TrueNAS accepts only lowercase alphanumerics plus '.', '-' and ':'.
-        Cinder's default `volume-<uuid>` passes, but a deployment that puts
-        an underscore or a capital in ``volume_name_template`` does not --
-        and would otherwise only discover that at the first attach, long
-        after deployment looked successful.
+        TrueNAS accepts only lowercase alphanumerics plus '.', '-' and
+        ':'. Checked here rather than at the first attach, which is where
+        it would otherwise surface.
 
         Raises:
             InvalidInput: If the template cannot be rendered at all, or the
@@ -402,10 +376,10 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
     def _update_volume_stats(self):
         """Report real capacity so the scheduler will place volumes here.
 
-        **Not optional.** The inherited implementation reports
+        **Not optional.** The inherited version reports
         ``free_capacity_gb=0`` with ``reserved_percentage=100``, which the
-        scheduler's capacity filter rejects -- the backend would accept no
-        volumes at all and nothing would say why.
+        scheduler's capacity filter rejects -- the backend would take no
+        volumes and nothing would say why.
 
         Raises:
             VolumeBackendAPIException: If capacity cannot be read
@@ -429,8 +403,7 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
                        'It existed when the driver started.')
                 % {'pool': pool_name})
 
-        # `size` and `free` are bytes; `allocated` is reported too but free
-        # is authoritative because it accounts for reservations.
+        # Bytes. `free` accounts for reservations; `allocated` does not.
         total_gb = int(pool.get('size') or 0) / GIB
         free_gb = int(pool.get('free') or 0) / GIB
 
