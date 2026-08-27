@@ -6,9 +6,6 @@
     flake-utils.url = "github:numtide/flake-utils";
   };
 
-  # Deliberately self-contained: nixpkgs and flake-utils only. This repo is
-  # public and GPL-3.0, so the dev shell must resolve for a contributor who
-  # has no access to any personal NixOS configuration.
   outputs = { self, nixpkgs, flake-utils, ... }:
     flake-utils.lib.eachDefaultSystem (system:
       let
@@ -19,18 +16,6 @@
         # CI still tests 3.10 via setup-python, which is what Kolla ships.
         python = pkgs.python312;
 
-        ##################################################################
-        # The reproducible half.
-        #
-        # Everything the API-client suite, the linter and the live
-        # verification tool need is in nixpkgs, so it is built by Nix and
-        # pinned by flake.lock -- no venv, no PyPI, nothing to install.
-        #
-        # This env deliberately does NOT contain Cinder, which mirrors the
-        # dependency boundary the project relies on: tests/unit must keep
-        # working without it, and `import cinder` failing here is the same
-        # guarantee the CI job gives.
-        ##################################################################
         pythonEnv = python.withPackages (ps: with ps; [
           requests
           pytest
@@ -40,11 +25,6 @@
           tox
         ]);
 
-        # Cinder pulls greenlet, lxml and cryptography as manylinux wheels
-        # built against an FHS toolchain. Without these on the library path
-        # `import cinder` dies with
-        #   ImportError: libstdc++.so.6: cannot open shared object file
-        # Only the uv/venv path below needs this; pythonEnv above does not.
         libPath = pkgs.lib.makeLibraryPath [
           pkgs.stdenv.cc.cc.lib
           pkgs.zlib
