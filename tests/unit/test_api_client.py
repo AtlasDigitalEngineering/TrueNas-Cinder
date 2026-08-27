@@ -1086,6 +1086,107 @@ class TestIscsiService(IscsiTestCase):
         self.assertFalse(self.client.reload_iscsi_service())
 
 
+class TestNameLookup(IscsiTestCase):
+    """Name-based lookup -- the authoritative teardown path (#16).
+
+    The appliance rejects an invalid filter *operator* with a 422 but
+    accepts an unrecognised filter *field*, answering 200 with an empty
+    list. So "it returned rows" is not by itself evidence the filter was
+    applied, and these tests pin the filter being sent and a multi-row
+    answer being refused rather than silently indexed.
+    """
+
+    def test_get_target_by_name_filters_server_side(self):
+        self._set_response([{"id": 6, "name": VOLUME}])
+
+        found = self.client.get_target_by_name(VOLUME)
+
+        self.session.request.assert_called_once_with(
+            "GET", f"{BASE_URL}/iscsi/target",
+            params={"name": VOLUME},
+            timeout=DEFAULT_TIMEOUT,
+        )
+        self.assertEqual(found["id"], 6)
+
+    def test_get_extent_by_name_filters_server_side(self):
+        self._set_response([{"id": 6, "name": VOLUME}])
+
+        found = self.client.get_extent_by_name(VOLUME)
+
+        self.session.request.assert_called_once_with(
+            "GET", f"{BASE_URL}/iscsi/extent",
+            params={"name": VOLUME},
+            timeout=DEFAULT_TIMEOUT,
+        )
+        self.assertEqual(found["id"], 6)
+
+    def test_missing_target_returns_none(self):
+        self._set_response([])
+
+        self.assertIsNone(self.client.get_target_by_name(VOLUME))
+
+    def test_missing_extent_returns_none(self):
+        self._set_response([])
+
+        self.assertIsNone(self.client.get_extent_by_name(VOLUME))
+
+    def test_multiple_matches_raise_rather_than_guess(self):
+        # Two rows means the filter was ignored and we are looking at the
+        # whole collection. Taking [0] would return another volume's
+        # export, and the caller deletes what it is handed.
+        self._set_response([
+            {"id": 6, "name": VOLUME},
+            {"id": 7, "name": "volume-other"},
+        ])
+
+        with self.assertRaises(TrueNASAPIError) as caught:
+            self.client.get_target_by_name(VOLUME)
+
+        self.assertIn("ignored", str(caught.exception))
+
+    def test_multiple_extent_matches_raise(self):
+        self._set_response([
+            {"id": 6, "name": VOLUME},
+            {"id": 7, "name": "volume-other"},
+        ])
+
+        with self.assertRaises(TrueNASAPIError):
+            self.client.get_extent_by_name(VOLUME)
+
+    def test_multi_match_error_carries_request_context(self):
+        self._set_response([{"id": 6}, {"id": 7}])
+
+        with self.assertRaises(TrueNASAPIError) as caught:
+            self.client.get_extent_by_name(VOLUME)
+
+        self.assertEqual(caught.exception.endpoint, "/iscsi/extent")
+        self.assertEqual(caught.exception.method, "GET")
+
+    def test_lookup_never_fetches_the_unfiltered_collection(self):
+        # A lookup that fell back to listing everything and filtering in
+        # Python would still pass the happy-path tests above.
+        for lookup in (self.client.get_target_by_name,
+                       self.client.get_extent_by_name):
+            self.session.reset_mock()
+            self._set_response([{"id": 6, "name": VOLUME}])
+
+            lookup(VOLUME)
+
+            self.assertEqual(self.session.request.call_count, 1)
+            kwargs = self.session.request.call_args.kwargs
+            self.assertEqual(kwargs.get("params"), {"name": VOLUME})
+
+    def test_lookup_is_a_read(self):
+        for lookup in (self.client.get_target_by_name,
+                       self.client.get_extent_by_name):
+            self.session.reset_mock()
+            self._set_response([])
+
+            lookup(VOLUME)
+
+            self.assertEqual(self.session.request.call_args.args[0], "GET")
+
+
 SNAP = "snapshot-7f2c1b9e-3a44-4d61-8e05-9b7c2f0a1d38"
 DATASET = f"Dev-Pool/{VOLUME}"
 SNAPSHOT_ID = f"{DATASET}@{SNAP}"

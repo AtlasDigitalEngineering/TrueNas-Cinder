@@ -688,6 +688,54 @@ class TrueNASAPIClient:
         text = str(value)
         return text[:limit] + "..." if len(text) > limit else text
 
+    def _get_one_by_name(
+        self,
+        resource: str,
+        name: str,
+        what: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Fetch exactly one iSCSI resource by name, or None.
+
+        Filtering happens on the appliance. Verified in #16 to discriminate
+        correctly on both ``/iscsi/target`` and ``/iscsi/extent``: with two
+        exports present, an exact name returns the single matching row and
+        a name matching nothing returns ``[]``.
+
+        **More than one row is an error, not a result.** An unrecognised
+        filter *field* is not rejected -- TrueNAS answers 200 with an empty
+        list rather than complaining, and a filter it ignored would return
+        the whole collection. Taking ``[0]`` from an unfiltered collection
+        would hand the caller some other volume's export and delete it, so
+        this refuses to guess. (An invalid *operator* does 422 loudly; it
+        is the field name that fails quietly.)
+
+        Args:
+            resource: Resource path segment, e.g. ``"target"``
+            name: Exact name to match
+            what: Human-readable description, for the error message
+
+        Returns:
+            The matching resource, or None if nothing has that name
+
+        Raises:
+            TrueNASAPIError: If the appliance returns more than one match
+        """
+        rows = self._make_request(
+            "GET", f"/iscsi/{resource}", params={"name": name},
+        )
+        if not rows:
+            return None
+        if len(rows) > 1:
+            raise TrueNASAPIError(
+                f"Expected at most one {what} named {name!r} but got "
+                f"{len(rows)}. The name filter appears to have been "
+                f"ignored; refusing to guess which one is correct.",
+                method="GET",
+                endpoint=f"/iscsi/{resource}",
+            )
+        return rows[0]
+
     @staticmethod
     def zvol_disk_path(pool: str, name: str) -> str:
         """
@@ -833,6 +881,23 @@ class TrueNASAPIClient:
         """
         return self._make_request("GET", "/iscsi/extent")
 
+    def get_extent_by_name(self, name: str) -> Optional[Dict[str, Any]]:
+        """
+        Find the iSCSI extent with this exact name.
+
+        The extent is the half of the pipeline that survives a target
+        delete -- deleting a target cascades only the target-extent link --
+        so teardown has to find and remove it separately. See
+        :meth:`get_target_by_name` for why the lookup is by name.
+
+        Args:
+            name: Extent name
+
+        Returns:
+            The extent, or None if no extent has that name
+        """
+        return self._get_one_by_name("extent", name, "iSCSI extent")
+
     def create_extent(self, zvol_path: str, extent_name: str) -> int:
         """
         Present a zvol as an iSCSI extent.
@@ -891,6 +956,25 @@ class TrueNASAPIClient:
             List of targets, each with ``id``, ``name`` and ``groups``
         """
         return self._make_request("GET", "/iscsi/target")
+
+    def get_target_by_name(self, name: str) -> Optional[Dict[str, Any]]:
+        """
+        Find the iSCSI target with this exact name.
+
+        The authoritative lookup for teardown (#16). Target names are a
+        deterministic function of the Cinder volume name, so the mapping
+        survives a ``cinder-volume`` restart and out-of-band changes on the
+        appliance without anything having been persisted. Nothing cached is
+        trusted for deletion: TrueNAS ids are small integers and a stale one
+        could address a different volume's export.
+
+        Args:
+            name: Target name, without the IQN basename prefix
+
+        Returns:
+            The target, or None if no target has that name
+        """
+        return self._get_one_by_name("target", name, "iSCSI target")
 
     def validate_target_name(self, name: str) -> Optional[str]:
         """
