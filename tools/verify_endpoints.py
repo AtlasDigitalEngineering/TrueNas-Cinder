@@ -283,14 +283,39 @@ def verify_iscsi_pipeline(client, pool, zvol_name):
                   f"{list(choices)[:4]}")
             ok = False
 
-        portal_id = check(
-            "create_portal()",
-            lambda: client.create_portal(comment="cinder-verify"),
-        )
-        if portal_id:
-            created.append((f"portal {portal_id}",
-                            lambda: client._make_request(
-                                "DELETE", f"/iscsi/portal/id/{portal_id}")))
+        # Multipath needs one portal per address, and a portal can only
+        # bind a *statically* configured address -- listen_ip_choices omits
+        # DHCP ones entirely (#45). A single-homed appliance falls back to
+        # the wildcard and simply does not exercise multipath.
+        choices = client._make_request(
+            "GET", "/iscsi/portal/listen_ip_choices") or {}
+        static_ips = [ip for ip in choices if ip not in ("0.0.0.0", "::")]
+        if len(static_ips) >= 2:
+            wanted = static_ips[:2]
+            print(f"  ..    {len(static_ips)} static address(es) offered; "
+                  f"exercising multipath across {wanted}")
+        else:
+            wanted = [None]
+            print(f"  ..    only {len(static_ips)} static address(es) "
+                  f"offered; binding 0.0.0.0 and NOT exercising multipath "
+                  f"(needs a multi-homed appliance with static IPs, #45)")
+
+        portal_ids = []
+        for ip in wanted:
+            pid = check(
+                f"create_portal({ip or '0.0.0.0'})",
+                lambda i=ip: client.create_portal(
+                    listen_ips=[i] if i else None, comment="cinder-verify"),
+            )
+            if pid:
+                portal_ids.append(pid)
+                created.append((f"portal {pid}",
+                                lambda p=pid: client._make_request(
+                                    "DELETE", f"/iscsi/portal/id/{p}")))
+        if len(portal_ids) != len(wanted):
+            print(f"  FAIL  expected {len(wanted)} portal(s), created "
+                  f"{len(portal_ids)}")
+            ok = False
 
         group_id = check(
             "get_or_create_initiator_group()",
@@ -327,12 +352,30 @@ def verify_iscsi_pipeline(client, pool, zvol_name):
         )
 
         target_id = None
-        if portal_id and group_id:
+        if portal_ids and group_id:
             target_id = check(
-                "create_target()",
+                f"create_target() across {len(portal_ids)} portal(s)",
                 lambda: client.create_target(TARGET_NAME, group_id,
-                                             portal_id),
+                                             portal_ids),
             )
+        if target_id and len(portal_ids) > 1:
+            # The multipath assertion. Compared as a *set*: the appliance
+            # returns groups in a different order than they were sent, and
+            # nothing may depend on that order (#45).
+            bound = check(
+                "target is bound to every portal",
+                lambda: client.get_target_by_name(TARGET_NAME),
+            )
+            got = sorted(g.get("portal")
+                         for g in (bound or {}).get("groups", []))
+            if got != sorted(portal_ids):
+                print(f"  FAIL  expected portals {sorted(portal_ids)}, "
+                      f"target reports {got}")
+                ok = False
+            else:
+                print(f"  ok    all {len(portal_ids)} portals bound "
+                      f"(order deliberately not asserted -- the appliance "
+                      f"reorders them)")
         if target_id:
             created.append((f"target {target_id}",
                             lambda: client.delete_target(target_id)))
