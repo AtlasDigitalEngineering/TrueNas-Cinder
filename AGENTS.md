@@ -61,6 +61,7 @@ tools/
 .env.example       # template; .env itself is gitignored
 docs/PLANNING.md   # milestones + issue map (predates the current issues, see #28)
 docs/configuration.md  # sample cinder.conf backend section + prerequisites
+flake.nix          # dev shell: python312, uv, gh, LD_LIBRARY_PATH
 tox.ini            # envlist = py310, driver, flake8; also [flake8] config
 requirements.txt   # cinder (platform), requests
 test-requirements.txt  # pytest, pytest-cov, coverage, flake8, tox, requests
@@ -86,6 +87,66 @@ tox -e flake8                                  # lint
 python -m pytest tests/unit                    # direct api_client run
 python -m unittest discover -s tests/unit -t . # discover path, also in CI
 ```
+
+Use `python -m pytest`, not bare `pytest` — see the packaging note above.
+
+**Use the flake.** `nix develop` gives the whole development environment.
+It comes in two halves, and the split is worth understanding:
+
+**Built by Nix, pinned by `flake.lock`, ready with no setup.** Everything the
+API-client suite, the linter and the verification tool need is in nixpkgs, so
+it is a `python312.withPackages` env — no venv, no PyPI, nothing to install:
+
+```bash
+nix develop
+python3 -m pytest tests/unit
+python3 -m flake8 truenas_cinder_driver tests tools
+python3 tools/verify_endpoints.py [--write]
+```
+
+That env deliberately does **not** contain Cinder. `import cinder` failing in it
+is the same guarantee the dependency-free CI job gives, enforced locally.
+
+**Installed from PyPI into a venv, for `tests/driver` only:**
+
+```bash
+uv venv && uv pip install -r driver-test-requirements.txt
+.venv/bin/python -m pytest tests/driver
+```
+
+Cinder is not in nixpkgs, and neither are `os-brick`, `oslo-versionedobjects`,
+`taskflow`, `castellan` or `cursive`. Making this half reproducible too means
+either packaging Cinder's whole dependency tree, or adopting `uv2nix` once #23
+adds a `pyproject.toml` — the latter is the better path and belongs to that
+issue.
+
+Two things the flake handles that are easy to get wrong by hand, both commented
+in it:
+
+- **`LD_LIBRARY_PATH` must carry `libstdc++`.** Cinder pulls `greenlet`, `lxml`
+  and `cryptography` as manylinux wheels built against an FHS toolchain, so
+  without it `import cinder` dies with `libstdc++.so.6: cannot open shared
+  object file`. Only the venv half needs this; the Nix env does not.
+- **`UV_PYTHON` must not be exported.** It takes precedence over uv's discovery
+  of `./.venv`, so `uv pip install` targets the read-only store interpreter and
+  fails with "tries to modify the immutable /nix/store". `UV_PYTHON_DOWNLOADS`
+  is set to `never` instead, so `uv venv` uses the shell's Python rather than
+  fetching one that will not run on NixOS.
+
+The flake is deliberately self-contained — nixpkgs and flake-utils only. This
+repo is public, so the dev shell has to resolve for a contributor with no
+access to any personal NixOS configuration.
+
+Python 3.12 locally versus 3.10 in CI is intentional: `python310` is no longer
+in nixpkgs, Cinder 26.x runs fine on 3.12, and CI still tests the 3.10 that
+Kolla actually ships.
+
+- **Cinder is needed for `tests/driver`, and only there.** `tests/unit` runs on
+  `requests` alone so the common CI job stays fast; a separate `Driver tests`
+  job installs Cinder and tests against the real base classes. Stubbing Cinder
+  was considered and rejected — it would test the driver against a fake base
+  class, and would not have caught that `SanDriver.check_for_setup_error()`
+  demands SSH credentials this driver never uses.
 
 Use `python -m pytest`, not bare `pytest` — see the packaging note above.
 

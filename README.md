@@ -27,6 +27,7 @@ TrueNas-Cinder/
 ├── tests/
 │   ├── unit/               # API client tests (no Cinder needed)
 │   └── driver/             # Driver tests (Cinder required)
+├── flake.nix               # Nix dev shell (Python, uv, gh)
 ├── AGENTS.md               # Conventions and workflow for contributors
 └── CONTRIBUTING.md         # Contribution guidelines
 ```
@@ -51,6 +52,16 @@ startup.
 
 ### Setup
 
+With Nix — the API client tests, linter and verification tool need no setup at
+all; only the driver tests, which need Cinder, install anything:
+
+```bash
+nix develop                                       # ready immediately
+uv venv && uv pip install -r driver-test-requirements.txt   # driver tests only
+```
+
+Without Nix:
+
 1. Clone the repository.
 2. Create a virtual environment: `python -m venv .venv && source .venv/bin/activate`
 3. Install test dependencies: `pip install -r test-requirements.txt`
@@ -59,8 +70,8 @@ startup.
 ### Running the tests
 
 ```bash
-python -m pytest tests/unit      # API client — runs on `requests` alone
-python -m pytest tests/driver    # Driver — needs Cinder installed
+python -m pytest tests/unit             # API client — runs on `requests` alone
+.venv/bin/python -m pytest tests/driver # Driver — needs Cinder installed
 ```
 
 The two suites are split so the API client tests stay fast and dependency-free;
