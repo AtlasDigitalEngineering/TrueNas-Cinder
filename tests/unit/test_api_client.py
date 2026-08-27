@@ -930,6 +930,99 @@ class TestTargets(IscsiTestCase):
         self.assertEqual(group["authmethod"], "NONE")
         self.assertNotIn("auth", group)
 
+    def test_create_target_accepts_several_portals(self):
+        # Multipath: one target, one LUN, several routes to it. Verified
+        # against the appliance in #45.
+        self._set_response({"id": 3})
+
+        self.client.create_target(VOLUME, 4, [1, 2])
+
+        self.assertEqual(
+            self._payload()["groups"],
+            [
+                {"portal": 1, "initiator": 4, "authmethod": "NONE"},
+                {"portal": 2, "initiator": 4, "authmethod": "NONE"},
+            ],
+        )
+
+    def test_portal_order_is_sent_as_given(self):
+        # The order we send determines which portal becomes the singular
+        # target_portal in provider_location, so it must be ours, not
+        # rearranged on the way out.
+        self._set_response({"id": 3})
+
+        self.client.create_target(VOLUME, 4, [2, 1])
+
+        self.assertEqual(
+            [g["portal"] for g in self._payload()["groups"]], [2, 1]
+        )
+
+    def test_every_portal_shares_one_initiator_group(self):
+        # Which IQNs may connect is a property of the volume, not of the
+        # path they arrive by.
+        self._set_response({"id": 3})
+
+        self.client.create_target(VOLUME, 4, [1, 2, 3])
+
+        for group in self._payload()["groups"]:
+            self.assertEqual(group["initiator"], 4)
+            self.assertEqual(group["authmethod"], "NONE")
+
+    def test_single_portal_still_accepted_as_a_bare_int(self):
+        self._set_response({"id": 3})
+
+        self.client.create_target(VOLUME, 4, 1)
+
+        self.assertEqual(
+            self._payload()["groups"],
+            [{"portal": 1, "initiator": 4, "authmethod": "NONE"}],
+        )
+
+    def test_single_portal_in_a_list_is_equivalent(self):
+        self._set_response({"id": 3})
+        self.client.create_target(VOLUME, 4, [1])
+        as_list = self._payload()["groups"]
+
+        self.session.reset_mock()
+        self._set_response({"id": 3})
+        self.client.create_target(VOLUME, 4, 1)
+
+        self.assertEqual(as_list, self._payload()["groups"])
+
+    def test_no_portal_is_refused(self):
+        # A target with no portal group is unreachable by any initiator.
+        with self.assertRaises(ValueError) as caught:
+            self.client.create_target(VOLUME, 4, [])
+
+        self.assertIn("at least one portal", str(caught.exception))
+        self.session.request.assert_not_called()
+
+    def test_duplicate_portal_is_refused(self):
+        with self.assertRaises(ValueError) as caught:
+            self.client.create_target(VOLUME, 4, [1, 2, 1])
+
+        self.assertIn("repeated portal", str(caught.exception))
+        self.session.request.assert_not_called()
+
+    def test_returns_only_the_id_never_the_reordered_groups(self):
+        # The appliance returns groups in a different order than they were
+        # sent (verified in #45). Returning the dict would hand a caller a
+        # reordered list that looks authoritative; returning the id alone
+        # means there is nothing to misuse.
+        self._set_response({
+            "id": 3,
+            "name": VOLUME,
+            "groups": [
+                {"portal": 2, "initiator": 4, "authmethod": "NONE"},
+                {"portal": 1, "initiator": 4, "authmethod": "NONE"},
+            ],
+        })
+
+        result = self.client.create_target(VOLUME, 4, [1, 2])
+
+        self.assertEqual(result, 3)
+        self.assertNotIsInstance(result, dict)
+
     def test_delete_target_never_sends_delete_extents(self):
         # `delete_extents: true` would widen an export teardown into
         # destroying the extent behind a volume that still exists.

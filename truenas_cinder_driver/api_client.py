@@ -1001,30 +1001,69 @@ class TrueNASAPIClient:
         self,
         target_name: str,
         initiator_group_id: int,
-        portal_id: int,
+        portal_ids: Union[int, List[int]],
     ) -> int:
         """
-        Create an iSCSI target bound to a portal and initiator group.
+        Create an iSCSI target bound to one or more portals.
+
+        A target carries one group per portal, all sharing the same
+        initiator group -- which IQNs may connect is a property of the
+        volume, not of the path they arrive by. Binding several portals is
+        how multipath is presented: one target, one LUN, several routes to
+        it. Verified against TrueNAS-25.10.5 in #45.
 
         ``authmethod`` is left at ``NONE``. CHAP is deferred past v1 (#27),
         and the driver must never invent a secret -- see #15.
+
+        **The appliance does not preserve group order.** Posting portals
+        ``[11, 12]`` returns them as ``[12, 11]`` (#45). Nothing may derive
+        an ordering from the response: in ``provider_location`` the first
+        portal becomes the singular ``target_portal`` that a non-multipath
+        connector uses, and reading it back would let that flip between
+        attaches. This method returns only the new id precisely so there is
+        no reordered ``groups`` list to be tempted by -- build the order
+        from the configured address list instead.
 
         Args:
             target_name: Name for the target. Becomes the suffix of the
                 full IQN, ``{basename}:{target_name}``.
             initiator_group_id: Group of IQNs permitted to connect
-            portal_id: Portal the target listens on
+            portal_ids: One portal id, or a list of them for multipath.
+                Order is not meaningful to the appliance.
 
         Returns:
             ID of the new target
+
+        Raises:
+            ValueError: If no portal is given, or one is repeated. Both are
+                caller bugs: a target with no portal is unreachable, and a
+                duplicate would ask for two identical groups.
         """
+        if isinstance(portal_ids, int):
+            portal_ids = [portal_ids]
+        else:
+            portal_ids = list(portal_ids)
+        if not portal_ids:
+            raise ValueError(
+                "create_target requires at least one portal: a target with "
+                "no portal group is not reachable by any initiator."
+            )
+        if len(set(portal_ids)) != len(portal_ids):
+            raise ValueError(
+                f"create_target got a repeated portal id in {portal_ids}. "
+                f"Each portal may appear at most once; a duplicate would "
+                f"request two identical groups on the same target."
+            )
         payload = {
             "name": target_name,
-            "groups": [{
-                "portal": portal_id,
-                "initiator": initiator_group_id,
-                "authmethod": "NONE",
-            }],
+            "groups": [
+                {
+                    "portal": portal_id,
+                    "initiator": initiator_group_id,
+                    "authmethod": "NONE",
+                }
+                for portal_id in portal_ids
+            ],
         }
         response = self._make_request("POST", "/iscsi/target", json=payload)
         return self._created_id(response, "iSCSI target")

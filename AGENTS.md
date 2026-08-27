@@ -234,10 +234,16 @@ disrupt a live iSCSI target.
 
 **The iSCSI pipeline has four traps, all verified in #12.**
 
-1. **Portals are not pre-existing.** The design doc called them read-only from
-   the driver's perspective; a clean appliance has *zero*. `get_portals()`
-   returns `[]` and there is no portal ID to create a target with. Whether the
-   driver creates one or demands one is #14/#17's call.
+1. **Portals are not pre-existing, and need a static address.** The design doc
+   called them read-only from the driver's perspective; a clean appliance has
+   *zero*. `get_portals()` returns `[]` and there is no portal ID to create a
+   target with. Whether the driver creates one or demands one is #14/#17's call.
+
+   `GET /iscsi/portal/listen_ip_choices` lists **only statically configured
+   addresses** — its own schema says so, and a DHCP interface is omitted even
+   though it holds a real address (#45). A portal bound to `0.0.0.0` reports
+   `listen[].ip` as `0.0.0.0`, which no compute node can connect to. So
+   "a portal exists" is not sufficient; it must bind a usable address.
 2. **A reload does not start a stopped service.** On a fresh appliance
    `iscsitarget` is `STOPPED` with `enable: false`. `POST /service/reload`
    returns `false` and changes nothing, so every target and extent written is
@@ -277,6 +283,28 @@ integers, so a stale id could address another volume's export, and guarding
 against that costs the same one request as looking it up by name. `provider_id`
 records `target:extent` for diagnostics, orphan reconciliation and #20 — never
 to skip a lookup.
+
+**Multipath is one target bound to several portals, and the appliance
+reorders the groups.** A TrueNAS target carries one group per portal, all
+sharing an initiator group — which IQNs may connect is a property of the volume,
+not of the path they arrive by. `create_target()` takes one portal id or a list
+of them; verified against hardware in #45.
+
+Cinder needs no help presenting this. `ISCSIDriver._get_iscsi_properties()`
+parses `provider_location` as `"<ip1>:<port>;<ip2>:<port>,<tag> <IQN> <lun>"` and,
+when there is more than one portal, populates `target_portals` / `target_iqns` /
+`target_luns` with one IQN and one LUN repeated per portal, keeping the singular
+keys for backward compatibility. Single-portal is the same format without
+semicolons, so there is one code path rather than two, and the `,<tag>` field is
+discarded by the parser — it is cosmetic, and cannot represent the per-portal
+tags TrueNAS actually assigns.
+
+**Never derive portal ordering from the appliance.** Posting groups for portals
+`[11, 12]` returns them as `[12, 11]` (#45). The first portal in
+`provider_location` becomes the singular `target_portal` a non-multipath
+connector uses, so reading the order back would let it flip between attaches.
+Build it from the configured address list. `create_target()` returns only the new
+id, deliberately, so there is no reordered `groups` list to be tempted by.
 
 **Never send the destructive delete options.** `DELETE /iscsi/target` accepts
 `delete_extents`, `DELETE /iscsi/extent` accepts `remove`, and both accept
