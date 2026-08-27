@@ -371,18 +371,29 @@ def verify_iscsi_pipeline(client, pool, zvol_name):
                   f"{found_extent.get('id') if found_extent else None}")
             ok = False
 
+        # Deliberately not using check() here. It returns None when the
+        # probe *raises*, and None is also the expected pass value for this
+        # assertion -- so a lookup that threw would be scored as a pass.
+        # An assertion whose expected value is None has to distinguish
+        # "returned None" from "blew up", or it reports success on failure.
         for label, lookup in (
             ("target", client.get_target_by_name),
             ("extent", client.get_extent_by_name),
         ):
-            missing = check(
-                f"unknown {label} name -> None (not a stray match)",
-                lambda fn=lookup: fn("cinder-verify-no-such-name"),
-            )
-            if missing is not None:
-                print(f"  FAIL  expected None for an unknown {label} name, "
-                      f"got {missing}")
+            try:
+                missing = lookup("cinder-verify-no-such-name")
+            except Exception as exc:                 # noqa: BLE001
+                print(f"  FAIL  unknown {label} name raised "
+                      f"{type(exc).__name__}: {str(exc)[:160]}")
                 ok = False
+            else:
+                if missing is None:
+                    print(f"  ok    unknown {label} name -> None "
+                          f"(not a stray match)")
+                else:
+                    print(f"  FAIL  expected None for an unknown {label} "
+                          f"name, got {missing}")
+                    ok = False
 
         # Reload against a stopped service is a no-op that reports no error.
         # If this ever starts returning True, the docstring on
