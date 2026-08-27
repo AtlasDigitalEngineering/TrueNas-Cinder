@@ -18,18 +18,27 @@ This project provides a Cinder volume driver that enables OpenStack to use TrueN
 TrueNas-Cinder/
 ├── .github/                # CI workflows and CODEOWNERS
 ├── docs/
-│   └── PLANNING.md         # Project roadmap and milestones
+│   ├── PLANNING.md         # Project roadmap and milestones
+│   └── configuration.md    # cinder.conf backend section + prerequisites
 ├── truenas_cinder_driver/
 │   ├── __init__.py         # Package initialization
-│   └── api_client.py       # TrueNAS REST API client wrapper
+│   ├── api_client.py       # TrueNAS REST API client wrapper
+│   └── driver.py           # Cinder volume driver
 ├── tests/
-│   └── unit/               # Unit tests
+│   ├── unit/               # API client tests (no Cinder needed)
+│   └── driver/             # Driver tests (Cinder required)
+├── flake.nix               # Nix dev shell (Python, uv, gh)
 ├── AGENTS.md               # Conventions and workflow for contributors
 └── CONTRIBUTING.md         # Contribution guidelines
 ```
 
-The Cinder driver itself (`driver.py`) is not implemented yet — see the
-roadmap below and the open issues.
+`driver.py` currently provides configuration, setup validation and capacity
+reporting. The volume lifecycle and the export/connection path are still in
+progress — see the open issues.
+
+See [docs/configuration.md](docs/configuration.md) for a sample `cinder.conf`
+backend section and the appliance prerequisites the driver validates at
+startup.
 
 ## Development
 
@@ -38,23 +47,37 @@ roadmap below and the open issues.
 - Python 3.10+ — 3.10 is the deployment target (Kolla 2025.1 / Ubuntu Jammy);
   CI also runs 3.12
 - TrueNAS Scale (v24.x or later)
-- OpenStack Cinder (provided by the deployment; not installed for local
-  development or testing)
+- OpenStack Cinder — provided by the deployment at runtime. Not needed for the
+  API client tests; required for the driver tests, which import it
 
 ### Setup
+
+With Nix — the API client tests, linter and verification tool need no setup at
+all; only the driver tests, which need Cinder, install anything:
+
+```bash
+nix develop                                       # ready immediately
+uv venv && uv pip install -r driver-test-requirements.txt   # driver tests only
+```
+
+Without Nix:
 
 1. Clone the repository.
 2. Create a virtual environment: `python -m venv .venv && source .venv/bin/activate`
 3. Install test dependencies: `pip install -r test-requirements.txt`
+4. For the driver tests as well: `pip install -r driver-test-requirements.txt`
 
 ### Running the tests
 
 ```bash
-python -m pytest tests/unit
+python -m pytest tests/unit             # API client — runs on `requests` alone
+.venv/bin/python -m pytest tests/driver # Driver — needs Cinder installed
 ```
 
-The package is not installable yet, so use `python -m pytest` rather than bare
-`pytest` — see [AGENTS.md](AGENTS.md) for the detail.
+The two suites are split so the API client tests stay fast and dependency-free;
+Cinder pulls in around 58 packages. The package is not installable yet, so use
+`python -m pytest` rather than bare `pytest` — see [AGENTS.md](AGENTS.md) for
+the detail, including the extra step needed on NixOS.
 
 ## Roadmap
 

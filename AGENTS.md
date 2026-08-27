@@ -42,27 +42,35 @@ class is `cinder.volume.drivers.san.san.SanISCSIDriver`.
 ```
 .github/
   CODEOWNERS               # * @setkeh
-  workflows/test.yml       # unit tests (3.10, 3.12) + flake8
+  workflows/test.yml       # unit (3.10, 3.12) + driver (3.10) + flake8
   workflows/claude-code-review.yml
 truenas_cinder_driver/
   __init__.py      # exports TrueNASAPIClient, the exception hierarchy, __version__
   api_client.py    # TrueNASAPIClient + TrueNASAPIError hierarchy — REST wrapper
+  driver.py        # TrueNASISCSIDriver — config, setup validation, stats
 tests/
   __init__.py
-  unit/
+  unit/            # api_client; runs on `requests` alone, no Cinder
     __init__.py
     test_api_client.py
+  driver/          # driver; needs Cinder installed
+    __init__.py
+    test_driver.py
 tools/
   verify_endpoints.py  # live-appliance verification, reads .env
 .env.example       # template; .env itself is gitignored
 docs/PLANNING.md   # milestones + issue map (predates the current issues, see #28)
-tox.ini            # envlist = py310, flake8; also holds [flake8] config
-requirements.txt   # cinder (platform, not installed by CI), requests
+docs/configuration.md  # sample cinder.conf backend section + prerequisites
+flake.nix          # dev shell: python312, uv, gh, LD_LIBRARY_PATH
+tox.ini            # envlist = py310, driver, flake8; also [flake8] config
+requirements.txt   # cinder (platform), requests
 test-requirements.txt  # pytest, pytest-cov, coverage, flake8, tox, requests
+driver-test-requirements.txt  # the above plus Cinder, for tests/driver
 ```
 
-`driver.py` does **not** exist on main. A draft lives on the unmerged
-`origin/feature/driver-core` branch — see #26 for its disposition.
+`feature/driver-core` carried an earlier draft of `driver.py`. It was
+abandoned and deleted — merging it would have reverted the whole API client.
+See #26.
 
 There is **no** `setup.py` / `pyproject.toml` / `setup.cfg` — the package is
 not installable, so tests import `truenas_cinder_driver` only because the repo
@@ -72,12 +80,73 @@ than bare `pytest`. Issue #23 fixes this properly.
 ## Commands
 
 ```bash
-tox                                        # py310 + flake8
-tox -e py310                               # unit tests with coverage
-tox -e flake8                              # lint
-python -m pytest tests/unit                # direct test run
-python -m unittest discover -s tests -t .  # discover path, also run in CI
+tox                                            # py310 + driver + flake8
+tox -e py310                                   # api_client tests, no Cinder
+tox -e driver                                  # driver tests, needs Cinder
+tox -e flake8                                  # lint
+python -m pytest tests/unit                    # direct api_client run
+python -m unittest discover -s tests/unit -t . # discover path, also in CI
 ```
+
+Use `python -m pytest`, not bare `pytest` — see the packaging note above.
+
+**Use the flake.** `nix develop` gives the whole development environment.
+It comes in two halves, and the split is worth understanding:
+
+**Built by Nix, pinned by `flake.lock`, ready with no setup.** Everything the
+API-client suite, the linter and the verification tool need is in nixpkgs, so
+it is a `python312.withPackages` env — no venv, no PyPI, nothing to install:
+
+```bash
+nix develop
+python3 -m pytest tests/unit
+python3 -m flake8 truenas_cinder_driver tests tools
+python3 tools/verify_endpoints.py [--write]
+```
+
+That env deliberately does **not** contain Cinder. `import cinder` failing in it
+is the same guarantee the dependency-free CI job gives, enforced locally.
+
+**Installed from PyPI into a venv, for `tests/driver` only:**
+
+```bash
+uv venv && uv pip install -r driver-test-requirements.txt
+.venv/bin/python -m pytest tests/driver
+```
+
+Cinder is not in nixpkgs, and neither are `os-brick`, `oslo-versionedobjects`,
+`taskflow`, `castellan` or `cursive`. Making this half reproducible too means
+either packaging Cinder's whole dependency tree, or adopting `uv2nix` once #23
+adds a `pyproject.toml` — the latter is the better path and belongs to that
+issue.
+
+Two things the flake handles that are easy to get wrong by hand, both commented
+in it:
+
+- **`LD_LIBRARY_PATH` must carry `libstdc++`.** Cinder pulls `greenlet`, `lxml`
+  and `cryptography` as manylinux wheels built against an FHS toolchain, so
+  without it `import cinder` dies with `libstdc++.so.6: cannot open shared
+  object file`. Only the venv half needs this; the Nix env does not.
+- **`UV_PYTHON` must not be exported.** It takes precedence over uv's discovery
+  of `./.venv`, so `uv pip install` targets the read-only store interpreter and
+  fails with "tries to modify the immutable /nix/store". `UV_PYTHON_DOWNLOADS`
+  is set to `never` instead, so `uv venv` uses the shell's Python rather than
+  fetching one that will not run on NixOS.
+
+The flake is deliberately self-contained — nixpkgs and flake-utils only. This
+repo is public, so the dev shell has to resolve for a contributor with no
+access to any personal NixOS configuration.
+
+Python 3.12 locally versus 3.10 in CI is intentional: `python310` is no longer
+in nixpkgs, Cinder 26.x runs fine on 3.12, and CI still tests the 3.10 that
+Kolla actually ships.
+
+- **Cinder is needed for `tests/driver`, and only there.** `tests/unit` runs on
+  `requests` alone so the common CI job stays fast; a separate `Driver tests`
+  job installs Cinder and tests against the real base classes. Stubbing Cinder
+  was considered and rejected — it would test the driver against a fake base
+  class, and would not have caught that `SanDriver.check_for_setup_error()`
+  demands SSH credentials this driver never uses.
 
 Use `python -m pytest`, not bare `pytest` — see the packaging note above.
 
@@ -95,9 +164,22 @@ dev machines differ:
   generally *not* installed, so
   `python3 -m unittest discover -s tests -t .` is the dependable fallback — it
   needs nothing beyond `requests`.
-- Cinder is deliberately not installed by CI. The driver is loaded *by* a Cinder
-  deployment that already provides it, and installing it costs minutes for no
-  benefit while only `api_client.py` (requests-only) is under test.
+- **Cinder is needed for `tests/driver`, and only there.** `tests/unit` runs on
+  `requests` alone so the common CI job stays fast; a separate `Driver tests`
+  job installs Cinder and tests against the real base classes. Stubbing Cinder
+  was considered and rejected — it would test the driver against a fake base
+  class, and would not have caught that `SanDriver.check_for_setup_error()`
+  demands SSH credentials this driver never uses.
+- **Driver tests on the NixOS workstation** need Cinder in a venv *and*
+  `libstdc++` on the library path, or `greenlet` fails to import:
+  ```bash
+  nix-shell -p python312 --run 'python3 -m venv /tmp/cenv'
+  /tmp/cenv/bin/pip install -r driver-test-requirements.txt
+  LD_LIBRARY_PATH="$(nix-build '<nixpkgs>' -A stdenv.cc.cc.lib --no-out-link)/lib" \\
+    /tmp/cenv/bin/python -m pytest tests/driver
+  ```
+  Cinder 26.3.0 installs cleanly on Python 3.12 this way. `python310` is not in
+  nixpkgs here, so local runs use 3.12 while CI uses the 3.10 deployment target.
 - **Clear `__pycache__` before trusting a test result after a scripted edit.**
   A same-size change written within the same mtime second leaves a stale `.pyc`
   that Python considers valid, so tests run against the *previous* source. This
@@ -321,6 +403,27 @@ currently in use by extent \<name\>" (errno 22, not ENOENT). That 1:1
 constraint is enforced appliance-side, which is what makes name-based
 re-derivation viable for #16.
 
+**Two things in `driver.py` look removable and are not.**
+
+`check_for_setup_error()` **must not call `super()`**. `SanDriver`'s version
+raises `InvalidInput` unless `san_ip` and one of `san_password` /
+`san_private_key` are set, because it drives arrays over SSH. This driver only
+speaks REST with a Bearer key, so those options are unused and demanding them
+would block startup on credentials nothing reads. A test asserts the driver
+starts with all of them empty, so "restoring" the call fails CI.
+
+`_update_volume_stats()` **must stay overridden**. The inherited
+`ISCSIDriver` version reports `total_capacity_gb=0`, `free_capacity_gb=0` and
+`reserved_percentage=100`, which the scheduler's capacity filter rejects — the
+backend would silently accept no volumes at all, and nothing would say why.
+Capacity comes from `GET /pool`, which reports `size` and `free` in bytes.
+
+**The driver never initialises appliance state** (#14). It does not create a
+portal and does not start the iSCSI service, because both are appliance-wide
+and shared by every `cinder-volume` worker. `check_for_setup_error` validates
+instead, and every failure names the offending value, the config option and the
+remedy. `docs/configuration.md` carries the operator-facing prerequisites.
+
 **Auth is a Bearer API key, not a password** (#10). `truenas_api_key` is a
 service-account key and must be declared `secret=True` in `oslo_config` so it
 is redacted from logged config dumps. `verify_ssl` defaults to **True** — do
@@ -427,6 +530,13 @@ Required status checks **are** enforced: contexts `Unit tests (Python 3.10)`,
 `Unit tests (Python 3.12)` and `Lint (flake8)`, with
 `strict_required_status_checks_policy: true`. A red pipeline blocks the merge.
 
+> **OUTSTANDING — add `Driver tests` to the required status checks.**
+> The ruleset lists `Unit tests (Python 3.10)`, `Unit tests (Python 3.12)` and
+> `Lint (flake8)`. The `Driver tests` job added for `tests/driver` is not among
+> them, so a red driver job does not block a merge. Add it to the
+> `required_status_checks` rule on the `Gitops` ruleset.
+
+
 **Signed commits are mandatory** and the signing key lives on a hardware token
 (OpenPGP smartcard). Agents **cannot** commit — gpg needs a PIN via pinentry on
 a TTY. Stage and verify the work, then ask setkeh to run the commit himself.
@@ -452,11 +562,19 @@ per-request.
    docstrings, Google-style docstrings with `Args:`/`Returns:` on every public
    method, `typing` annotations on signatures. Keep lines within flake8's
    default 79 columns unless a config says otherwise.
-2. **Tests required** for new functions — add to `tests/unit/test_<module>.py`
-   (note: `test_*.py`, not `*_tests.py`). Mock at the `requests.Session`
-   boundary; unit tests must never make a real network call. Verify a new test
-   actually fails when the code is wrong — the existing suite is a cautionary
-   example of tests that pass no signal.
+2. **Tests required** for new functions (note: `test_*.py`, not `*_tests.py`).
+   Which suite, and what to mock, depends on what is under test:
+   - `api_client.py` → `tests/unit/test_api_client.py`, mocking at the
+     **`requests.Session`** boundary. This suite must keep running without
+     Cinder installed.
+   - `driver.py` → `tests/driver/test_driver.py`, mocking at the
+     **API-client** boundary. The client's own behaviour is already covered
+     exhaustively and verified against hardware, so re-mocking HTTP there
+     would test the wrong thing.
+
+   No test may make a real network call. Verify a new test actually fails when
+   the code is wrong — the original suite is a cautionary example of tests that
+   passed no signal.
 3. **Follow OpenStack Cinder conventions** in `driver.py`: subclass
    `cinder.volume.drivers.san.san.SanISCSIDriver`, declare config via
    `oslo_config` opts read through `self.configuration`, and raise
