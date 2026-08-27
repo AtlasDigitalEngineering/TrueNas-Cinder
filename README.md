@@ -81,13 +81,16 @@ the detail, including the extra step needed on NixOS.
 
 ## Roadmap
 
-See [PLANNING.md](docs/PLANNING.md) for the detailed development roadmap.
+See [PLANNING.md](docs/PLANNING.md) for why the project exists, how it is
+structured, and what each milestone means. Current status — what is merged, in
+progress or blocked — lives in the GitHub issues and their milestones:
 
-1. Define project structure and architecture
-2. Implement API client for TrueNAS Scale REST API
-3. Develop core Cinder driver with OpenStack compliance
-4. Establish testing framework (unit tests, CI/CD)
-5. Create comprehensive documentation
+- **M1 — Minimum viable attach**: create, delete, attach and detach, proven by a
+  Nova instance booting from a TrueNAS-backed volume.
+- **M2 — Full lifecycle**: snapshots, clones and extend, with rollback paths
+  covered.
+- **M3 — Migration ready**: `manage_existing` validated against a real
+  Proxmox-created zvol, and a Kolla image deployed.
 
 ## Contributing
 

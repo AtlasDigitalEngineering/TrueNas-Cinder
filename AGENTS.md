@@ -59,7 +59,7 @@ tests/
 tools/
   verify_endpoints.py  # live-appliance verification, reads .env
 .env.example       # template; .env itself is gitignored
-docs/PLANNING.md   # milestones + issue map (predates the current issues, see #28)
+docs/PLANNING.md   # why the project exists, its shape, milestone outcomes
 docs/configuration.md  # sample cinder.conf backend section + prerequisites
 flake.nix          # dev shell: python312, uv, gh, LD_LIBRARY_PATH
 tox.ini            # envlist = py310, driver, flake8; also [flake8] config
