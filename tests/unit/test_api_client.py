@@ -1004,6 +1004,41 @@ class TestTargets(IscsiTestCase):
         self.assertIn("repeated portal", str(caught.exception))
         self.session.request.assert_not_called()
 
+    def test_bool_portal_id_is_refused(self):
+        # bool is an int subclass, so True would otherwise be wrapped into
+        # [True] and serialise as JSON `true` for the portal id (#51).
+        for value in (True, False):
+            self.session.reset_mock()
+            with self.assertRaises(ValueError) as caught:
+                self.client.create_target(VOLUME, 4, value)
+
+            self.assertIn("portal id", str(caught.exception))
+            self.session.request.assert_not_called()
+
+    def test_bool_inside_a_portal_list_is_refused(self):
+        with self.assertRaises(ValueError):
+            self.client.create_target(VOLUME, 4, [1, True])
+
+        self.session.request.assert_not_called()
+
+    def test_non_integer_portal_id_is_refused(self):
+        for value in ("1", None, 1.0):
+            self.session.reset_mock()
+            with self.assertRaises(ValueError):
+                self.client.create_target(VOLUME, 4, [value])
+
+            self.session.request.assert_not_called()
+
+    def test_bare_non_iterable_portal_id_is_refused(self):
+        # Not wrapped in a list: None has no __iter__, so it must normalise
+        # to [None] and be refused, not blow up in list(None).
+        for value in (None, 1.5):
+            self.session.reset_mock()
+            with self.assertRaises(ValueError):
+                self.client.create_target(VOLUME, 4, value)
+
+            self.session.request.assert_not_called()
+
     def test_returns_only_the_id_never_the_reordered_groups(self):
         # The appliance returns groups in a different order than they were
         # sent (verified in #45). Returning the dict would hand a caller a

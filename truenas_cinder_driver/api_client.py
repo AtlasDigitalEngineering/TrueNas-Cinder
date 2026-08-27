@@ -444,7 +444,7 @@ class TrueNASAPIClient:
 
             extent_id = client.create_extent(zvol_path, name)
             try:
-                target_id = client.create_target(name, group_id, portal_id)
+                target_id = client.create_target(name, group_id, portal_ids)
             except TrueNASAPIError:
                 client.best_effort_delete(
                     client.delete_extent, extent_id,
@@ -1029,20 +1029,39 @@ class TrueNASAPIClient:
                 full IQN, ``{basename}:{target_name}``.
             initiator_group_id: Group of IQNs permitted to connect
             portal_ids: One portal id, or a list of them for multipath.
-                Order is not meaningful to the appliance.
+                Order is not meaningful to the appliance. Each must be an
+                integer -- `bool` is refused, see below.
 
         Returns:
             ID of the new target
 
         Raises:
-            ValueError: If no portal is given, or one is repeated. Both are
-                caller bugs: a target with no portal is unreachable, and a
-                duplicate would ask for two identical groups.
+            ValueError: If no portal is given, one is repeated, or any is
+                not an integer. All are caller bugs: a target with no portal
+                is unreachable, a duplicate would ask for two identical
+                groups, and a `bool` -- an `int` subclass -- would serialise
+                as JSON `true` rather than a portal id.
         """
-        if isinstance(portal_ids, int):
+        # `bool` needs no mention here: it is an `int` subclass, so a bare
+        # True already normalises to [True] and is caught by the per-id
+        # check below.
+        if isinstance(portal_ids, int) or not hasattr(
+            portal_ids, "__iter__"
+        ):
             portal_ids = [portal_ids]
         else:
             portal_ids = list(portal_ids)
+        for portal_id in portal_ids:
+            # `bool` is an `int` subclass, so a stray True would otherwise
+            # pass an isinstance check and serialise as JSON `true` for the
+            # portal id. Rejected explicitly rather than left to fail at
+            # the appliance as a schema error (#51).
+            if not isinstance(portal_id, int) or isinstance(portal_id, bool):
+                raise ValueError(
+                    f"create_target got {portal_id!r} as a portal id. "
+                    f"Portal ids are integers, as returned by "
+                    f"create_portal() and get_portals()."
+                )
         if not portal_ids:
             raise ValueError(
                 "create_target requires at least one portal: a target with "
