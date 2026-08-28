@@ -22,13 +22,6 @@ a side effect.
    can connect to, so the driver requires `truenas_iscsi_portal_addresses` in
    that case.
 
-5. **No periodic snapshot task covering the Cinder pool.** ZFS refuses to
-   destroy a zvol that still has snapshots, and the driver will not delete
-   them for you — it fails the delete and returns the volume to `available`
-   rather than destroying snapshots it did not create. A TrueNAS periodic
-   snapshot task over the pool therefore makes **every** volume delete fail.
-   Exclude the Cinder pool from snapshot tasks, or give Cinder its own pool.
-
 ## Sample backend section
 
 ```ini
@@ -72,6 +65,28 @@ that file as you would any other credential store.
 | `truenas_iscsi_portal_id` | integer | discovered | only with several portals |
 | `truenas_iscsi_portal_addresses` | list | portal's own addresses | when the portal binds a wildcard |
 | `truenas_verify_ssl` | boolean | `true` | no |
+
+## Let OpenStack own snapshots
+
+TrueNAS does not snapshot zvols on its own, so this is not something you have
+to turn off — but it *is* something to avoid turning on for a pool Cinder
+manages.
+
+ZFS refuses to destroy a zvol that still has snapshots. The driver will not
+destroy snapshots it did not create: it fails the delete and returns the volume
+to `available` rather than silently discarding them. So anything that creates
+snapshots behind Cinder's back — a **periodic snapshot task**, a **replication
+task**, or a manual snapshot — will make that volume undeletable until the
+snapshot is removed, and Cinder cannot tell you why beyond reporting the volume
+as busy.
+
+**Snapshot Cinder volumes through Cinder.** If you need TrueNAS-side snapshot or
+replication tasks, scope them to datasets Cinder does not manage, or give Cinder
+its own pool.
+
+There is no good automatic answer here. Deleting foreign snapshots to complete a
+delete would be the driver destroying data it does not own, which is worse than
+failing.
 
 ## Volume naming
 
