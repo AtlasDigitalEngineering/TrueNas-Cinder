@@ -32,9 +32,10 @@ TrueNas-Cinder/
 └── CONTRIBUTING.md         # Contribution guidelines
 ```
 
-`driver.py` currently provides configuration, setup validation and capacity
-reporting. The volume lifecycle and the export/connection path are still in
-progress — see the open issues.
+`driver.py` provides configuration, setup validation, capacity reporting, the
+volume lifecycle and the iSCSI export/connection path. Snapshots, clones,
+extend and the `manage_existing` family are still in progress — see the open
+issues.
 
 See [docs/configuration.md](docs/configuration.md) for a sample `cinder.conf`
 backend section and the appliance prerequisites the driver validates at
