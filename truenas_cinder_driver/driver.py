@@ -373,6 +373,116 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
                 % {'template': template, 'reason': reason,
                    'suggestion': DEFAULT_VOLUME_NAME_TEMPLATE})
 
+    def create_volume(self, volume):
+        """Create the zvol backing a Cinder volume.
+
+        Created sparse, which is what lets the driver report
+        ``thin_provisioning_support``. ``volume.name`` renders
+        ``volume_name_template`` against the volume's ``name_id``, so it
+        follows a migrated volume and matches the name
+        :meth:`check_for_setup_error` validated against the appliance.
+
+        Args:
+            volume: The Cinder volume to create
+
+        Raises:
+            VolumeBackendAPIException: If the appliance refused the create
+        """
+        pool = self.configuration.truenas_pool
+        try:
+            self.client.create_zvol(pool, volume.name, volume.size)
+        except api_client.TrueNASAPIError as exc:
+            raise exception.VolumeBackendAPIException(
+                data=_('Could not create volume %(name)s in TrueNAS pool '
+                       '%(pool)s: %(err)s')
+                % {'name': volume.name, 'pool': pool, 'err': exc})
+
+        LOG.info('Created zvol %(pool)s/%(name)s, %(size)s GiB, sparse.',
+                 {'pool': pool, 'name': volume.name, 'size': volume.size})
+
+    def delete_volume(self, volume):
+        """Delete the zvol backing a Cinder volume.
+
+        Idempotent: a zvol that is already gone counts as deleted, which is
+        what lets a retried or half-completed delete converge instead of
+        wedging the volume in ``error_deleting``.
+
+        **Never recursive.** ZFS refuses to destroy a zvol that still has
+        snapshots, and ``recursive=True`` would destroy them along with it.
+        Cinder deletes snapshots before volumes itself, so reaching that
+        state means something is already wrong -- and silently destroying
+        snapshots to get past it turns a visible failure into data loss
+        found at restore time.
+
+        Args:
+            volume: The Cinder volume to delete
+
+        Raises:
+            VolumeIsBusy: If snapshots still depend on the zvol
+            VolumeBackendAPIException: If the delete failed for any other
+                reason
+        """
+        pool = self.configuration.truenas_pool
+        try:
+            self.client.delete_zvol(pool, volume.name, recursive=False)
+        except api_client.TrueNASAPINotFoundError:
+            LOG.info('Zvol %(pool)s/%(name)s was already gone; treating the '
+                     'delete as complete.',
+                     {'pool': pool, 'name': volume.name})
+        except api_client.TrueNASAPIError as exc:
+            self._raise_delete_failure(volume, pool, exc)
+        else:
+            LOG.info('Deleted zvol %(pool)s/%(name)s.',
+                     {'pool': pool, 'name': volume.name})
+
+    def _raise_delete_failure(self, volume, pool, exc):
+        """Re-raise a failed zvol delete, naming snapshots when they caused it.
+
+        The appliance reports the snapshot case as a flat
+        ``{"message": ..., "errno": 14}`` body. Rather than key off that --
+        message text is unreliable and the errno is undocumented -- this
+        asks the appliance directly whether snapshots exist, which costs a
+        request only on the failure path and produces a message naming
+        them.
+
+        A common cause is snapshots Cinder does not know about: a TrueNAS
+        periodic snapshot task covering the pool will block every delete.
+
+        Args:
+            volume: The Cinder volume whose delete failed
+            pool: Pool the zvol lives in
+            exc: The error the delete raised
+
+        Raises:
+            VolumeIsBusy: If snapshots still depend on the zvol. The manager
+                returns the volume to ``available`` rather than
+                ``error_deleting``, which is correct -- it still exists and
+                is still usable.
+            VolumeBackendAPIException: For any other failure
+        """
+        dataset = f'{pool}/{volume.name}'
+        try:
+            snapshots = self.client.get_snapshot_list(dataset=dataset)
+        except api_client.TrueNASAPIError:
+            # Asking was a courtesy. Report the original failure.
+            snapshots = []
+
+        if snapshots:
+            names = ', '.join(sorted(
+                snap.get('snapshot_name') or snap.get('id', '?')
+                for snap in snapshots))
+            LOG.error('Refusing to delete %(dataset)s: %(count)d snapshot(s) '
+                      'still depend on it (%(names)s). Deleting the zvol '
+                      'would destroy them.',
+                      {'dataset': dataset, 'count': len(snapshots),
+                       'names': names})
+            raise exception.VolumeIsBusy(volume_name=volume.name)
+
+        raise exception.VolumeBackendAPIException(
+            data=_('Could not delete volume %(name)s from TrueNAS pool '
+                   '%(pool)s: %(err)s')
+            % {'name': volume.name, 'pool': pool, 'err': exc})
+
     def _update_volume_stats(self):
         """Report real capacity so the scheduler will place volumes here.
 
