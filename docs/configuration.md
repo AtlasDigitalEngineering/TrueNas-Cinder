@@ -22,6 +22,13 @@ a side effect.
    can connect to, so the driver requires `truenas_iscsi_portal_addresses` in
    that case.
 
+5. **No periodic snapshot task covering the Cinder pool.** ZFS refuses to
+   destroy a zvol that still has snapshots, and the driver will not delete
+   them for you — it fails the delete and returns the volume to `available`
+   rather than destroying snapshots it did not create. A TrueNAS periodic
+   snapshot task over the pool therefore makes **every** volume delete fail.
+   Exclude the Cinder pool from snapshot tasks, or give Cinder its own pool.
+
 ## Sample backend section
 
 ```ini

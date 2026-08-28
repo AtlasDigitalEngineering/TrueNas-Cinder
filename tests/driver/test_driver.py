@@ -361,6 +361,158 @@ class TestSetupValidation(DriverTestCase):
         driver.client.validate_target_name.assert_not_called()
 
 
+class FakeVolume(object):
+    """Minimal stand-in for a Cinder volume object."""
+
+    def __init__(self, name='volume-4d9e1a5c-8f3b-4a21-9c77-2e6b0f1d3a84',
+                 size=10):
+        self.name = name
+        self.size = size
+
+
+class TestCreateVolume(DriverTestCase):
+    """create_volume."""
+
+    def test_creates_a_zvol_in_the_configured_pool(self):
+        driver = self._driver()
+        volume = FakeVolume()
+
+        driver.create_volume(volume)
+
+        driver.client.create_zvol.assert_called_once_with(
+            POOL, volume.name, volume.size)
+
+    def test_size_is_passed_in_gib(self):
+        driver = self._driver()
+
+        driver.create_volume(FakeVolume(size=250))
+
+        self.assertEqual(driver.client.create_zvol.call_args.args[2], 250)
+
+    def test_uses_the_rendered_volume_name(self):
+        # volume.name is volume_name_template % name_id, which follows a
+        # migrated volume. Using volume.id instead would diverge.
+        driver = self._driver()
+
+        driver.create_volume(FakeVolume(name='volume-renamed-id'))
+
+        self.assertEqual(
+            driver.client.create_zvol.call_args.args[1], 'volume-renamed-id')
+
+    def test_backend_failure_is_translated(self):
+        driver = self._driver()
+        driver.client.create_zvol.side_effect = (
+            api_client.TrueNASAPIError('pool is full'))
+
+        with self.assertRaises(exception.VolumeBackendAPIException) as caught:
+            driver.create_volume(FakeVolume())
+
+        self.assertIn('pool is full', str(caught.exception))
+
+    def test_no_raw_client_exception_escapes(self):
+        # The driver must never leak a TrueNASAPIError to Cinder.
+        driver = self._driver()
+        driver.client.create_zvol.side_effect = (
+            api_client.TrueNASAPITimeoutError('timed out'))
+
+        with self.assertRaises(exception.VolumeBackendAPIException):
+            driver.create_volume(FakeVolume())
+
+
+class TestDeleteVolume(DriverTestCase):
+    """delete_volume."""
+
+    def _driver(self, **over):
+        driver = super()._driver(**over)
+        driver.client.get_snapshot_list.return_value = []
+        return driver
+
+    def test_deletes_non_recursively(self):
+        # recursive=True would destroy the volume's snapshots with it.
+        driver = self._driver()
+        volume = FakeVolume()
+
+        driver.delete_volume(volume)
+
+        driver.client.delete_zvol.assert_called_once_with(
+            POOL, volume.name, recursive=False)
+
+    def test_already_gone_counts_as_deleted(self):
+        driver = self._driver()
+        driver.client.delete_zvol.side_effect = (
+            api_client.TrueNASAPINotFoundError('no such dataset'))
+
+        driver.delete_volume(FakeVolume())
+
+    def test_already_gone_does_not_go_looking_for_snapshots(self):
+        driver = self._driver()
+        driver.client.delete_zvol.side_effect = (
+            api_client.TrueNASAPINotFoundError('no such dataset'))
+
+        driver.delete_volume(FakeVolume())
+
+        driver.client.get_snapshot_list.assert_not_called()
+
+    def test_snapshots_make_the_volume_busy_not_an_error(self):
+        # VolumeIsBusy returns the volume to 'available'; a generic error
+        # would strand it in 'error_deleting'.
+        driver = self._driver()
+        volume = FakeVolume()
+        driver.client.delete_zvol.side_effect = (
+            api_client.TrueNASAPIError('volume has children'))
+        driver.client.get_snapshot_list.return_value = [
+            {'id': f'{POOL}/{volume.name}@snap-1', 'snapshot_name': 'snap-1'},
+        ]
+
+        with self.assertRaises(exception.VolumeIsBusy):
+            driver.delete_volume(volume)
+
+    def test_snapshots_are_checked_on_the_right_dataset(self):
+        driver = self._driver()
+        volume = FakeVolume()
+        driver.client.delete_zvol.side_effect = (
+            api_client.TrueNASAPIError('volume has children'))
+        driver.client.get_snapshot_list.return_value = [
+            {'id': 'x@snap-1', 'snapshot_name': 'snap-1'}]
+
+        with self.assertRaises(exception.VolumeIsBusy):
+            driver.delete_volume(volume)
+
+        driver.client.get_snapshot_list.assert_called_once_with(
+            dataset=f'{POOL}/{volume.name}')
+
+    def test_failure_without_snapshots_is_a_backend_error(self):
+        driver = self._driver()
+        driver.client.delete_zvol.side_effect = (
+            api_client.TrueNASAPIError('pool is offline'))
+
+        with self.assertRaises(exception.VolumeBackendAPIException) as caught:
+            driver.delete_volume(FakeVolume())
+
+        self.assertIn('pool is offline', str(caught.exception))
+
+    def test_snapshot_lookup_failing_reports_the_original_error(self):
+        # Asking about snapshots is a courtesy; it must not replace the
+        # failure that actually happened.
+        driver = self._driver()
+        driver.client.delete_zvol.side_effect = (
+            api_client.TrueNASAPIError('pool is offline'))
+        driver.client.get_snapshot_list.side_effect = (
+            api_client.TrueNASAPIConnectionError('gone'))
+
+        with self.assertRaises(exception.VolumeBackendAPIException) as caught:
+            driver.delete_volume(FakeVolume())
+
+        self.assertIn('pool is offline', str(caught.exception))
+
+    def test_happy_path_makes_no_snapshot_query(self):
+        driver = self._driver()
+
+        driver.delete_volume(FakeVolume())
+
+        driver.client.get_snapshot_list.assert_not_called()
+
+
 class TestVolumeStats(DriverTestCase):
     """Capacity reporting -- without it the backend is unschedulable."""
 
