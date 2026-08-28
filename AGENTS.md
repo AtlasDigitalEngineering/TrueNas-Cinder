@@ -48,7 +48,7 @@ an earlier version of this file said Jammy, which put the driver tests on
 ```
 .github/
   CODEOWNERS               # * @setkeh
-  workflows/test.yml       # unit (3.10, 3.12) + driver (3.10) + flake8
+  workflows/test.yml       # unit (3.12, 3.10) + driver (3.12) + flake8
   workflows/claude-code-review.yml
 truenas_cinder_driver/
   __init__.py      # exports TrueNASAPIClient, the exception hierarchy, __version__
@@ -68,7 +68,7 @@ tools/
 docs/PLANNING.md   # why the project exists, its shape, milestone outcomes
 docs/configuration.md  # sample cinder.conf backend section + prerequisites
 flake.nix          # dev shell: python312, uv, gh, LD_LIBRARY_PATH
-tox.ini            # envlist = py310, driver, flake8; also [flake8] config
+tox.ini            # envlist = py312, driver, flake8; also [flake8] config
 requirements.txt   # cinder (platform), requests
 test-requirements.txt  # pytest, pytest-cov, coverage, flake8, tox, requests
 driver-test-requirements.txt  # the above plus Cinder, for tests/driver
@@ -86,8 +86,8 @@ than bare `pytest`. Issue #23 fixes this properly.
 ## Commands
 
 ```bash
-tox                                            # py310 + driver + flake8
-tox -e py310                                   # api_client tests, no Cinder
+tox                                            # py312 + driver + flake8
+tox -e py312                                   # api_client tests, no Cinder
 tox -e driver                                  # driver tests, needs Cinder
 tox -e flake8                                  # lint
 python -m pytest tests/unit                    # direct api_client run
@@ -143,9 +143,9 @@ The flake is deliberately self-contained — nixpkgs and flake-utils only. This
 repo is public, so the dev shell has to resolve for a contributor with no
 access to any personal NixOS configuration.
 
-Python 3.12 locally versus 3.10 in CI is intentional: `python310` is no longer
-in nixpkgs, Cinder 26.x runs fine on 3.12, and CI still tests the 3.10 that
-Kolla actually ships.
+Local and CI both run 3.12, the deployment interpreter. `python310` is no
+longer in nixpkgs, which is convenient rather than a compromise: the api_client
+suite keeps a 3.10 leg in CI as breadth, but nothing needs 3.10 locally.
 
 - **Cinder is needed for `tests/driver`, and only there.** `tests/unit` runs on
   `requests` alone so the common CI job stays fast; a separate `Driver tests`
@@ -540,15 +540,10 @@ and non-fast-forward, requires signed commits, requires a PR with stale-review
 dismissal and thread resolution, and requires code owner review
 (`.github/CODEOWNERS` → `* @setkeh`).
 
-Required status checks **are** enforced: contexts `Unit tests (Python 3.10)`,
-`Unit tests (Python 3.12)` and `Lint (flake8)`, with
-`strict_required_status_checks_policy: true`. A red pipeline blocks the merge.
-
-> **OUTSTANDING — add `Driver tests` to the required status checks.**
-> The ruleset lists `Unit tests (Python 3.10)`, `Unit tests (Python 3.12)` and
-> `Lint (flake8)`. The `Driver tests` job added for `tests/driver` is not among
-> them, so a red driver job does not block a merge. Add it to the
-> `required_status_checks` rule on the `Gitops` ruleset.
+Required status checks **are** enforced: contexts `Unit tests (Python 3.12)`,
+`Unit tests (Python 3.10)`, `Driver tests` and `Lint (flake8)`, with
+`strict_required_status_checks_policy: true`. A red pipeline blocks the merge,
+and a branch behind `main` must be updated before it can merge.
 
 
 **Signed commits are mandatory** and the signing key lives on a hardware token
