@@ -418,6 +418,13 @@ starts with all of them empty, so "restoring" the call fails CI.
 backend would silently accept no volumes at all, and nothing would say why.
 Capacity comes from `GET /pool`, which reports `size` and `free` in bytes.
 
+**An export is inert until the service reloads.** `create_export` reloads
+after building the pipeline, and rolls the whole thing back if that reload
+fails — configuration the appliance accepted but never activated is not an
+export, and leaving it behind would orphan a target and extent that no
+initiator can see. `remove_export` reloads too, but a failure there is only
+logged: the resources are already gone, and failing would strand the volume.
+
 **The driver never initialises appliance state** (#14). It does not create a
 portal and does not start the iSCSI service, because both are appliance-wide
 and shared by every `cinder-volume` worker. `check_for_setup_error` validates

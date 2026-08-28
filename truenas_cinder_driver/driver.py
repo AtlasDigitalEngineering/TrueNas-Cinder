@@ -28,6 +28,11 @@ GIB = 1024 ** 3
 DEFAULT_VOLUME_NAME_TEMPLATE = 'volume-%s'
 SAMPLE_VOLUME_ID = 'ffffffff-ffff-ffff-ffff-ffffffffffff'
 
+DEFAULT_SNAPSHOT_NAME_TEMPLATE = 'snapshot-%s'
+
+# One LUN per target: each volume gets its own target.
+LUN_ID = 0
+
 # Accepted by the appliance, unreachable from a compute node.
 WILDCARD_ADDRESSES = ('0.0.0.0', '::')
 
@@ -85,7 +90,10 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         self.client = None
         # Resolved during check_for_setup_error, used by the export path.
         self.portal_id = None
+        self.portal_tag = None
         self.portal_addresses = []
+        self.iscsi_basename = None
+        self.iscsi_port = None
 
     @staticmethod
     def get_driver_options():
@@ -150,6 +158,7 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         self._require_pool_exists(pools)
         self._require_iscsi_service_running()
         self._resolve_portal()
+        self._resolve_iscsi_global()
         self._require_usable_volume_name_template()
         LOG.info('TrueNAS driver setup validated: pool %(pool)s, portal '
                  '%(portal)s, addresses %(addresses)s.',
@@ -288,6 +297,7 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
                    'available': ', '.join(str(i) for i in available)})
 
         self.portal_id = portal.get('id')
+        self.portal_tag = portal.get('tag')
         self.portal_addresses = self._resolve_portal_addresses(portal)
 
     def _resolve_portal_addresses(self, portal):
@@ -327,6 +337,30 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
             % {'portal': portal.get('id'),
                'listening': ', '.join(ip for ip in listening if ip)
                             or 'nothing'})
+
+    def _resolve_iscsi_global(self):
+        """Read the IQN prefix and port the appliance serves iSCSI on.
+
+        Cached rather than fetched per export: both are appliance-wide and
+        change about as often as the hostname.
+
+        Raises:
+            VolumeBackendAPIException: If the global config cannot be read,
+                or carries no ``basename`` to build target IQNs from
+        """
+        try:
+            config = self.client.get_iscsi_global_config()
+        except api_client.TrueNASAPIError as exc:
+            raise exception.VolumeBackendAPIException(
+                data=_('Could not read the iSCSI configuration from the '
+                       'TrueNAS appliance: %s') % exc)
+
+        self.iscsi_basename = config.get('basename')
+        self.iscsi_port = config.get('listen_port')
+        if not self.iscsi_basename:
+            raise exception.VolumeBackendAPIException(
+                data=_('The TrueNAS appliance reported no iSCSI basename, '
+                       'so target IQNs cannot be built.'))
 
     def _require_usable_volume_name_template(self):
         """Confirm rendered volume names are valid iSCSI target names.
@@ -372,6 +406,172 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
                          '%(suggestion)r.')
                 % {'template': template, 'reason': reason,
                    'suggestion': DEFAULT_VOLUME_NAME_TEMPLATE})
+
+    def ensure_export(self, context, volume):
+        """Nothing to do -- exports live on the appliance, not in memory.
+
+        Called when the volume service restarts. Targets, extents and their
+        association are appliance state and survive a restart, and teardown
+        re-derives them by name rather than from anything cached, so there
+        is nothing to rebuild.
+
+        Args:
+            context: Security context, unused
+            volume: The Cinder volume, unused
+        """
+
+    def create_export(self, context, volume, connector):
+        """Export the volume over iSCSI and return what Cinder must persist.
+
+        Builds extent -> target -> association, then reloads the service so
+        the configuration is actually live. Each step rolls back the ones
+        before it, so a failure leaves nothing behind for the operator to
+        find later.
+
+        Args:
+            context: Security context, unused
+            volume: The Cinder volume to export
+            connector: Connector dict; its ``initiator`` decides which IQN
+                is allowed to attach
+
+        Returns:
+            Model update carrying ``provider_location`` and ``provider_id``
+
+        Raises:
+            InvalidConnectorException: If the connector carries no initiator
+            VolumeBackendAPIException: If the appliance refused any step
+        """
+        initiator = (connector or {}).get('initiator')
+        if not initiator:
+            raise exception.InvalidConnectorException(missing='initiator')
+
+        pool = self.configuration.truenas_pool
+        name = volume.name
+        rollback = []
+
+        try:
+            group_id = self.client.get_or_create_initiator_group([initiator])
+            extent_id = self.client.create_extent(
+                self.client.zvol_disk_path(pool, name), name)
+            rollback.append(('iSCSI extent %s' % extent_id,
+                             self.client.delete_extent, extent_id))
+
+            target_id = self.client.create_target(
+                name, group_id, self.portal_id)
+            rollback.append(('iSCSI target %s' % target_id,
+                             self.client.delete_target, target_id))
+
+            self.client.create_target_extent(target_id, extent_id)
+
+            # Until the service reloads, everything above is inert: the
+            # appliance accepts the configuration and no initiator can see
+            # it.
+            self.client.reload_iscsi_service()
+        except api_client.TrueNASAPIError as exc:
+            for what, delete, resource_id in reversed(rollback):
+                self.client.best_effort_delete(delete, resource_id, what=what)
+            raise exception.VolumeBackendAPIException(
+                data=_('Could not export volume %(name)s over iSCSI: '
+                       '%(err)s') % {'name': name, 'err': exc})
+
+        location = self._provider_location(name)
+        LOG.info('Exported %(name)s as %(location)s.',
+                 {'name': name, 'location': location})
+        return {
+            'provider_location': location,
+            # A hint for orphan reconciliation and #20, never trusted for
+            # teardown -- see remove_export.
+            'provider_id': '%s:%s' % (target_id, extent_id),
+        }
+
+    def _provider_location(self, name):
+        """Build the iSCSI discovery string Cinder stores and parses back.
+
+        ``"<ip>:<port>[;<ip>:<port>...],<tag> <IQN> <lun>"``. The inherited
+        ``_get_iscsi_properties()`` splits the address list on ``;`` and
+        fills ``target_portals`` / ``target_iqns`` / ``target_luns`` when
+        there is more than one, so listing every address is all multipath
+        needs from this driver.
+
+        Address order comes from configuration, never from the appliance:
+        the first entry becomes the singular ``target_portal`` a
+        non-multipath connector uses, and TrueNAS does not preserve order.
+
+        Args:
+            name: Volume name, which is also the target name
+
+        Returns:
+            The provider_location string
+        """
+        portals = ';'.join('%s:%s' % (address, self.iscsi_port)
+                           for address in self.portal_addresses)
+        return '%s,%s %s:%s %s' % (portals, self.portal_tag,
+                                   self.iscsi_basename, name, LUN_ID)
+
+    def remove_export(self, context, volume):
+        """Tear down the volume's iSCSI export.
+
+        Finds the target and extent **by name** rather than from
+        ``provider_id``: TrueNAS ids are small integers, so a stale one
+        could address another volume's export, and checking that a cached
+        id still matches costs the same request as looking it up.
+
+        Idempotent, because Cinder also calls this to clean up after a
+        failed export and after a failed model update -- so it must cope
+        with a half-built export, or none at all.
+
+        Args:
+            context: Security context, unused
+            volume: The Cinder volume to unexport
+
+        Raises:
+            VolumeBackendAPIException: If something exists and could not be
+                removed
+        """
+        name = volume.name
+        removed = []
+
+        # Target first: deleting either end cascades the association, and
+        # the extent is what holds the zvol.
+        for what, find, delete in (
+            ('target', self.client.get_target_by_name,
+             self.client.delete_target),
+            ('extent', self.client.get_extent_by_name,
+             self.client.delete_extent),
+        ):
+            try:
+                found = find(name)
+            except api_client.TrueNASAPIError as exc:
+                raise exception.VolumeBackendAPIException(
+                    data=_('Could not look up the iSCSI %(what)s for volume '
+                           '%(name)s: %(err)s')
+                    % {'what': what, 'name': name, 'err': exc})
+            if not found:
+                continue
+            try:
+                delete(found['id'])
+            except api_client.TrueNASAPINotFoundError:
+                pass
+            except api_client.TrueNASAPIError as exc:
+                raise exception.VolumeBackendAPIException(
+                    data=_('Could not remove the iSCSI %(what)s for volume '
+                           '%(name)s: %(err)s')
+                    % {'what': what, 'name': name, 'err': exc})
+            removed.append('%s %s' % (what, found['id']))
+
+        if not removed:
+            LOG.info('Volume %s had no iSCSI export to remove.', name)
+            return
+
+        try:
+            self.client.reload_iscsi_service()
+        except api_client.TrueNASAPIError as exc:
+            LOG.warning('Removed %(removed)s for volume %(name)s but could '
+                        'not reload the iSCSI service: %(err)s',
+                        {'removed': ', '.join(removed), 'name': name,
+                         'err': exc})
+        LOG.info('Removed %(removed)s for volume %(name)s.',
+                 {'removed': ', '.join(removed), 'name': name})
 
     def create_volume(self, volume):
         """Create the zvol backing a Cinder volume.
@@ -468,20 +668,70 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
             snapshots = []
 
         if snapshots:
-            names = ', '.join(sorted(
-                snap.get('snapshot_name') or snap.get('id', '?')
-                for snap in snapshots))
-            LOG.error('Refusing to delete %(dataset)s: %(count)d snapshot(s) '
-                      'still depend on it (%(names)s). Deleting the zvol '
-                      'would destroy them.',
-                      {'dataset': dataset, 'count': len(snapshots),
-                       'names': names})
+            self._log_blocking_snapshots(dataset, snapshots)
             raise exception.VolumeIsBusy(volume_name=volume.name)
 
         raise exception.VolumeBackendAPIException(
             data=_('Could not delete volume %(name)s from TrueNAS pool '
                    '%(pool)s: %(err)s')
             % {'name': volume.name, 'pool': pool, 'err': exc})
+
+    def _log_blocking_snapshots(self, dataset, snapshots):
+        """Say which snapshots blocked a delete, and who created them.
+
+        The two cases need different action and are otherwise
+        indistinguishable to an operator. Snapshots Cinder created mean its
+        own delete ordering went wrong, which is a bug here. Snapshots it
+        did not create mean something else on the appliance is snapshotting
+        a Cinder-managed zvol -- a periodic snapshot or replication task --
+        and no amount of retrying will clear it.
+
+        Args:
+            dataset: Full dataset path, for the message
+            snapshots: Snapshots returned for that dataset
+        """
+        names = sorted(snap.get('snapshot_name') or snap.get('id') or '?'
+                       for snap in snapshots)
+        foreign = [name for name in names
+                   if not self._is_cinder_snapshot(name)]
+
+        if foreign:
+            LOG.error(
+                'Cannot delete %(dataset)s: %(count)d snapshot(s) still '
+                'depend on it, and %(n)d of them were not created by Cinder '
+                '(%(foreign)s). Something else on the appliance is '
+                'snapshotting a Cinder-managed volume -- check for a '
+                'periodic snapshot or replication task covering this pool. '
+                'The driver will not delete snapshots it does not own.',
+                {'dataset': dataset, 'count': len(names), 'n': len(foreign),
+                 'foreign': ', '.join(foreign)})
+        else:
+            LOG.error(
+                'Cannot delete %(dataset)s: %(count)d Cinder snapshot(s) '
+                'still exist (%(names)s). Cinder deletes snapshots before '
+                'volumes, so reaching this state means the volume was '
+                'deleted out of order.',
+                {'dataset': dataset, 'count': len(names),
+                 'names': ', '.join(names)})
+
+    def _is_cinder_snapshot(self, snapshot_name):
+        """Decide whether a snapshot name looks like one Cinder created.
+
+        Matches the literal prefix of ``snapshot_name_template`` -- the
+        default ``snapshot-%s`` gives ``snapshot-``. A template with no
+        prefix makes every snapshot look like Cinder's, so that is treated
+        as "cannot tell" rather than "all ours".
+
+        Args:
+            snapshot_name: Bare snapshot name, without the dataset or ``@``
+
+        Returns:
+            True if the name carries the template's prefix
+        """
+        template = (self.configuration.safe_get('snapshot_name_template')
+                    or DEFAULT_SNAPSHOT_NAME_TEMPLATE)
+        prefix = template.split('%s')[0]
+        return bool(prefix) and snapshot_name.startswith(prefix)
 
     def _update_volume_stats(self):
         """Report real capacity so the scheduler will place volumes here.

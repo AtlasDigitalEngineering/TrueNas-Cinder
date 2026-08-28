@@ -513,6 +513,293 @@ class TestDeleteVolume(DriverTestCase):
         driver.client.get_snapshot_list.assert_not_called()
 
 
+IQN = 'iqn.2005-03.org.open-iscsi:nova-compute-01'
+BASENAME = 'iqn.2005-10.org.freenas.ctl'
+
+
+class ExportTestCase(DriverTestCase):
+    """A driver whose setup has already resolved the portal and globals."""
+
+    def _driver(self, addresses=None, **over):
+        driver = super()._driver(**over)
+        driver.portal_id = 1
+        driver.portal_tag = 1
+        driver.portal_addresses = addresses or ['10.20.21.81']
+        driver.iscsi_basename = BASENAME
+        driver.iscsi_port = 3260
+        driver.client.get_or_create_initiator_group.return_value = 7
+        driver.client.create_extent.return_value = 8
+        driver.client.create_target.return_value = 9
+        driver.client.create_target_extent.return_value = 10
+        driver.client.zvol_disk_path.side_effect = (
+            lambda pool, name: f'zvol/{pool}/{name}')
+        return driver
+
+
+class TestCreateExport(ExportTestCase):
+    """create_export."""
+
+    def test_builds_the_pipeline_and_reloads(self):
+        driver = self._driver()
+        volume = FakeVolume()
+
+        driver.create_export(None, volume, {'initiator': IQN})
+
+        driver.client.get_or_create_initiator_group.assert_called_once_with(
+            [IQN])
+        driver.client.create_extent.assert_called_once_with(
+            f'zvol/{POOL}/{volume.name}', volume.name)
+        driver.client.create_target.assert_called_once_with(
+            volume.name, 7, 1)
+        driver.client.create_target_extent.assert_called_once_with(9, 8)
+        # Without this the appliance holds the config and nothing attaches.
+        driver.client.reload_iscsi_service.assert_called_once_with()
+
+    def test_returns_provider_location_and_id(self):
+        driver = self._driver()
+        volume = FakeVolume()
+
+        update = driver.create_export(None, volume, {'initiator': IQN})
+
+        self.assertEqual(
+            update['provider_location'],
+            f'10.20.21.81:3260,1 {BASENAME}:{volume.name} 0')
+        self.assertEqual(update['provider_id'], '9:8')
+
+    def test_multipath_joins_addresses_with_semicolons(self):
+        # _get_iscsi_properties splits on ';' and only then populates
+        # target_portals / target_iqns / target_luns.
+        driver = self._driver(addresses=['10.20.21.81', '10.40.96.182'])
+        volume = FakeVolume()
+
+        update = driver.create_export(None, volume, {'initiator': IQN})
+
+        self.assertIn('10.20.21.81:3260;10.40.96.182:3260',
+                      update['provider_location'])
+
+    def test_address_order_follows_configuration(self):
+        driver = self._driver(addresses=['10.40.96.182', '10.20.21.81'])
+
+        update = driver.create_export(None, FakeVolume(),
+                                      {'initiator': IQN})
+
+        self.assertTrue(
+            update['provider_location'].startswith('10.40.96.182:3260;'))
+
+    def test_missing_initiator_is_refused(self):
+        driver = self._driver()
+
+        with self.assertRaises(exception.InvalidConnectorException):
+            driver.create_export(None, FakeVolume(), {})
+
+        driver.client.create_extent.assert_not_called()
+
+    def test_no_connector_at_all_is_refused(self):
+        driver = self._driver()
+
+        with self.assertRaises(exception.InvalidConnectorException):
+            driver.create_export(None, FakeVolume(), None)
+
+    def test_target_failure_rolls_back_the_extent(self):
+        driver = self._driver()
+        driver.client.create_target.side_effect = (
+            api_client.TrueNASAPIError('name taken'))
+
+        with self.assertRaises(exception.VolumeBackendAPIException):
+            driver.create_export(None, FakeVolume(), {'initiator': IQN})
+
+        driver.client.best_effort_delete.assert_called_once()
+        args = driver.client.best_effort_delete.call_args
+        self.assertEqual(args.args[0], driver.client.delete_extent)
+        self.assertEqual(args.args[1], 8)
+
+    def test_link_failure_rolls_back_target_then_extent(self):
+        driver = self._driver()
+        driver.client.create_target_extent.side_effect = (
+            api_client.TrueNASAPIError('bad link'))
+
+        with self.assertRaises(exception.VolumeBackendAPIException):
+            driver.create_export(None, FakeVolume(), {'initiator': IQN})
+
+        # Reverse order: target first, then the extent it was built on.
+        deleted = [c.args[0] for c
+                   in driver.client.best_effort_delete.call_args_list]
+        self.assertEqual(
+            deleted, [driver.client.delete_target,
+                      driver.client.delete_extent])
+
+    def test_reload_failure_rolls_back_too(self):
+        # Config that never activated is not an export.
+        driver = self._driver()
+        driver.client.reload_iscsi_service.side_effect = (
+            api_client.TrueNASAPIError('service gone'))
+
+        with self.assertRaises(exception.VolumeBackendAPIException):
+            driver.create_export(None, FakeVolume(), {'initiator': IQN})
+
+        self.assertEqual(driver.client.best_effort_delete.call_count, 2)
+
+    def test_extent_failure_rolls_back_nothing(self):
+        driver = self._driver()
+        driver.client.create_extent.side_effect = (
+            api_client.TrueNASAPIError('disk in use'))
+
+        with self.assertRaises(exception.VolumeBackendAPIException):
+            driver.create_export(None, FakeVolume(), {'initiator': IQN})
+
+        driver.client.best_effort_delete.assert_not_called()
+
+
+class TestRemoveExport(ExportTestCase):
+    """remove_export."""
+
+    def _driver(self, **over):
+        driver = super()._driver(**over)
+        driver.client.get_target_by_name.return_value = {'id': 9}
+        driver.client.get_extent_by_name.return_value = {'id': 8}
+        return driver
+
+    def test_deletes_target_then_extent_by_name(self):
+        driver = self._driver()
+        volume = FakeVolume()
+
+        driver.remove_export(None, volume)
+
+        driver.client.get_target_by_name.assert_called_once_with(volume.name)
+        driver.client.get_extent_by_name.assert_called_once_with(volume.name)
+        driver.client.delete_target.assert_called_once_with(9)
+        driver.client.delete_extent.assert_called_once_with(8)
+        driver.client.reload_iscsi_service.assert_called_once_with()
+
+    def test_never_uses_provider_id(self):
+        # A stale id could address another volume's export.
+        driver = self._driver()
+        volume = FakeVolume()
+        volume.provider_id = '999:999'
+
+        driver.remove_export(None, volume)
+
+        driver.client.delete_target.assert_called_once_with(9)
+
+    def test_nothing_exported_is_not_an_error(self):
+        driver = self._driver()
+        driver.client.get_target_by_name.return_value = None
+        driver.client.get_extent_by_name.return_value = None
+
+        driver.remove_export(None, FakeVolume())
+
+        driver.client.delete_target.assert_not_called()
+        driver.client.delete_extent.assert_not_called()
+        driver.client.reload_iscsi_service.assert_not_called()
+
+    def test_half_built_export_still_cleans_up(self):
+        # create_export failed after the extent but before the target.
+        driver = self._driver()
+        driver.client.get_target_by_name.return_value = None
+
+        driver.remove_export(None, FakeVolume())
+
+        driver.client.delete_target.assert_not_called()
+        driver.client.delete_extent.assert_called_once_with(8)
+
+    def test_already_gone_during_delete_is_tolerated(self):
+        driver = self._driver()
+        driver.client.delete_target.side_effect = (
+            api_client.TrueNASAPINotFoundError('cascaded'))
+
+        driver.remove_export(None, FakeVolume())
+
+        driver.client.delete_extent.assert_called_once_with(8)
+
+    def test_lookup_failure_is_reported(self):
+        driver = self._driver()
+        driver.client.get_target_by_name.side_effect = (
+            api_client.TrueNASAPIConnectionError('unreachable'))
+
+        with self.assertRaises(exception.VolumeBackendAPIException):
+            driver.remove_export(None, FakeVolume())
+
+    def test_delete_failure_is_reported(self):
+        driver = self._driver()
+        driver.client.delete_extent.side_effect = (
+            api_client.TrueNASAPIError('busy'))
+
+        with self.assertRaises(exception.VolumeBackendAPIException):
+            driver.remove_export(None, FakeVolume())
+
+    def test_reload_failure_does_not_fail_the_removal(self):
+        # The resources are gone; failing here would strand the volume.
+        driver = self._driver()
+        driver.client.reload_iscsi_service.side_effect = (
+            api_client.TrueNASAPIError('service gone'))
+
+        driver.remove_export(None, FakeVolume())
+
+
+class TestSnapshotOrigin(DriverTestCase):
+    """Telling Cinder's snapshots apart from the appliance's."""
+
+    def _busy(self, driver, snapshot_names):
+        driver.client.delete_zvol.side_effect = (
+            api_client.TrueNASAPIError('volume has children'))
+        driver.client.get_snapshot_list.return_value = [
+            {'snapshot_name': n} for n in snapshot_names]
+
+    def test_foreign_snapshots_name_the_likely_cause(self):
+        driver = self._driver()
+        self._busy(driver, ['auto-2026-08-28_00-00'])
+
+        with mock.patch.object(tnd, 'LOG') as log:
+            with self.assertRaises(exception.VolumeIsBusy):
+                driver.delete_volume(FakeVolume())
+
+        message = log.error.call_args.args[0] % log.error.call_args.args[1]
+        self.assertIn('not created by Cinder', message)
+        self.assertIn('auto-2026-08-28_00-00', message)
+
+    def test_cinder_snapshots_point_at_delete_ordering(self):
+        driver = self._driver()
+        self._busy(driver, ['snapshot-1b2c3d4e-0000-0000-0000-000000000000'])
+
+        with mock.patch.object(tnd, 'LOG') as log:
+            with self.assertRaises(exception.VolumeIsBusy):
+                driver.delete_volume(FakeVolume())
+
+        message = log.error.call_args.args[0] % log.error.call_args.args[1]
+        self.assertIn('out of order', message)
+        self.assertNotIn('not created by Cinder', message)
+
+    def test_a_single_foreign_snapshot_is_enough_to_flag(self):
+        driver = self._driver()
+        self._busy(driver, ['snapshot-1b2c3d4e-0000-0000-0000-000000000000',
+                            'replication-2026-08-28'])
+
+        with mock.patch.object(tnd, 'LOG') as log:
+            with self.assertRaises(exception.VolumeIsBusy):
+                driver.delete_volume(FakeVolume())
+
+        message = log.error.call_args.args[0] % log.error.call_args.args[1]
+        self.assertIn('not created by Cinder', message)
+        self.assertIn('replication-2026-08-28', message)
+
+    def test_custom_snapshot_template_is_honoured(self):
+        driver = self._driver(snapshot_name_template='cinder-snap-%s')
+        self._busy(driver, ['cinder-snap-abc'])
+
+        with mock.patch.object(tnd, 'LOG') as log:
+            with self.assertRaises(exception.VolumeIsBusy):
+                driver.delete_volume(FakeVolume())
+
+        message = log.error.call_args.args[0] % log.error.call_args.args[1]
+        self.assertIn('out of order', message)
+
+    def test_a_prefixless_template_never_claims_ownership(self):
+        # '%s' alone would otherwise make every snapshot look like ours.
+        driver = self._driver(snapshot_name_template='%s')
+
+        self.assertFalse(driver._is_cinder_snapshot('anything-at-all'))
+
+
 class TestVolumeStats(DriverTestCase):
     """Capacity reporting -- without it the backend is unschedulable."""
 
