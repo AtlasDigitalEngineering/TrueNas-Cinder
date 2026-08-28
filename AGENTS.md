@@ -34,8 +34,14 @@ and the EULA response shape — all fixed in #35). Its content has been extracte
 into issues #8–#28 and the milestone definitions. Do not treat any document as
 outranking observed behaviour.
 
-Deployment target: Kolla-Ansible, OpenStack 2025.1, Ubuntu Jammy base. Base
-class is `cinder.volume.drivers.san.san.SanISCSIDriver`.
+Deployment target: Kolla-Ansible, OpenStack 2025.1, **Ubuntu Noble 24.04**
+base — verified against Kolla's own `stable/2025.1`
+(`kolla/common/config.py` pins `'ubuntu': {'tag': '24.04'}`, and its support
+matrix lists Ubuntu Noble). Noble ships **python3 3.12**, so that is the
+interpreter the driver actually runs on. Re-check both on a Kolla upgrade;
+an earlier version of this file said Jammy, which put the driver tests on
+3.10 for months (#57). Base class is
+`cinder.volume.drivers.san.san.SanISCSIDriver`.
 
 ## Layout
 
@@ -178,8 +184,9 @@ dev machines differ:
   LD_LIBRARY_PATH="$(nix-build '<nixpkgs>' -A stdenv.cc.cc.lib --no-out-link)/lib" \\
     /tmp/cenv/bin/python -m pytest tests/driver
   ```
-  Cinder 26.3.0 installs cleanly on Python 3.12 this way. `python310` is not in
-  nixpkgs here, so local runs use 3.12 while CI uses the 3.10 deployment target.
+  Cinder 26.3.0 installs cleanly on Python 3.12 this way — which is also the
+  deployment interpreter, so local runs and the driver CI job agree. `python310`
+  is not in nixpkgs; CI keeps a 3.10 leg for the api_client suite as breadth.
 - **Clear `__pycache__` before trusting a test result after a scripted edit.**
   A same-size change written within the same mtime second leaves a stale `.pyc`
   that Python considers valid, so tests run against the *previous* source. This

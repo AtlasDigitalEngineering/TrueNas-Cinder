@@ -11,9 +11,8 @@
       let
         pkgs = import nixpkgs { inherit system; };
 
-        # 3.12, not the 3.10 deployment target: python310 is no longer in
-        # nixpkgs, and Cinder 26.x (OpenStack 2025.1) runs fine on 3.12.
-        # CI still tests 3.10 via setup-python, which is what Kolla ships.
+        # 3.12 is the deployment interpreter: Kolla 2025.1 builds on Ubuntu
+        # Noble 24.04. CI keeps a 3.10 leg for the api_client suite only.
         python = pkgs.python312;
 
         pythonEnv = python.withPackages (ps: with ps; [
