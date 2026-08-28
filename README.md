@@ -45,8 +45,8 @@ startup.
 
 ### Prerequisites
 
-- Python 3.10+ — 3.10 is the deployment target (Kolla 2025.1 / Ubuntu Jammy);
-  CI also runs 3.12
+- Python 3.12 — the deployment target, from Kolla 2025.1's Ubuntu Noble 24.04
+  base. CI also runs the API client suite on 3.10 for breadth
 - TrueNAS Scale (v24.x or later)
 - OpenStack Cinder — provided by the deployment at runtime. Not needed for the
   API client tests; required for the driver tests, which import it
