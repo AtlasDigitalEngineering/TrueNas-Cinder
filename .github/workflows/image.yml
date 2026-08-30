@@ -91,6 +91,48 @@ jobs:
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
             org.opencontainers.image.base.name=${{ env.KOLLA_BASE }}
 
+      # A green publish does not mean a usable image. A package first pushed
+      # with GITHUB_TOKEN is private even when the repository is public, and
+      # nothing above notices: the build succeeds, the release looks right,
+      # and the failure surfaces on the deploy host as an auth error. This
+      # says so here instead.
+      #
+      # Warns rather than fails. The image genuinely was published, and
+      # visibility is a one-time manual step -- GITHUB_TOKEN does not carry
+      # the scope and the REST API does not expose container visibility at
+      # all -- so failing the release would make the first publish of every
+      # new package permanently red.
+      - name: Check the image can be pulled anonymously
+        run: |
+          image='${{ steps.version.outputs.image }}'
+          tag='${{ steps.version.outputs.version }}'
+          repo="${image#*/}"
+          docs='docs/deployment.md, "The first publish creates a private package"'
+
+          token=$(curl -sf \
+            "https://ghcr.io/token?scope=repository:${repo}:pull" \
+            | jq -r '.token // empty') || true
+
+          # One line per annotation: a workflow command stops at the
+          # first newline, so a wrapped message loses everything after it.
+          if [ -z "${token}" ]; then
+            echo "::warning::${image}:${tag} was published but is NOT anonymously pullable - the package is private, so deployments will fail to pull it. Change the package visibility to public, or configure registry credentials on every node. See ${docs}."
+            exit 0
+          fi
+
+          # The Accept header is required: without it the registry answers
+          # 404 for an image that is public and present.
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${token}" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json' \
+            "https://ghcr.io/v2/${repo}/manifests/${tag}")
+
+          if [ "${code}" = "200" ]; then
+            echo "${image}:${tag} is anonymously pullable."
+          else
+            echo "::warning::${image}:${tag} answered HTTP ${code} to an anonymous manifest request, so nodes may not be able to pull it. See ${docs}."
+          fi
+
       - name: Attach the wheel to the release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
