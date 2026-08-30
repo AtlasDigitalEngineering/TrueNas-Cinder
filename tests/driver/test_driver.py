@@ -959,6 +959,322 @@ class TestSnapshotOrigin(DriverTestCase):
         self.assertFalse(driver._is_cinder_snapshot('anything-at-all'))
 
 
+class FakeSnapshot(object):
+    """Minimal stand-in for a Cinder snapshot object."""
+
+    def __init__(self, name='snapshot-1b2c3d4e-5f60-4718-9a2b-3c4d5e6f7a8b',
+                 volume_name=None, size=10):
+        self.name = name
+        self.volume_name = volume_name or FakeVolume().name
+        self.size = size
+
+
+class SnapshotTestCase(DriverTestCase):
+    """A driver with the snapshot paths wired to sensible defaults."""
+
+    def _driver(self, **over):
+        driver = super()._driver(**over)
+        driver.client.snapshot_id.side_effect = (
+            lambda pool, name, snap: f'{pool}/{name}@{snap}')
+        driver.client.get_snapshot.return_value = {
+            'id': 'x', 'properties': {'clones': {'value': ''}},
+        }
+        driver.client.get_zvol.return_value = {
+            'name': 'z', 'type': 'VOLUME',
+            'volsize': {'parsed': 10 * 1024 ** 3},
+        }
+        return driver
+
+    def _id(self, snapshot):
+        return f'{POOL}/{snapshot.volume_name}@{snapshot.name}'
+
+
+class TestCreateSnapshot(SnapshotTestCase):
+    """create_snapshot."""
+
+    def test_snapshots_the_volumes_dataset(self):
+        driver = self._driver()
+        snapshot = FakeSnapshot()
+
+        driver.create_snapshot(snapshot)
+
+        driver.client.create_snapshot.assert_called_once_with(
+            f'{POOL}/{snapshot.volume_name}', snapshot.name)
+
+    def test_a_failure_is_reported_as_a_backend_error(self):
+        driver = self._driver()
+        driver.client.create_snapshot.side_effect = (
+            api_client.TrueNASAPIError('refused'))
+
+        self.assertRaises(exception.VolumeBackendAPIException,
+                          driver.create_snapshot, FakeSnapshot())
+
+
+class TestDeleteSnapshot(SnapshotTestCase):
+    """delete_snapshot, including the case that must not destroy data."""
+
+    def test_deletes_by_name_derived_id(self):
+        driver = self._driver()
+        snapshot = FakeSnapshot()
+
+        driver.delete_snapshot(snapshot)
+
+        driver.client.delete_snapshot.assert_called_once_with(
+            self._id(snapshot))
+
+    def test_never_defers_the_destroy(self):
+        # defer=True tells ZFS to destroy the snapshot when its last clone
+        # is released: success now, data gone later, outside Cinder's view.
+        driver = self._driver()
+
+        driver.delete_snapshot(FakeSnapshot())
+
+        _args, kwargs = driver.client.delete_snapshot.call_args
+        self.assertNotIn('defer', kwargs)
+
+    def test_an_already_deleted_snapshot_counts_as_deleted(self):
+        driver = self._driver()
+        driver.client.delete_snapshot.side_effect = (
+            api_client.TrueNASAPINotFoundError('gone'))
+
+        driver.delete_snapshot(FakeSnapshot())
+
+    def test_a_dependent_clone_is_reported_busy_not_failed(self):
+        # SnapshotIsBusy returns the snapshot to `available`, which is
+        # right: it still exists and is still usable.
+        driver = self._driver()
+        driver.client.delete_snapshot.side_effect = (
+            api_client.TrueNASAPIError('has dependent clones'))
+        driver.client.get_snapshot.return_value = {
+            'properties': {'clones': {'value': f'{POOL}/some-clone'}},
+        }
+
+        self.assertRaises(exception.SnapshotIsBusy,
+                          driver.delete_snapshot, FakeSnapshot())
+
+    def test_the_clone_is_named_in_the_log(self):
+        driver = self._driver()
+        driver.client.delete_snapshot.side_effect = (
+            api_client.TrueNASAPIError('nope'))
+        driver.client.get_snapshot.return_value = {
+            'properties': {'clones': {'value': f'{POOL}/some-clone'}},
+        }
+
+        with self.assertLogs(tnd.__name__, level='ERROR') as logged:
+            self.assertRaises(exception.SnapshotIsBusy,
+                              driver.delete_snapshot, FakeSnapshot())
+
+        self.assertIn('some-clone', '\n'.join(logged.output))
+
+    def test_a_failure_with_no_clones_is_a_backend_error(self):
+        driver = self._driver()
+        driver.client.delete_snapshot.side_effect = (
+            api_client.TrueNASAPIError('disk on fire'))
+
+        self.assertRaises(exception.VolumeBackendAPIException,
+                          driver.delete_snapshot, FakeSnapshot())
+
+    def test_an_unreadable_snapshot_falls_back_to_the_original_error(self):
+        # Asking what depends on it is a courtesy; if that also fails the
+        # original failure is what the operator needs to see.
+        driver = self._driver()
+        driver.client.delete_snapshot.side_effect = (
+            api_client.TrueNASAPIError('original failure'))
+        driver.client.get_snapshot.side_effect = (
+            api_client.TrueNASAPIError('also broken'))
+
+        with self.assertRaises(exception.VolumeBackendAPIException) as caught:
+            driver.delete_snapshot(FakeSnapshot())
+
+        self.assertIn('original failure', str(caught.exception))
+
+
+class TestManageExistingSnapshot(SnapshotTestCase):
+    """Snapshot adoption."""
+
+    def _ref(self, snapshot, source=None):
+        return {'source-name':
+                source or f'{POOL}/{snapshot.volume_name}@old-snap'}
+
+    def test_renames_the_snapshot_to_the_cinder_name(self):
+        driver = self._driver()
+        snapshot = FakeSnapshot()
+
+        driver.manage_existing_snapshot(snapshot, self._ref(snapshot))
+
+        driver.client.rename_snapshot.assert_called_once_with(
+            f'{POOL}/{snapshot.volume_name}@old-snap', snapshot.name)
+
+    def test_adoption_creates_and_deletes_nothing(self):
+        driver = self._driver()
+        snapshot = FakeSnapshot()
+
+        driver.manage_existing_snapshot(snapshot, self._ref(snapshot))
+
+        driver.client.create_snapshot.assert_not_called()
+        driver.client.delete_snapshot.assert_not_called()
+        driver.client.delete_zvol.assert_not_called()
+
+    def test_a_snapshot_of_another_volume_is_refused(self):
+        # The id is derived from snapshot.volume_name, so adopting across
+        # volumes would make a record that resolves to nothing and can
+        # never be deleted through Cinder.
+        driver = self._driver()
+        snapshot = FakeSnapshot()
+
+        with self.assertRaises(
+                exception.ManageExistingInvalidReference) as caught:
+            driver.manage_existing_snapshot(
+                snapshot, self._ref(snapshot, f'{POOL}/other-volume@snap'))
+
+        driver.client.rename_snapshot.assert_not_called()
+        self.assertIn('other-volume', str(caught.exception))
+
+    def test_a_reference_without_an_at_is_refused(self):
+        driver = self._driver()
+        snapshot = FakeSnapshot()
+
+        self.assertRaises(
+            exception.ManageExistingInvalidReference,
+            driver.manage_existing_snapshot, snapshot,
+            self._ref(snapshot, f'{POOL}/{snapshot.volume_name}'))
+
+    def test_a_reference_with_an_empty_snapshot_name_is_refused(self):
+        driver = self._driver()
+        snapshot = FakeSnapshot()
+
+        self.assertRaises(
+            exception.ManageExistingInvalidReference,
+            driver.manage_existing_snapshot, snapshot,
+            self._ref(snapshot, f'{POOL}/{snapshot.volume_name}@'))
+
+    def test_a_missing_source_name_is_refused(self):
+        driver = self._driver()
+
+        self.assertRaises(exception.ManageExistingInvalidReference,
+                          driver.manage_existing_snapshot,
+                          FakeSnapshot(), {})
+
+    def test_a_reference_that_is_not_a_mapping_is_refused(self):
+        driver = self._driver()
+
+        self.assertRaises(exception.ManageExistingInvalidReference,
+                          driver.manage_existing_snapshot,
+                          FakeSnapshot(), 'Dev-Pool/v@s')
+
+    def test_a_snapshot_that_does_not_exist_is_refused(self):
+        driver = self._driver()
+        snapshot = FakeSnapshot()
+        driver.client.get_snapshot.side_effect = (
+            api_client.TrueNASAPINotFoundError('gone'))
+
+        self.assertRaises(exception.ManageExistingInvalidReference,
+                          driver.manage_existing_snapshot,
+                          snapshot, self._ref(snapshot))
+
+    def test_an_unreadable_appliance_is_a_backend_error(self):
+        driver = self._driver()
+        snapshot = FakeSnapshot()
+        driver.client.get_snapshot.side_effect = (
+            api_client.TrueNASAPIError('timeout'))
+
+        self.assertRaises(exception.VolumeBackendAPIException,
+                          driver.manage_existing_snapshot,
+                          snapshot, self._ref(snapshot))
+
+    def test_a_failed_rename_is_a_backend_error(self):
+        driver = self._driver()
+        snapshot = FakeSnapshot()
+        driver.client.rename_snapshot.side_effect = (
+            api_client.TrueNASAPIError('refused'))
+
+        self.assertRaises(exception.VolumeBackendAPIException,
+                          driver.manage_existing_snapshot,
+                          snapshot, self._ref(snapshot))
+
+
+class TestManageExistingSnapshotGetSize(SnapshotTestCase):
+    """Sizing an adopted snapshot."""
+
+    def _ref(self, snapshot):
+        return {'source-name': f'{POOL}/{snapshot.volume_name}@old-snap'}
+
+    def test_reports_the_parent_zvols_size(self):
+        # A ZFS snapshot has no size of its own; Cinder wants the volume's.
+        driver = self._driver()
+        snapshot = FakeSnapshot()
+
+        self.assertEqual(
+            driver.manage_existing_snapshot_get_size(
+                snapshot, self._ref(snapshot)), 10)
+
+    def test_rounds_up(self):
+        driver = self._driver()
+        snapshot = FakeSnapshot()
+        driver.client.get_zvol.return_value = {
+            'name': 'z', 'type': 'VOLUME',
+            'volsize': {'parsed': int(10.5 * 1024 ** 3)},
+        }
+
+        self.assertEqual(
+            driver.manage_existing_snapshot_get_size(
+                snapshot, self._ref(snapshot)), 11)
+
+    def test_it_reads_the_parent_not_the_snapshot(self):
+        driver = self._driver()
+        snapshot = FakeSnapshot()
+
+        driver.manage_existing_snapshot_get_size(snapshot, self._ref(snapshot))
+
+        driver.client.get_zvol.assert_called_once_with(
+            POOL, snapshot.volume_name)
+
+    def test_sizing_does_not_rename_anything(self):
+        driver = self._driver()
+        snapshot = FakeSnapshot()
+
+        driver.manage_existing_snapshot_get_size(snapshot, self._ref(snapshot))
+
+        driver.client.rename_snapshot.assert_not_called()
+
+    def test_a_bad_reference_is_refused_before_sizing(self):
+        driver = self._driver()
+
+        self.assertRaises(exception.ManageExistingInvalidReference,
+                          driver.manage_existing_snapshot_get_size,
+                          FakeSnapshot(), {})
+
+
+class TestUnmanageSnapshot(SnapshotTestCase):
+    """unmanage_snapshot must release and destroy nothing."""
+
+    def test_it_issues_no_delete(self):
+        driver = self._driver()
+
+        driver.unmanage_snapshot(FakeSnapshot())
+
+        driver.client.delete_snapshot.assert_not_called()
+        driver.client.delete_zvol.assert_not_called()
+
+    def test_it_does_not_rename_the_snapshot_back(self):
+        driver = self._driver()
+
+        driver.unmanage_snapshot(FakeSnapshot())
+
+        driver.client.rename_snapshot.assert_not_called()
+
+    def test_the_only_call_it_makes_is_building_the_id_for_the_log(self):
+        # Cinder calls this instead of delete_snapshot, so there is nothing
+        # for it to do on the appliance.
+        driver = self._driver()
+
+        driver.unmanage_snapshot(FakeSnapshot())
+
+        self.assertEqual(
+            [c for c in driver.client.method_calls
+             if not c[0].startswith('snapshot_id')], [])
+
+
 class AdoptionTestCase(ExportTestCase):
     """A driver ready to adopt, with nothing exporting the target zvol."""
 

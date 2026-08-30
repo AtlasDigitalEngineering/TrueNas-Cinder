@@ -249,6 +249,16 @@ It is the only way to tell a zvol that *has* an export from one that is
 Sessions name their target by full IQN rather than by id, so correlating one
 back to a zvol runs target name -> target -> targetextent -> extent -> `disk`.
 
+**A snapshot with a dependent clone cannot be destroyed, and `defer` is not
+the answer.** `DELETE /pool/snapshot/id/<id>` on a snapshot something has
+cloned answers 422 with errno **22** under an `options.defer` key — the
+appliance is telling the caller to pass `defer`, which would schedule the
+destroy for whenever the last clone is released. That reports success now and
+destroys data later, outside Cinder's view, so `delete_snapshot` never defers
+and reports `SnapshotIsBusy` instead. It identifies the case by asking the
+appliance rather than by reading that message: `GET /pool/snapshot/id/<id>`
+returns `properties.clones.value` naming the dependents, verified in #20.
+
 **Never point tests or exploration at the production TrueNAS.** It holds every
 production VM disk as a zvol, and those are the migration's only copy. Use the
 dev appliance and a scratch pool; `tools/verify_endpoints.py` refuses to run
