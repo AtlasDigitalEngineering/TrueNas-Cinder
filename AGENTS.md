@@ -201,9 +201,9 @@ status does **not** belong here — that is what the issue tracker is for. Run
 `gh issue list` for what is open; the milestones `M1 — Minimum viable attach`,
 `M2 — Full lifecycle`, and `M3 — Migration ready` carry the ordering.
 
-**The zvol, auth, error-mapping, iSCSI-pipeline and snapshot paths have been
-verified against real hardware** (TrueNAS-25.10.5, #35, #11, #12 and #42). The
-clone, rollback and promote endpoints (#13, #21) have not.
+**The zvol, auth, error-mapping, iSCSI-pipeline, snapshot and rename paths
+have been verified against real hardware** (TrueNAS-25.10.5, #35, #11, #12,
+#42 and #20). The clone, rollback and promote endpoints (#13, #21) have not.
 Every design-doc guess checked so far has had at least one error in it —
 `/zfs/zvol` was not a real endpoint, `volmode: GEOM` is FreeBSD-only,
 `name__startswith` is not a valid operator, the EULA endpoint returns a bare
@@ -221,6 +221,19 @@ an unrecognised key in a `/pool/dataset` create breaks discrimination of the
 `VOLUME` schema variant, so the 422 blames `type` instead of the real culprit;
 and the JSON `filters=[[...]]` query form returns `200` with an empty list
 rather than an error, so a wrong query reads as "nothing exists".
+
+**Renaming is how adoption works, and both rename endpoints demand `force`.**
+`POST /pool/dataset/rename` and `POST /pool/snapshot/rename` refuse without
+`force: true` even when nothing is using the object, so **the appliance
+performs no safety check on the caller's behalf** — anything calling
+`rename_zvol` must establish for itself that the zvol is not already exported.
+Three further asymmetries between the two, all verified in #20: the dataset
+endpoint wraps its options in `data` and the snapshot endpoint in `options`;
+`new_name` is a full path (`pool/name`, and `dataset@snapshot` for snapshots)
+and the leaf form is rejected; and both answer `200` with a `null` body, so
+success cannot be read off the payload. The rename itself is metadata-only —
+`creation` survives it byte-for-byte — which is what makes adopting a
+multi-terabyte Proxmox zvol free.
 
 **Never point tests or exploration at the production TrueNAS.** It holds every
 production VM disk as a zvol, and those are the migration's only copy. Use the
@@ -269,12 +282,15 @@ is worse than failing. Making retry idempotency-aware is #12's problem.
 **"Object not found" has two forms, and the obvious one is the wrong one.**
 Verified on TrueNAS-25.10.5 (#11):
 
-| Operation                        | Status | Body            |
-| -------------------------------- | ------ | --------------- |
-| `GET /pool/dataset/id/<missing>`  | 404    | `{"message": ""}` |
-| `DELETE /pool/dataset/id/<missing>` | 422  | `errno: 2`      |
-| `PUT /pool/dataset/id/<missing>`  | 422    | `errno: 2`      |
-| `DELETE /iscsi/extent/id/<missing>` | 422  | `errno: 2`      |
+| Operation                        | Status | Body                        |
+| -------------------------------- | ------ | --------------------------- |
+| `GET /pool/dataset/id/<missing>`  | 404    | `{"message": ""}`           |
+| `GET /pool/snapshot/id/<missing>` | 404    | `{"message": ""}`           |
+| `DELETE /pool/dataset/id/<missing>` | 422  | nested, `errno: 2`          |
+| `PUT /pool/dataset/id/<missing>`  | 422    | nested, `errno: 2`          |
+| `DELETE /iscsi/extent/id/<missing>` | 422  | nested, `errno: 2`          |
+| `POST /pool/dataset/rename` (missing) | 422 | **flat**, `errno: 2`      |
+| `POST /pool/snapshot/rename` (missing) | 422 | **flat**, `errno: 14`   |
 
 `DELETE` — the one operation idempotent deletes depend on — is in the 422
 group, so a 404-only mapping compiles, passes review, and never fires where it
@@ -284,6 +300,17 @@ exist.`, and string matching would report that failed create as a successful
 delete. `_is_enoent` requires *every* reported error to be ENOENT, because a
 false "already gone" loses a volume while a false "still there" only fails a
 no-op.
+
+**The 422 body itself has two shapes** (#20). Most endpoints nest errors under
+a varying field key, `{<field>: [{"message": …, "errno": …}]}`; the two rename
+endpoints return a single flat `{"message": …, "errno": …}` instead.
+`_is_enoent` reads the nested lists first and falls back to a top-level
+`errno`, so the nested form still decides when a body somehow carries both.
+
+**Do not assume a missing object is always ENOENT.** A missing *snapshot*
+rename source reports errno **14**, where the equivalent dataset rename
+reports errno **2**. Code that needs "already gone" from the snapshot path has
+to ask `get_snapshot` rather than catch `TrueNASAPINotFoundError`.
 
 **A mistyped endpoint also returns 404**, so a caller swallowing
 `TrueNASAPINotFoundError` for idempotency will read a wrong path as a
