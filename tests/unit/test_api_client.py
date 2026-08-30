@@ -651,6 +651,89 @@ IQN_A = "iqn.2005-03.org.open-iscsi:nova-compute-01"
 IQN_B = "iqn.2005-03.org.open-iscsi:nova-compute-02"
 
 
+class TestCloneAndPromote(TrueNASAPIClientTestCase):
+    """Cloning and promotion (#13), both shaped by live 422s."""
+
+    def test_clone_posts_snapshot_and_destination(self):
+        self._set_response(True)
+
+        self.client.clone_snapshot("tank/volume1@snap-1", "tank", "volume2")
+
+        self.session.request.assert_called_once_with(
+            "POST",
+            f"{BASE_URL}/pool/snapshot/clone",
+            json={"snapshot": "tank/volume1@snap-1",
+                  "dataset_dst": "tank/volume2"},
+            timeout=DEFAULT_TIMEOUT,
+        )
+
+    def test_clone_builds_the_destination_from_pool_and_name(self):
+        # dataset_dst is a full path; the caller passes a name relative to
+        # the pool, as with create_zvol and rename_zvol.
+        self._set_response(True)
+
+        self.client.clone_snapshot("tank/v@s", "tank", "volume2")
+
+        payload = self.session.request.call_args.kwargs["json"]
+        self.assertEqual(payload["dataset_dst"], "tank/volume2")
+
+    def test_clone_omits_dataset_properties_when_none_are_given(self):
+        # An empty mapping is not the same as absent: unrecognised or
+        # empty keys in a /pool/dataset payload have broken schema
+        # discrimination before (#35), so nothing is sent unless asked for.
+        self._set_response(True)
+
+        self.client.clone_snapshot("tank/v@s", "tank", "volume2")
+
+        self.assertNotIn("dataset_properties",
+                         self.session.request.call_args.kwargs["json"])
+
+    def test_clone_passes_dataset_properties_when_given(self):
+        self._set_response(True)
+
+        self.client.clone_snapshot("tank/v@s", "tank", "volume2",
+                                   readonly="OFF")
+
+        payload = self.session.request.call_args.kwargs["json"]
+        self.assertEqual(payload["dataset_properties"], {"readonly": "OFF"})
+
+    def test_clone_of_a_missing_snapshot_raises(self):
+        self._set_error(422, {"message": "snapshot does not exist",
+                              "errno": 2})
+
+        self.assertRaises(TrueNASAPINotFoundError,
+                          self.client.clone_snapshot,
+                          "tank/v@nope", "tank", "volume2")
+
+    def test_promote_sends_no_request_body(self):
+        # An empty JSON object is rejected: the middleware counts it as a
+        # second positional argument alongside the id and answers
+        # "Too many arguments (expected 1, found 2)". Verified in #13.
+        self._set_response(None)
+
+        self.client.promote_clone("tank", "volume2")
+
+        self.assertNotIn("json", self.session.request.call_args.kwargs)
+
+    def test_promote_addresses_the_clone_by_encoded_id(self):
+        self._set_response(None)
+
+        self.client.promote_clone("tank", "nested/volume2")
+
+        method, url = self.session.request.call_args.args
+        self.assertEqual(method, "POST")
+        self.assertEqual(
+            url,
+            f"{BASE_URL}/pool/dataset/id/tank%2Fnested%2Fvolume2/promote",
+        )
+
+    def test_promote_of_a_missing_dataset_maps_to_not_found(self):
+        self._set_error(404, {"message": ""})
+
+        self.assertRaises(TrueNASAPINotFoundError,
+                          self.client.promote_clone, "tank", "gone")
+
+
 class TestZvolRename(TrueNASAPIClientTestCase):
     """Adoption renames, and every detail of them was a live 422 first.
 

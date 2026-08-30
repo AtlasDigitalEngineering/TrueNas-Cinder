@@ -682,6 +682,87 @@ class TrueNASAPIClient:
             },
         )
 
+    def clone_snapshot(
+        self,
+        snapshot_id: str,
+        pool: str,
+        dest_name: str,
+        **properties
+    ) -> None:
+        """
+        Clone a snapshot into a new zvol.
+
+        A ZFS clone is a writable dataset sharing the snapshot's blocks, so
+        it is created instantly and consumes only what it later diverges
+        by. The cost is a permanent dependency: the clone's ``origin``
+        points at the snapshot, and **that snapshot cannot be destroyed
+        while the clone exists**, which also blocks destroying the dataset
+        the snapshot sits on.
+
+        :meth:`promote_clone` moves that dependency rather than removing
+        it. See its docstring before deciding whether to call it -- the
+        choice is not obvious and it is not free.
+
+        Args:
+            snapshot_id: Snapshot to clone from, ``pool/dataset@snapshot``
+            pool: Pool to create the clone in
+            dest_name: Name for the new zvol, relative to the pool
+            **properties: ZFS properties to set on the clone, passed as
+                ``dataset_properties``
+
+        Raises:
+            TrueNASAPIError: If the snapshot does not exist, or the
+                destination name is taken
+        """
+        payload = {
+            "snapshot": snapshot_id,
+            "dataset_dst": f"{pool}/{dest_name}",
+        }
+        if properties:
+            payload["dataset_properties"] = properties
+        self._make_request("POST", "/pool/snapshot/clone", json=payload)
+
+    def promote_clone(self, pool: str, name: str) -> None:
+        """
+        Promote a clone so it no longer depends on its origin snapshot.
+
+        **This reverses the dependency; it does not remove it**, and it
+        moves the snapshot. Verified against TrueNAS-25.10.5 in #13:
+
+        ===================  ======================  ======================
+        ..                   before promote          after promote
+        ===================  ======================  ======================
+        snapshots on source  ``[src@s1]``            ``[]``
+        snapshots on clone   ``[]``                  ``[clone@s1]``
+        ``origin`` of source  --                     ``clone@s1``
+        ``origin`` of clone  ``src@s1``              --
+        ===================  ======================  ======================
+
+        Afterwards the source can be destroyed, which is the reason to do
+        it. But the snapshot now lives on the clone, so anything that
+        resolves that snapshot by its old dataset will no longer find it,
+        and the clone cannot be destroyed while the source survives.
+
+        Callers must therefore know whether a Cinder snapshot record refers
+        to the snapshot being moved. #21 owns that decision.
+
+        Note the request carries **no body at all**. An empty JSON object
+        is rejected -- the middleware counts it as a second positional
+        argument alongside the id: ``Too many arguments (expected 1, found
+        2)``.
+
+        Args:
+            pool: Pool the clone lives in
+            name: Clone's zvol name, relative to the pool
+
+        Raises:
+            TrueNASAPINotFoundError: If no such dataset exists
+            TrueNASAPIError: If the dataset is not a clone, or the promote
+                was refused
+        """
+        dataset_id = self._dataset_id(pool, name)
+        self._make_request("POST", f"/pool/dataset/id/{dataset_id}/promote")
+
     def list_zvols(self, pool: str) -> List[Dict[str, Any]]:
         """
         List every zvol in a pool.

@@ -29,6 +29,7 @@ import json
 import os
 import pathlib
 import sys
+from urllib.parse import quote
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
@@ -49,6 +50,8 @@ VERIFY_IQN = "iqn.2005-03.org.open-iscsi:cinder-verify-probe"
 SNAPSHOT_NAME = "cinder-verify-snap"
 RENAMED = "cinder-verify-renamed"
 RENAMED_SNAPSHOT = "cinder-verify-snap-renamed"
+CLONE_NAME = "cinder-verify-clone"
+CLONE_SNAPSHOT = "cinder-verify-clone-snap"
 
 
 def load_env(path=".env"):
@@ -354,6 +357,110 @@ def verify_rename(client, pool, zvol_name):
                 print(f"  FAIL  {pool}/{RENAMED} was left behind; the "
                       f"cleanup below will not find it")
                 ok = False
+
+    return ok
+
+
+def verify_clone_and_promote(client, pool, zvol_name):
+    """Exercise clone and promote, and pin down what promote does (#13).
+
+    The important assertion is not that promote succeeds but that it
+    **moves the origin snapshot onto the clone and reverses the
+    dependency**. #13 was written believing promote severs the dependency;
+    it does not, and the driver's decision about when to call it in #21
+    rests entirely on that. If a future release changes the behaviour, this
+    fires.
+
+    Also asserts the empty-body form is still rejected. `promote_clone`
+    sends no body because an empty JSON object is counted as a second
+    positional argument; if that ever stops being true, the workaround
+    should be revisited rather than left in place forever.
+
+    Promotes the clone and then promotes it *back*, so the caller's zvol is
+    left owning its own snapshot and the cleanup below still works. Without
+    that the throwaway would end up depending on a clone this function
+    created.
+
+    Args:
+        client: A configured TrueNASAPIClient
+        pool: Pool the zvol lives in
+        zvol_name: Zvol to snapshot and clone
+
+    Returns:
+        True if every probe passed
+    """
+    ok = True
+    dataset = f"{pool}/{zvol_name}"
+    snapshot_id = client.snapshot_id(pool, zvol_name, CLONE_SNAPSHOT)
+    clone_dataset = f"{pool}/{CLONE_NAME}"
+
+    if check("create_snapshot() to clone from",
+             lambda: client.create_snapshot(dataset, CLONE_SNAPSHOT)) is None:
+        return False
+
+    cloned = False
+    try:
+        if check("clone_snapshot()",
+                 lambda: client.clone_snapshot(snapshot_id, pool, CLONE_NAME)
+                 or "cloned") is not None:
+            cloned = True
+
+        origin = check(
+            "the clone's origin is the snapshot",
+            lambda: client.get_zvol(pool, CLONE_NAME)
+            .get("origin", {}).get("rawvalue"))
+        if origin != snapshot_id:
+            print(f"  FAIL  expected origin {snapshot_id!r}, got {origin!r}")
+            ok = False
+
+        ok &= expect_raises(
+            "the origin snapshot cannot be deleted while cloned",
+            TrueNASAPIError,
+            lambda: client.delete_snapshot(snapshot_id),
+        )
+        ok &= expect_raises(
+            "an empty body is still rejected by promote",
+            TrueNASAPIError,
+            lambda: client._make_request(
+                "POST",
+                f"/pool/dataset/id/{quote(clone_dataset, safe='')}/promote",
+                json={}),
+        )
+
+        check("promote_clone()",
+              lambda: client.promote_clone(pool, CLONE_NAME) or "promoted")
+
+        # The point of the whole function.
+        moved = client.snapshot_id(pool, CLONE_NAME, CLONE_SNAPSHOT)
+        on_source = [s["id"] for s in client.get_snapshot_list(dataset)]
+        on_clone = [s["id"] for s in client.get_snapshot_list(clone_dataset)]
+        if snapshot_id in on_source or moved not in on_clone:
+            print(f"  FAIL  promote did not move the snapshot: source has "
+                  f"{on_source}, clone has {on_clone}. #21's decision about "
+                  f"when to promote assumes it moves.")
+            ok = False
+        else:
+            print(f"  ok    promote moved the snapshot onto the clone\n"
+                  f"        -> {moved}")
+
+        back = (client.get_zvol(pool, zvol_name)
+                .get("origin", {}).get("rawvalue"))
+        if back != moved:
+            print(f"  FAIL  expected the source to become a clone of "
+                  f"{moved!r}, but its origin is {back!r}")
+            ok = False
+        else:
+            print("  ok    the dependency reversed: the source is now the "
+                  f"clone\n        -> origin {back}")
+    finally:
+        if cloned:
+            # Promote the original back, or the caller cannot delete it.
+            check("promote_clone() back onto the original",
+                  lambda: client.promote_clone(pool, zvol_name) or "restored")
+            check("delete the clone",
+                  lambda: client.delete_zvol(pool, CLONE_NAME) or "deleted")
+        check("delete the clone-source snapshot",
+              lambda: client.delete_snapshot(snapshot_id) or "deleted")
 
     return ok
 
@@ -794,6 +901,12 @@ def main():
             print("  ->    rename endpoints verified, zvol name restored")
         else:
             print("  ->    RENAME PROBES REPORTED FAILURES (see above)")
+
+        print(f"\nClone and promote probes (#13), on {THROWAWAY}")
+        if verify_clone_and_promote(client, pool, THROWAWAY):
+            print("  ->    clone/promote verified, original restored")
+        else:
+            print("  ->    CLONE/PROMOTE PROBES REPORTED FAILURES (see above)")
 
         print(f"\niSCSI pipeline probes (#12), exporting {THROWAWAY}")
         if verify_iscsi_pipeline(client, pool, THROWAWAY):

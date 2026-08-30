@@ -259,6 +259,28 @@ and reports `SnapshotIsBusy` instead. It identifies the case by asking the
 appliance rather than by reading that message: `GET /pool/snapshot/id/<id>`
 returns `properties.clones.value` naming the dependents, verified in #20.
 
+**Promoting a clone reverses the dependency and moves the snapshot; it does
+not sever anything.** This is the opposite of what #13 was written assuming,
+and it decides how `create_volume_from_snapshot` has to work. Verified in #13:
+
+| | before promote | after promote |
+| --- | --- | --- |
+| snapshots on source | `[src@s1]` | `[]` |
+| snapshots on clone | `[]` | `[clone@s1]` |
+| `origin` of source | — | `clone@s1` |
+| `origin` of clone | `src@s1` | — |
+
+So promoting makes the **source** destroyable, at the cost of making the clone
+undestroyable while the source lives — and the snapshot physically moves to
+another dataset. Anything resolving that snapshot by its old dataset path stops
+finding it, which for this driver means a Cinder snapshot record whose id is
+derived from `snapshot.volume_name`. Somebody always depends on somebody; ZFS
+offers no way out of that short of a full copy.
+
+`POST /pool/dataset/id/<id>/promote` takes **no request body at all**. An empty
+JSON object is counted as a second positional argument and rejected with
+`Too many arguments (expected 1, found 2)`.
+
 **Never point tests or exploration at the production TrueNAS.** It holds every
 production VM disk as a zvol, and those are the migration's only copy. Use the
 dev appliance and a scratch pool; `tools/verify_endpoints.py` refuses to run
