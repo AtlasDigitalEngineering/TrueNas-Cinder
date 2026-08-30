@@ -44,13 +44,63 @@ Nodes need to pull the image from somewhere. Without a registry it has to reach
 each node by hand (`podman save` / `podman load`), which is workable for one
 development host and unworkable for several.
 
-`ghcr.io` is the path of least resistance for a GitHub-hosted project: free for
-public images, authenticated by the workflow's own `GITHUB_TOKEN`, and in the
-same namespace as the repository. `.github/workflows/image.yml` publishes there
-on a tag. Any OCI registry works — change `REGISTRY` in that workflow.
+`ghcr.io` is the path of least resistance for a GitHub-hosted project:
+authenticated by the workflow's own `GITHUB_TOKEN`, in the same namespace as
+the repository, and free for public images. `.github/workflows/image.yml`
+publishes there on a tag. Any OCI registry works — change `REGISTRY` in that
+workflow.
 
 **Never deploy `:latest`.** Tag with the driver version, so a running container
 can be traced back to a release.
+
+### The first publish creates a private package
+
+**Package visibility is separate from repository visibility, and publishing
+does not link them.** A package first pushed with `GITHUB_TOKEN` is private
+even when the repository is public, so the image will be there, the workflow
+will be green, and every node will still fail to pull it with an
+authentication error — at deploy time, after the Kolla configuration is
+already done.
+
+Changing it is a one-time manual step per package. It cannot be automated:
+`GITHUB_TOKEN` does not carry the scope, and container visibility is not
+exposed by the REST API at all.
+
+> Repository → **Packages** → the package → **Package settings** → **Danger
+> Zone** → **Change visibility** → **Public**
+
+Then verify it **without credentials**, because a `docker pull` from a shell
+that is already logged in proves nothing:
+
+```bash
+owner=atlasdigitalengineering
+image=cinder-volume-truenas
+tag=1.0.0
+
+token=$(curl -s "https://ghcr.io/token?scope=repository:${owner}/${image}:pull" \
+        | jq -r .token)
+curl -sI -H "Authorization: Bearer ${token}" \
+     -H "Accept: application/vnd.oci.image.index.v1+json,\
+application/vnd.oci.image.manifest.v1+json,\
+application/vnd.docker.distribution.manifest.list.v2+json,\
+application/vnd.docker.distribution.manifest.v2+json" \
+     "https://ghcr.io/v2/${owner}/${image}/manifests/${tag}" | head -1
+```
+
+**The `Accept` header is not optional.** Without it the registry declines to
+serve the manifest and answers `404` even for an image that is public and
+present — which reads exactly like failure and sends you back to the
+visibility setting you just fixed correctly.
+
+| Response | Meaning |
+|---|---|
+| `HTTP/2 200` | Public and present. Any node can pull it. |
+| `HTTP/2 404` | Public, but no such tag. Check the tag, not the visibility. |
+| `HTTP/2 401` | Still private. The token request fails first, so `${token}` is empty. |
+
+If you would rather keep the package private, this is the point to configure
+registry credentials on every node instead, which Kolla does through
+`docker_registry_username` / `docker_registry_password` in `globals.yml`.
 
 ## 4. Point Kolla at it
 
