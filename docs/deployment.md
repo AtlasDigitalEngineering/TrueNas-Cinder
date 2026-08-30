@@ -59,8 +59,12 @@ In your deployment's `globals.yml`:
 ```yaml
 enable_cinder: "yes"
 enable_cinder_backend_iscsi: "yes"
-cinder_volume_image_full: "ghcr.io/<owner>/cinder-volume-truenas:1.0.0"
+cinder_volume_image_full: "ghcr.io/atlasdigitalengineering/cinder-volume-truenas:1.0.0"
 ```
+
+The path is all-lowercase whatever the owner's login looks like — OCI
+repository names have to be, so the publish workflow lowercases it. Copying the
+mixed-case org name here gets `invalid reference format` from the pull.
 
 Multipath needs `enable_multipathd: "yes"` here, and
 `volume_use_multipath = true` under `[libvirt]` in `nova.conf`, and the compute
