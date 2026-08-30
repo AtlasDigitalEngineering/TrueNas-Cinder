@@ -26,6 +26,24 @@ ever moving.
   [configuration.md](configuration.md); it matters for every disk that was
   provisioned by hand, which is most of them.
 
+### Credentials used below
+
+Several commands here talk to the appliance or to Cinder directly. Set these
+once, and **never paste the values inline** — a literal key on a command line
+lands in your shell history and in the process list, where it outlives the
+migration:
+
+```bash
+read -rs TRUENAS_API_KEY; export TRUENAS_API_KEY   # no echo, no history
+export TOKEN=$(openstack token issue -f value -c id)
+export CINDER_URL=$(openstack catalog show block-storage \
+  -f json | jq -r '.endpoints[] | select(.interface=="public") | .url')
+```
+
+`TOKEN` is a bearer credential: anyone holding it is you, until it expires
+(one hour by default). Re-issue it rather than extending its life, and unset
+it when the migration run is finished.
+
 ## The CLI is `cinder`, not `openstack`
 
 `openstack volume manage` **does not exist**. The OpenStack client has never
