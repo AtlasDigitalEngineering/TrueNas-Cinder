@@ -36,8 +36,39 @@ pip install python-cinderclient
 cinder --version    # 9.9.0 at time of writing
 ```
 
-Everything below uses `cinder`. It authenticates from the same `OS_*`
-environment as `openstack`.
+Everything below uses `cinder`. It reads the same `OS_*` environment as
+`openstack`, with one exception that will stop you at the first command.
+
+### `cinder` cannot use application credentials
+
+```
+ERROR: Error authenticating with application credential:
+       Application credentials cannot request a scope. (HTTP 401)
+```
+
+The `cinder` shell always requests a scoped token, and application credentials
+are already scoped and forbid it. There is no flag that fixes this — supplying
+`OS_PROJECT_ID` makes it worse, not better.
+
+Use username/password authentication for the migration, or drive the API
+directly:
+
+```bash
+curl -s -X POST "$CINDER_URL/os-volume-manage" \
+  -H "X-Auth-Token: $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"volume": {"host": "<host>",
+                  "ref": {"source-name": "<pool>/<zvol>"},
+                  "name": "<name>", "bootable": true,
+                  "volume_type": "truenas-iscsi"}}'
+```
+
+Unmanage is an action on the volume:
+
+```bash
+curl -s -X POST "$CINDER_URL/volumes/<id>/action" \
+  -H "X-Auth-Token: $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"os-unmanage": {}}'
+```
 
 ## Finding candidates
 
@@ -103,6 +134,32 @@ pointing at it are removed, and Cinder builds its own on first attach.
 The refusal names **only** the objects blocking this adoption. If it mentions
 `target 11` and `extent 8`, those are the two to remove; anything else on the
 appliance belongs to something different.
+
+## When an adoption fails
+
+**Cinder tells you almost nothing through the API.** A refused adoption leaves
+a volume in `error`, and that is all you get:
+
+- No user message. `GET /messages` is empty — the manage flow does not create
+  one, so `cinder message-list` will not explain it either.
+- `size` stays `0`. That is **not** diagnostic: the flow writes the size only
+  after `manage_existing` succeeds, so a refusal at any point leaves it at
+  zero. It does not mean sizing failed.
+
+The driver's reason — which names the exact target and extent to remove — only
+reaches `cinder-volume`'s log:
+
+```bash
+# on the controller running cinder-volume
+docker logs cinder_volume 2>&1 | grep -i "invalid backend reference"
+# or, under Kolla:
+grep -i "invalid backend reference" /var/log/kolla/cinder/cinder-volume.log
+```
+
+Delete the errored volume record before retrying. It is safe: the record's
+name never existed on the appliance, and `delete_volume` resolves by name, so
+it finds nothing and treats the delete as complete. The zvol you were trying
+to adopt is untouched.
 
 ## Verifying an adoption
 
