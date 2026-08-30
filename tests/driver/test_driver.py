@@ -21,6 +21,7 @@ from unittest import mock
 
 from cinder import exception
 
+import truenas_cinder_driver
 from truenas_cinder_driver import api_client
 from truenas_cinder_driver import driver as tnd
 
@@ -1013,6 +1014,24 @@ class TestVolumeStats(DriverTestCase):
 
         with self.assertRaises(exception.VolumeBackendAPIException):
             driver._update_volume_stats()
+
+
+class TestDriverVersion(DriverTestCase):
+    """The driver reports the package version to Cinder."""
+
+    def test_version_comes_from_the_package(self):
+        # Reported in get_volume_stats as driver_version, and shown by
+        # `pip show`. Two literals would drift.
+        self.assertEqual(tnd.TrueNASISCSIDriver.VERSION,
+                         truenas_cinder_driver.__version__)
+
+    def test_stats_report_that_version(self):
+        driver = self._driver()
+
+        driver._update_volume_stats()
+
+        self.assertEqual(driver._stats["driver_version"],
+                         truenas_cinder_driver.__version__)
 
 
 if __name__ == '__main__':

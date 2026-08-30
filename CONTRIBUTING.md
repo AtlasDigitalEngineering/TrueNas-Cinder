@@ -31,7 +31,9 @@ By participating in this project, you agree to abide by the code of conduct.
 
 1.  Clone the repository.
 2.  Create a virtual environment.
-3.  Install development dependencies: `pip install -r test-requirements.txt`.
+3.  Install the package and its development dependencies:
+    `pip install -e '.[test]'`, or `pip install -e '.[driver]'` to
+    include Cinder for the driver tests.
 
 ## Code Style
 

@@ -68,10 +68,9 @@ tools/
 docs/PLANNING.md   # why the project exists, its shape, milestone outcomes
 docs/configuration.md  # sample cinder.conf backend section + prerequisites
 flake.nix          # dev shell: python312, uv, gh, LD_LIBRARY_PATH
+pyproject.toml     # packaging + ALL dependencies, via extras
+uv.lock            # pinned resolution of those, for reproducible installs
 tox.ini            # envlist = py312, driver, flake8; also [flake8] config
-requirements.txt   # cinder (platform), requests
-test-requirements.txt  # pytest, pytest-cov, coverage, flake8, tox, requests
-driver-test-requirements.txt  # the above plus Cinder, for tests/driver
 ```
 
 `feature/driver-core` carried an earlier draft of `driver.py`. It was
@@ -116,7 +115,7 @@ is the same guarantee the dependency-free CI job gives, enforced locally.
 **Installed from PyPI into a venv, for `tests/driver` only:**
 
 ```bash
-uv venv && uv pip install -r driver-test-requirements.txt
+uv venv && uv pip install -e '.[driver]'
 .venv/bin/python -m pytest tests/driver
 ```
 
@@ -180,7 +179,7 @@ dev machines differ:
   `libstdc++` on the library path, or `greenlet` fails to import:
   ```bash
   nix-shell -p python312 --run 'python3 -m venv /tmp/cenv'
-  /tmp/cenv/bin/pip install -r driver-test-requirements.txt
+  /tmp/cenv/bin/pip install -e '.[driver]'
   LD_LIBRARY_PATH="$(nix-build '<nixpkgs>' -A stdenv.cc.cc.lib --no-out-link)/lib" \\
     /tmp/cenv/bin/python -m pytest tests/driver
   ```

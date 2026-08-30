@@ -36,10 +36,9 @@
 
             # For tests/driver only. Cinder is not in nixpkgs, and neither
             # are os-brick, oslo-versionedobjects, taskflow, castellan or
-            # cursive, so that suite installs from PyPI into a venv. Making
-            # it reproducible too means packaging Cinder's whole tree, or
-            # adopting uv2nix once #23 adds a pyproject.toml -- the latter
-            # is the better path and belongs to that issue.
+            # cursive, so that suite installs from PyPI into a venv,
+            # pinned by uv.lock. Building it with nix instead means
+            # adopting uv2nix, which the lock now makes possible (#23).
             pkgs.uv
 
             pkgs.gh
@@ -69,7 +68,7 @@
             echo "    python3 tools/verify_endpoints.py [--write]   # dev appliance only"
             echo ""
             echo "  Driver tests need Cinder, which is not in nixpkgs:"
-            echo "    uv venv && uv pip install -r driver-test-requirements.txt"
+            echo "    uv venv && uv pip install -e '.[driver]'"
             echo "    .venv/bin/python -m pytest tests/driver"
             echo "----------------------------------------------------"
           '';
