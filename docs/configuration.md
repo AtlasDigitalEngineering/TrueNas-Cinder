@@ -49,6 +49,12 @@ truenas_pool = tank
 
 # Leave enabled. Fix the appliance certificate rather than turning this off.
 truenas_verify_ssl = true
+
+# Only consulted by `cinder manage`. Off means the driver refuses to adopt a
+# zvol that already has an iSCSI export and tells you what to remove; on means
+# it removes that export itself. Either way it refuses a zvol with a live
+# session. See "Adopting existing zvols" below.
+#truenas_adopt_removes_export = false
 ```
 
 `truenas_api_key` is declared `secret=True`, so oslo_config redacts it from
@@ -65,6 +71,7 @@ that file as you would any other credential store.
 | `truenas_iscsi_portal_id` | integer | discovered | only with several portals |
 | `truenas_iscsi_portal_addresses` | list | portal's own addresses | when the portal binds a wildcard |
 | `truenas_verify_ssl` | boolean | `true` | no |
+| `truenas_adopt_removes_export` | boolean | `false` | no |
 
 ## Let OpenStack own snapshots
 
@@ -87,6 +94,51 @@ its own pool.
 There is no good automatic answer here. Deleting foreign snapshots to complete a
 delete would be the driver destroying data it does not own, which is worse than
 failing.
+
+## Adopting existing zvols
+
+`cinder manage` brings a zvol the driver did not create under Cinder's
+management. The zvol is **renamed**, not copied, so adoption costs the same
+whether the disk is 1 GiB or 10 TiB.
+
+```bash
+openstack volume manage \
+  --name <name> --volume-type truenas-iscsi \
+  <cinder-host>@truenas-iscsi#truenas-iscsi \
+  <pool>/<zvol>
+```
+
+The reference is the zvol's full path in the pool this backend manages, and it
+may be nested — `Dev-Pool/proxmox/vm-100-disk-0` is fine. Adoption moves it to
+the pool root under Cinder's naming convention.
+
+### The export conflict
+
+A hand-provisioned disk usually already has an iSCSI extent and target. **The
+appliance performs no safety check here**: both rename endpoints require
+`force` and refuse without it even when the dataset is idle, so TrueNAS will
+rename whatever it is pointed at, including a zvol an initiator is writing to.
+The driver therefore checks first, and behaves in one of three ways.
+
+| Zvol state | Behaviour |
+|---|---|
+| No export | Adopted. |
+| Export exists, nothing connected | Refused by default, naming the target and extent to delete. With `truenas_adopt_removes_export = true`, the driver deletes them and adopts. |
+| Live iSCSI session | **Always refused**, whatever the option is set to. |
+
+The last row is not configurable on purpose: renaming a zvol out from under a
+connected initiator breaks it mid-write, and no configuration should be able to
+authorise that. Detach the disk first.
+
+Removing an export never touches the zvol or its data — it deletes the iSCSI
+objects that point at it, and Cinder builds its own on the first attach.
+
+### Releasing a volume again
+
+`cinder unmanage` removes Cinder's record and **leaves the zvol in place** with
+its data intact. The zvol keeps the name Cinder gave it, so it can be adopted
+again later with `source-name: <pool>/<volume-name>`. Delete it by hand if you
+do not want it — nothing else will.
 
 ## Volume naming
 

@@ -1308,6 +1308,43 @@ class TestIscsiService(IscsiTestCase):
         self.assertFalse(self.client.reload_iscsi_service())
 
 
+class TestIscsiSessions(IscsiTestCase):
+    """The live-session read the adoption safety gate depends on (#20)."""
+
+    def test_sessions_is_a_post_despite_being_a_read(self):
+        # It takes query filters, so the middleware models it as a call.
+        # A GET is a 405, which would surface as a plain API error and
+        # could be misread as "no sessions" by a careless caller.
+        self._set_response([])
+
+        self.client.get_iscsi_sessions()
+
+        method, url = self.session.request.call_args.args
+        self.assertEqual(method, "POST")
+        self.assertEqual(url, f"{BASE_URL}/iscsi/global/sessions")
+
+    def test_sessions_returns_the_rows(self):
+        self._set_response([{
+            "initiator": "iqn.2016-04.com.open-iscsi:2a16da8389ad",
+            "initiator_addr": "10.20.213.129",
+            "target": "iqn.2005-10.org.freenas.ctl:volume-abc",
+            "target_alias": "volume-abc",
+        }])
+
+        sessions = self.client.get_iscsi_sessions()
+
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sessions[0]["target"],
+                         "iqn.2005-10.org.freenas.ctl:volume-abc")
+
+    def test_no_sessions_is_an_empty_list_not_an_error(self):
+        # The gate reads "empty" as "safe to rename", so an empty result
+        # has to arrive as data rather than as an exception.
+        self._set_response([])
+
+        self.assertEqual(self.client.get_iscsi_sessions(), [])
+
+
 class TestNameLookup(IscsiTestCase):
     """Name-based lookup -- the authoritative teardown path (#16).
 

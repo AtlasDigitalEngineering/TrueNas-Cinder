@@ -1,9 +1,9 @@
 """
 OpenStack Cinder volume driver for TrueNAS Scale over iSCSI.
 
-Configuration, setup validation and capacity reporting. The volume lifecycle
-and the export/connection path are issue #3, inherited as
-``NotImplementedError`` until then.
+Configuration and setup validation, capacity reporting, the volume
+lifecycle, the iSCSI export path, and adoption of zvols the driver did not
+create.
 
 Setup validates the appliance and never changes it: it does not create a
 portal or start the iSCSI service. See AGENTS.md for the reasoning.
@@ -65,6 +65,16 @@ truenas_opts = [
                 default=True,
                 help='Verify the appliance TLS certificate. Leave enabled: '
                      'fix the certificate rather than disabling this.'),
+    cfg.BoolOpt('truenas_adopt_removes_export',
+                default=False,
+                help='Allow manage_existing to delete an iSCSI export that '
+                     'already exists on the zvol being adopted. Off by '
+                     'default, in which case the driver refuses and names '
+                     'the target and extent to remove. Turn it on to '
+                     'migrate hand-provisioned disks without a manual '
+                     'cleanup step per disk. A zvol with a live iSCSI '
+                     'session is refused either way, whatever this is set '
+                     'to.'),
 ]
 
 CONF = cfg.CONF
@@ -75,7 +85,8 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
     """Cinder volume driver for TrueNAS Scale over iSCSI.
 
     Version history:
-        1.0.0 - Configuration, setup validation and capacity reporting.
+        1.0.0 - Setup validation, capacity reporting, volume lifecycle,
+                iSCSI export, and adoption of existing zvols.
     """
 
     # From the package, so `pip show` and get_volume_stats agree.
@@ -825,6 +836,391 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
                     or DEFAULT_SNAPSHOT_NAME_TEMPLATE)
         prefix = template.split('%s')[0]
         return bool(prefix) and snapshot_name.startswith(prefix)
+
+    # ------------------------------------------------------------------
+    # Adoption (#20)
+    #
+    # The migration this driver exists for: every disk already lives on the
+    # appliance as a zvol, and copying an estate of them out and back is
+    # not viable. Adoption renames a zvol into Cinder's naming convention
+    # in place, which ZFS does as a metadata operation -- no data moves,
+    # whatever the disk's size.
+    #
+    # Cinder calls manage_existing_get_size() first and manage_existing()
+    # second, so both validate the reference; the first call's answer is
+    # not carried over.
+    # ------------------------------------------------------------------
+
+    def manage_existing_get_size(self, volume, existing_ref):
+        """Report the size Cinder should record for a zvol being adopted.
+
+        Args:
+            volume: The Cinder volume the zvol will be adopted as
+            existing_ref: ``{'source-name': '<pool>/<zvol>'}``
+
+        Returns:
+            The zvol's size in GiB, rounded up
+
+        Raises:
+            ManageExistingInvalidReference: If the reference is malformed
+                or names nothing adoptable
+            VolumeBackendAPIException: If the appliance could not be read
+        """
+        name = self._parse_existing_ref(existing_ref)
+        return self._zvol_size_gb(self._adoptable_zvol(existing_ref, name))
+
+    def manage_existing(self, volume, existing_ref):
+        """Bring an existing zvol under Cinder management.
+
+        Adopts by rename, the first of the two strategies ``BaseVD``
+        describes. It suits this driver because every other operation
+        already resolves the backend object by name -- ``delete_volume``,
+        ``create_export`` and ``remove_export`` all derive it from
+        ``volume.name`` -- so once the zvol carries that name it is
+        indistinguishable from one the driver created.
+
+        Returns nothing: ``provider_location`` is built by
+        :meth:`create_export` when the volume is first attached, not here.
+
+        Args:
+            volume: The Cinder volume to adopt the zvol as
+            existing_ref: ``{'source-name': '<pool>/<zvol>'}``
+
+        Raises:
+            ManageExistingInvalidReference: If the reference is malformed,
+                names nothing adoptable, or names a zvol that is still
+                exported
+            VolumeBackendAPIException: If the rename failed
+        """
+        pool = self.configuration.truenas_pool
+        name = self._parse_existing_ref(existing_ref)
+        self._adoptable_zvol(existing_ref, name)
+        self._clear_conflicting_export(existing_ref, pool, name)
+
+        try:
+            self.client.rename_zvol(pool, name, volume.name)
+        except api_client.TrueNASAPIError as exc:
+            raise exception.VolumeBackendAPIException(
+                data=_('Could not adopt %(pool)s/%(name)s as volume '
+                       '%(volume)s: %(err)s')
+                % {'pool': pool, 'name': name, 'volume': volume.name,
+                   'err': exc})
+
+        LOG.info('Adopted zvol %(pool)s/%(name)s as volume %(volume)s. '
+                 'The rename moved no data.',
+                 {'pool': pool, 'name': name, 'volume': volume.name})
+
+    def unmanage(self, volume):
+        """Release a volume from Cinder without destroying its zvol.
+
+        **Deliberately makes no API call.** Cinder's delete path invokes
+        ``remove_export()`` and then calls this *instead of*
+        ``delete_volume()`` (``cinder/volume/manager.py``), so the export
+        is already gone by the time this runs and the only thing left to
+        decide is the zvol's fate -- which for an unmanage is to leave it
+        exactly where it is.
+
+        The zvol keeps the Cinder name it was given, so it can be adopted
+        again later with ``source-name: <pool>/<volume.name>``.
+
+        Args:
+            volume: The Cinder volume to stop managing
+        """
+        LOG.info('Stopped managing volume %(volume)s. The zvol '
+                 '%(pool)s/%(volume)s was left in place with its data '
+                 'intact; delete it by hand if it is not wanted.',
+                 {'pool': self.configuration.truenas_pool,
+                  'volume': volume.name})
+
+    def _parse_existing_ref(self, existing_ref):
+        """Validate an adoption reference and return the zvol name.
+
+        Args:
+            existing_ref: The reference Cinder passed through from the API
+
+        Returns:
+            The zvol name relative to the configured pool
+
+        Raises:
+            ManageExistingInvalidReference: With a reason naming what was
+                wrong and what a correct reference looks like
+        """
+        pool = self.configuration.truenas_pool
+        example = _("Expected {'source-name': '%(pool)s/<zvol>'}, for "
+                    "example '%(pool)s/vm-100-disk-0'.") % {'pool': pool}
+
+        if not isinstance(existing_ref, dict):
+            raise exception.ManageExistingInvalidReference(
+                existing_ref=existing_ref,
+                reason=_('The reference is not a mapping. %s') % example)
+
+        source = existing_ref.get('source-name')
+        if not isinstance(source, str) or not source.strip():
+            raise exception.ManageExistingInvalidReference(
+                existing_ref=existing_ref,
+                reason=_("No 'source-name' was given. %s") % example)
+        source = source.strip()
+
+        # Checked before the pool prefix, so naming a snapshot gets the
+        # answer that helps rather than "wrong pool".
+        if '@' in source:
+            raise exception.ManageExistingInvalidReference(
+                existing_ref=existing_ref,
+                reason=_("'%(source)s' names a snapshot. Adopt a snapshot "
+                         "with 'cinder snapshot-manage', not this call.")
+                % {'source': source})
+
+        prefix = '%s/' % pool
+        if not source.startswith(prefix):
+            raise exception.ManageExistingInvalidReference(
+                existing_ref=existing_ref,
+                reason=_("'%(source)s' is not in pool '%(pool)s', which is "
+                         "the only pool this backend manages. %(example)s")
+                % {'source': source, 'pool': pool, 'example': example})
+
+        name = source[len(prefix):]
+        if not name:
+            raise exception.ManageExistingInvalidReference(
+                existing_ref=existing_ref,
+                reason=_("'%(source)s' names the pool itself rather than a "
+                         "zvol in it. %(example)s")
+                % {'source': source, 'example': example})
+        return name
+
+    def _adoptable_zvol(self, existing_ref, name):
+        """Fetch the zvol named by a reference, refusing anything else.
+
+        The type check is not redundant. A ``GET`` on a filesystem dataset
+        answers 200, so a reference naming a filesystem reaches this point
+        looking exactly like a successful lookup.
+
+        Args:
+            existing_ref: The reference, for the exception message
+            name: Zvol name relative to the pool
+
+        Returns:
+            The zvol's metadata
+
+        Raises:
+            ManageExistingInvalidReference: If nothing is there, or what is
+                there is not a zvol
+            VolumeBackendAPIException: If the appliance could not be read
+        """
+        pool = self.configuration.truenas_pool
+        try:
+            zvol = self.client.get_zvol(pool, name)
+        except api_client.TrueNASAPINotFoundError:
+            raise exception.ManageExistingInvalidReference(
+                existing_ref=existing_ref,
+                reason=_("No dataset '%(pool)s/%(name)s' exists on the "
+                         "appliance.") % {'pool': pool, 'name': name})
+        except api_client.TrueNASAPIError as exc:
+            raise exception.VolumeBackendAPIException(
+                data=_('Could not read %(pool)s/%(name)s from the '
+                       'appliance: %(err)s')
+                % {'pool': pool, 'name': name, 'err': exc})
+
+        kind = zvol.get('type')
+        if kind != 'VOLUME':
+            raise exception.ManageExistingInvalidReference(
+                existing_ref=existing_ref,
+                reason=_("'%(pool)s/%(name)s' is a %(kind)s, not a zvol. "
+                         "Only zvols can back a Cinder volume.")
+                % {'pool': pool, 'name': name, 'kind': kind or _('unknown')})
+        return zvol
+
+    def _zvol_size_gb(self, zvol):
+        """Return a zvol's size in GiB, rounded up.
+
+        **Rounded up, never down.** Cinder treats the returned size as the
+        volume's capacity, and reporting less than the zvol actually holds
+        would let it believe data fits where it does not.
+
+        The arithmetic is integer throughout: ``volsize`` is a byte count
+        and float division would start losing precision on a large enough
+        zvol.
+
+        Args:
+            zvol: Zvol metadata from the appliance
+
+        Returns:
+            Size in GiB
+
+        Raises:
+            VolumeBackendAPIException: If the appliance reported no usable
+                volsize
+        """
+        raw = zvol.get('volsize')
+        # volsize arrives as {'parsed': int, 'rawvalue': str, 'value': str,
+        # ...}; `parsed` is already an integer, `rawvalue` the same number
+        # as a string. A bare value is accepted too so the shape is not
+        # load-bearing.
+        if isinstance(raw, dict):
+            raw = raw.get('parsed', raw.get('rawvalue'))
+        try:
+            size_bytes = int(raw)
+        except (TypeError, ValueError):
+            raise exception.VolumeBackendAPIException(
+                data=_('The appliance reported no usable volsize for '
+                       '%(name)s: %(raw)r')
+                % {'name': zvol.get('name'), 'raw': zvol.get('volsize')})
+        if size_bytes <= 0:
+            raise exception.VolumeBackendAPIException(
+                data=_('The appliance reported %(name)s as %(size)s bytes, '
+                       'which cannot be adopted.')
+                % {'name': zvol.get('name'), 'size': size_bytes})
+        return (size_bytes + GIB - 1) // GIB
+
+    def _clear_conflicting_export(self, existing_ref, pool, name):
+        """Ensure nothing is exporting the zvol before it is renamed.
+
+        **This gate exists because the appliance has none.** Both rename
+        endpoints require ``force``, and refuse without it even when the
+        dataset is idle, so TrueNAS performs no safety check on the
+        driver's behalf -- it renames whatever it is pointed at, including
+        a zvol a live initiator is writing to.
+
+        Two cases, deliberately treated differently:
+
+        A **live session** is refused unconditionally. Renaming a zvol out
+        from under a connected initiator breaks it mid-write, and no
+        configuration option should be able to authorise that.
+
+        A **configured but idle export** is refused by default, naming what
+        to remove, and removed automatically when
+        ``truenas_adopt_removes_export`` is set. Hand-provisioned disks
+        carry one of these each, so the option is what makes a bulk
+        migration bearable; the default keeps the driver from destroying
+        iSCSI configuration nobody asked it to touch.
+
+        Args:
+            existing_ref: The reference, for the exception message
+            pool: Pool the zvol lives in
+            name: Zvol name relative to the pool
+
+        Raises:
+            ManageExistingInvalidReference: If the zvol is exported and
+                this call may not clear it
+            VolumeBackendAPIException: If the appliance could not be read,
+                or the export could not be removed
+        """
+        disk = self.client.zvol_disk_path(pool, name)
+        try:
+            extents = [extent for extent in self.client.get_extents()
+                       if extent.get('disk') == disk]
+            if not extents:
+                LOG.debug('No iSCSI extent references %s; safe to adopt.',
+                          disk)
+                return
+            extent_ids = {extent['id'] for extent in extents}
+            links = [link for link in self.client.get_target_extents()
+                     if link.get('extent') in extent_ids]
+            target_ids = {link['target'] for link in links}
+            targets = [target for target in self.client.get_targets()
+                       if target['id'] in target_ids]
+            sessions = self._sessions_for(targets)
+        except api_client.TrueNASAPIError as exc:
+            raise exception.VolumeBackendAPIException(
+                data=_('Could not determine whether %(disk)s is already '
+                       'exported, so it will not be adopted: %(err)s')
+                % {'disk': disk, 'err': exc})
+
+        if sessions:
+            raise exception.ManageExistingInvalidReference(
+                existing_ref=existing_ref,
+                reason=_("'%(pool)s/%(name)s' has %(count)d live iSCSI "
+                         "session(s), from %(initiators)s. Renaming it now "
+                         "would break whatever is using it. Detach it "
+                         "first; this is refused whatever "
+                         "truenas_adopt_removes_export is set to.")
+                % {'pool': pool, 'name': name, 'count': len(sessions),
+                   'initiators': ', '.join(sorted(
+                       {'%s (%s)' % (session.get('initiator'),
+                                     session.get('initiator_addr'))
+                        for session in sessions}))})
+
+        described = ', '.join(
+            ['target %s' % target['id'] for target in targets]
+            + ['extent %s' % extent['id'] for extent in extents])
+
+        if not self.configuration.truenas_adopt_removes_export:
+            raise exception.ManageExistingInvalidReference(
+                existing_ref=existing_ref,
+                reason=_("'%(pool)s/%(name)s' is already exported over "
+                         "iSCSI by %(described)s. Nothing is connected to "
+                         "it, so removing that export is safe and leaves "
+                         "the zvol untouched -- do it on the appliance and "
+                         "retry, or set truenas_adopt_removes_export = "
+                         "true to have the driver do it.")
+                % {'pool': pool, 'name': name, 'described': described})
+
+        self._remove_conflicting_export(disk, targets, extents)
+
+    def _sessions_for(self, targets):
+        """Return the live iSCSI sessions served by any of these targets.
+
+        Sessions name their target by full IQN rather than by id, so the
+        comparison is built from the basename resolved during setup.
+
+        Args:
+            targets: Target rows from the appliance
+
+        Returns:
+            The matching session rows, empty if none
+        """
+        if not targets:
+            return []
+        iqns = {'%s:%s' % (self.iscsi_basename, target['name'])
+                for target in targets}
+        return [session for session in self.client.get_iscsi_sessions()
+                if session.get('target') in iqns]
+
+    def _remove_conflicting_export(self, disk, targets, extents):
+        """Delete an idle export standing in the way of an adoption.
+
+        Targets before extents, matching :meth:`remove_export`: deleting
+        either end cascades the association, and the extent is what pins
+        the zvol.
+
+        Args:
+            disk: Zvol disk path, for logging
+            targets: Target rows to delete
+            extents: Extent rows to delete
+
+        Raises:
+            VolumeBackendAPIException: If anything could not be removed,
+                before the zvol has been renamed
+        """
+        removed = []
+        for what, rows, delete in (
+            ('target', targets, self.client.delete_target),
+            ('extent', extents, self.client.delete_extent),
+        ):
+            for row in rows:
+                try:
+                    delete(row['id'])
+                except api_client.TrueNASAPINotFoundError:
+                    continue
+                except api_client.TrueNASAPIError as exc:
+                    raise exception.VolumeBackendAPIException(
+                        data=_('Could not remove iSCSI %(what)s %(id)s '
+                               'while adopting %(disk)s, so the zvol has '
+                               'not been renamed: %(err)s')
+                        % {'what': what, 'id': row['id'], 'disk': disk,
+                           'err': exc})
+                removed.append('%s %s' % (what, row['id']))
+
+        try:
+            self.client.reload_iscsi_service()
+        except api_client.TrueNASAPIError as exc:
+            LOG.warning('Removed %(removed)s for %(disk)s but could not '
+                        'reload the iSCSI service: %(err)s',
+                        {'removed': ', '.join(removed), 'disk': disk,
+                         'err': exc})
+        LOG.info('Removed %(removed)s that were exporting %(disk)s, as '
+                 'truenas_adopt_removes_export is set. The zvol itself was '
+                 'not touched.',
+                 {'removed': ', '.join(removed), 'disk': disk})
 
     def _update_volume_stats(self):
         """Report real capacity so the scheduler will place volumes here.

@@ -235,6 +235,20 @@ success cannot be read off the payload. The rename itself is metadata-only —
 `creation` survives it byte-for-byte — which is what makes adopting a
 multi-terabyte Proxmox zvol free.
 
+**`GET /pool/dataset/id/<a filesystem>` answers 200.** The endpoint serves
+datasets of every type, so a lookup for something that is supposed to be a zvol
+succeeds against a filesystem and returns `type: FILESYSTEM`. Anything that
+resolves a caller-supplied dataset name has to check `type` explicitly —
+`manage_existing` does, because a reference naming a filesystem would otherwise
+reach the rename looking like a validated zvol.
+
+**`POST /iscsi/global/sessions` is a read.** It lists live iSCSI sessions and
+takes query filters, so the middleware models it as a call; a `GET` is a 405.
+It is the only way to tell a zvol that *has* an export from one that is
+*being served*, which is the distinction the adoption safety gate turns on.
+Sessions name their target by full IQN rather than by id, so correlating one
+back to a zvol runs target name -> target -> targetextent -> extent -> `disk`.
+
 **Never point tests or exploration at the production TrueNAS.** It holds every
 production VM disk as a zvol, and those are the migration's only copy. Use the
 dev appliance and a scratch pool; `tools/verify_endpoints.py` refuses to run
