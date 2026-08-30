@@ -29,7 +29,10 @@ jobs:
     name: Build and publish
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      # write, not read: the final step uploads the wheel as a release asset
+      # via GITHUB_TOKEN, which needs contents:write. With read it 403s -- and
+      # only ever on a real tag, since this workflow does not run otherwise.
+      contents: write
       packages: write
 
     steps:
