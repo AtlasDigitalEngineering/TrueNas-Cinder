@@ -1315,6 +1315,116 @@ class TestNameLookup(IscsiTestCase):
             self.assertEqual(self.session.request.call_args.args[0], "GET")
 
 
+class TestTargetExtentLookup(IscsiTestCase):
+    """Finding the association between a specific target and extent."""
+
+    def test_filters_on_both_ids(self):
+        self._set_response([{"id": 25, "target": 9, "extent": 8}])
+
+        found = self.client.get_target_extent(9, 8)
+
+        self.session.request.assert_called_once_with(
+            "GET", f"{BASE_URL}/iscsi/targetextent",
+            params={"target": 9, "extent": 8},
+            timeout=DEFAULT_TIMEOUT,
+        )
+        self.assertEqual(found["id"], 25)
+
+    def test_returns_none_when_unlinked(self):
+        self._set_response([])
+
+        self.assertIsNone(self.client.get_target_extent(9, 8))
+
+    def test_refuses_multiple_matches(self):
+        # More than one means the filter was ignored and the whole
+        # collection came back -- same reasoning as _get_one_by_name.
+        self._set_response([{"id": 25}, {"id": 26}])
+
+        with self.assertRaises(TrueNASAPIError) as caught:
+            self.client.get_target_extent(9, 8)
+
+        self.assertIn("ignored", str(caught.exception))
+
+    def test_is_a_read(self):
+        self._set_response([])
+
+        self.client.get_target_extent(9, 8)
+
+        self.assertEqual(self.session.request.call_args.args[0], "GET")
+
+
+class TestTargetGroups(IscsiTestCase):
+    """The groups payload, shared by create and update."""
+
+    def test_single_portal_becomes_one_group(self):
+        self.assertEqual(
+            self.client.target_groups(4, 1),
+            [{"portal": 1, "initiator": 4, "authmethod": "NONE"}],
+        )
+
+    def test_several_portals_keep_their_order(self):
+        self.assertEqual(
+            [g["portal"] for g in self.client.target_groups(4, [2, 1])],
+            [2, 1],
+        )
+
+    def test_every_group_shares_the_initiator_and_uses_no_chap(self):
+        for group in self.client.target_groups(4, [1, 2, 3]):
+            self.assertEqual(group["initiator"], 4)
+            self.assertEqual(group["authmethod"], "NONE")
+
+    def test_create_target_uses_the_same_builder(self):
+        # If these drift, a target updated later gets a different shape
+        # than the one it was created with.
+        self._set_response({"id": 3})
+
+        self.client.create_target(VOLUME, 4, [1, 2])
+
+        self.assertEqual(self._payload()["groups"],
+                         self.client.target_groups(4, [1, 2]))
+
+
+class TestUpdateTargetGroups(IscsiTestCase):
+    """Repointing an adopted target at the attaching host (#62)."""
+
+    def test_puts_only_the_groups(self):
+        self._set_response({"id": 9})
+
+        self.client.update_target_groups(9, 4, 1)
+
+        self.session.request.assert_called_once_with(
+            "PUT", f"{BASE_URL}/iscsi/target/id/9",
+            json={"groups": [{"portal": 1, "initiator": 4,
+                              "authmethod": "NONE"}]},
+            timeout=DEFAULT_TIMEOUT,
+        )
+
+    def test_accepts_several_portals(self):
+        self._set_response({"id": 9})
+
+        self.client.update_target_groups(9, 4, [1, 2])
+
+        self.assertEqual(
+            [g["portal"] for g in self._payload()["groups"]], [1, 2])
+
+    def test_does_not_send_the_name(self):
+        # A PUT carrying `name` would rename the target.
+        self._set_response({"id": 9})
+
+        self.client.update_target_groups(9, 4, 1)
+
+        self.assertNotIn("name", self._payload())
+
+    def test_missing_target_surfaces_as_not_found(self):
+        self._set_error(422, {
+            "null": [{"message": "iSCSITarget 9 does not exist",
+                      "errno": 2}]
+        })
+
+        with self.assertRaises(TrueNASAPINotFoundError):
+            self.client.update_target_groups(9, 4, 1)
+
+
 SNAP = "snapshot-7f2c1b9e-3a44-4d61-8e05-9b7c2f0a1d38"
 DATASET = f"Dev-Pool/{VOLUME}"
 SNAPSHOT_ID = f"{DATASET}@{SNAP}"
