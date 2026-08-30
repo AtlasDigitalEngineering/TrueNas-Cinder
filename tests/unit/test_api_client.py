@@ -651,6 +651,98 @@ IQN_A = "iqn.2005-03.org.open-iscsi:nova-compute-01"
 IQN_B = "iqn.2005-03.org.open-iscsi:nova-compute-02"
 
 
+class TestZvolRename(TrueNASAPIClientTestCase):
+    """Adoption renames, and every detail of them was a live 422 first.
+
+    See #20: the appliance rejected the leaf form, rejected the unforced
+    form, and reports a missing source and an occupied destination with
+    different errnos. Each test below corresponds to one of those refusals.
+    """
+
+    def test_rename_zvol_sends_a_full_destination_path(self):
+        # The leaf form fails with "cannot create 'volume-x': missing
+        # dataset name". The pool has to be on the front of new_name.
+        self._set_response(None)
+
+        self.client.rename_zvol("tank", "vm-100-disk-0", "volume-abc")
+
+        payload = self.session.request.call_args.kwargs["json"]
+        self.assertEqual(payload["data"]["new_name"], "tank/volume-abc")
+
+    def test_rename_zvol_addresses_the_source_by_full_path(self):
+        self._set_response(None)
+
+        self.client.rename_zvol("tank", "vm-100-disk-0", "volume-abc")
+
+        payload = self.session.request.call_args.kwargs["json"]
+        self.assertEqual(payload["id"], "tank/vm-100-disk-0")
+
+    def test_rename_zvol_forces(self):
+        # Not a preference. The appliance refuses the rename outright
+        # without it, so there is no unforced mode to fall back to -- and
+        # that is exactly why the driver has to check the zvol is unused
+        # before it calls this.
+        self._set_response(None)
+
+        self.client.rename_zvol("tank", "old", "new")
+
+        payload = self.session.request.call_args.kwargs["json"]
+        self.assertTrue(payload["data"]["force"])
+
+    def test_rename_zvol_wraps_options_in_data_not_options(self):
+        # /pool/dataset/rename takes `data`; /pool/snapshot/rename takes
+        # `options`. Same operation, different key.
+        self._set_response(None)
+
+        self.client.rename_zvol("tank", "old", "new")
+
+        payload = self.session.request.call_args.kwargs["json"]
+        self.assertIn("data", payload)
+        self.assertNotIn("options", payload)
+
+    def test_rename_zvol_posts_to_the_rename_endpoint(self):
+        self._set_response(None)
+
+        self.client.rename_zvol("tank", "old", "new")
+
+        method, url = self.session.request.call_args.args
+        self.assertEqual(method, "POST")
+        self.assertEqual(url, f"{BASE_URL}/pool/dataset/rename")
+
+    def test_rename_zvol_keeps_a_nested_source_name_intact(self):
+        # Proxmox nests its zvols. Adoption moves them to the pool root,
+        # which is one rename, not a walk down the tree.
+        self._set_response(None)
+
+        self.client.rename_zvol(
+            "tank", "proxmox/vm-100-disk-0", "volume-abc")
+
+        payload = self.session.request.call_args.kwargs["json"]
+        self.assertEqual(payload["id"], "tank/proxmox/vm-100-disk-0")
+        self.assertEqual(payload["data"]["new_name"], "tank/volume-abc")
+
+    def test_rename_zvol_missing_source_maps_to_not_found(self):
+        # 422 + errno 2, the ENOENT shape.
+        self._set_error(422, {"message": "Dataset 'tank/nope' not found",
+                              "errno": 2})
+
+        with self.assertRaises(TrueNASAPINotFoundError):
+            self.client.rename_zvol("tank", "nope", "volume-abc")
+
+    def test_rename_zvol_occupied_destination_is_not_not_found(self):
+        # errno 14, not 2. Treating this as "already gone" would let an
+        # adoption silently target a name another volume owns.
+        self._set_error(422, {
+            "message": ("Failed to rename dataset: cannot rename "
+                        "'tank/old': dataset already exists"),
+            "errno": 14})
+
+        with self.assertRaises(TrueNASAPIError) as caught:
+            self.client.rename_zvol("tank", "old", "volume-abc")
+
+        self.assertNotIsInstance(caught.exception, TrueNASAPINotFoundError)
+
+
 class IscsiTestCase(TrueNASAPIClientTestCase):
     """Adds a helper for probes that make more than one request."""
 
@@ -1586,6 +1678,91 @@ BAD_POOL_BODY = {
 }
 
 
+class TestSnapshotAdoption(IscsiTestCase):
+    """get_snapshot and rename_snapshot -- the snapshot half of #20."""
+
+    def test_get_snapshot_encodes_the_id(self):
+        self._set_response({"id": "tank/volume1@snap-1"})
+
+        self.client.get_snapshot("tank/volume1@snap-1")
+
+        _, url = self.session.request.call_args.args
+        self.assertEqual(
+            url,
+            f"{BASE_URL}/pool/snapshot/id/tank%2Fvolume1%40snap-1",
+        )
+
+    def test_get_snapshot_missing_maps_to_not_found(self):
+        # A missing snapshot GET is a plain 404, unlike the missing-delete
+        # case which is 422/errno 2.
+        self._set_error(404, {"message": ""})
+
+        with self.assertRaises(TrueNASAPINotFoundError):
+            self.client.get_snapshot("tank/volume1@nope")
+
+    def test_rename_snapshot_composes_the_full_zfs_form(self):
+        # A bare snapshot name is rejected: "Please provide a valid
+        # snapshot name according to ZFS standards i.e <dataset>@<snapshot>"
+        self._set_response(None)
+
+        self.client.rename_snapshot("tank/volume1@old", "snapshot-abc")
+
+        payload = self.session.request.call_args.kwargs["json"]
+        self.assertEqual(payload["options"]["new_name"],
+                         "tank/volume1@snapshot-abc")
+
+    def test_rename_snapshot_keeps_the_snapshot_on_its_own_dataset(self):
+        # The destination dataset is taken from the source id rather than
+        # from the caller, because ZFS cannot move a snapshot between
+        # datasets and any other value would be wrong.
+        self._set_response(None)
+
+        self.client.rename_snapshot("tank/proxmox/vm-1@old", "new")
+
+        payload = self.session.request.call_args.kwargs["json"]
+        self.assertEqual(payload["options"]["new_name"],
+                         "tank/proxmox/vm-1@new")
+
+    def test_rename_snapshot_wraps_options_not_data(self):
+        self._set_response(None)
+
+        self.client.rename_snapshot("tank/volume1@old", "new")
+
+        payload = self.session.request.call_args.kwargs["json"]
+        self.assertIn("options", payload)
+        self.assertNotIn("data", payload)
+
+    def test_rename_snapshot_forces(self):
+        self._set_response(None)
+
+        self.client.rename_snapshot("tank/volume1@old", "new")
+
+        payload = self.session.request.call_args.kwargs["json"]
+        self.assertTrue(payload["options"]["force"])
+
+    def test_rename_snapshot_rejects_an_id_without_a_snapshot(self):
+        # Composing from a dataset path would build "tank@new", renaming
+        # something the caller never named. Refuse before the request.
+        with self.assertRaises(TrueNASAPIError):
+            self.client.rename_snapshot("tank/volume1", "new")
+
+        self.session.request.assert_not_called()
+
+    def test_rename_snapshot_missing_source_is_not_not_found(self):
+        # errno 14 here, where the dataset rename reports errno 2 for the
+        # same condition. Callers needing "already gone" must ask
+        # get_snapshot instead of catching NotFound.
+        self._set_error(422, {
+            "message": ("Failed to rename snapshot: Snapshot "
+                        "tank/volume1@nope not found"),
+            "errno": 14})
+
+        with self.assertRaises(TrueNASAPIError) as caught:
+            self.client.rename_snapshot("tank/volume1@nope", "new")
+
+        self.assertNotIsInstance(caught.exception, TrueNASAPINotFoundError)
+
+
 class TestErrorPropagation(TrueNASAPIClientTestCase):
     """HTTP failures must reach the caller as typed exceptions."""
 
@@ -1684,6 +1861,56 @@ class TestNotFoundMapping(TrueNASAPIClientTestCase):
 
         with self.assertRaises(TrueNASAPINotFoundError):
             self.client.resize_zvol("tank", "gone", new_size_gb=2)
+
+    def test_flat_422_enoent_maps_to_not_found(self):
+        # The rename endpoints report a single flat error rather than the
+        # per-field lists every other endpoint uses. Verified in #20:
+        #   {"message": "Dataset 'tank/nope' not found", "errno": 2}
+        # Before _is_enoent understood this shape it scanned for lists,
+        # found none, and let a missing source raise a plain error.
+        self._set_error(422, body={
+            "message": "Dataset 'tank/nope' not found", "errno": 2})
+
+        with self.assertRaises(TrueNASAPINotFoundError):
+            self.client.rename_zvol("tank", "nope", "volume-abc")
+
+    def test_flat_422_non_enoent_is_not_not_found(self):
+        # errno 14 is how a snapshot rename reports a missing source, and
+        # how a dataset rename reports an occupied destination. Neither is
+        # "already gone".
+        self._set_error(422, body={
+            "message": "cannot rename 'tank/old': dataset already exists",
+            "errno": 14})
+
+        with self.assertRaises(TrueNASAPIError) as ctx:
+            self.client.rename_zvol("tank", "old", "volume-abc")
+
+        self.assertNotIsInstance(ctx.exception, TrueNASAPINotFoundError)
+
+    def test_flat_422_with_a_non_integer_errno_is_not_not_found(self):
+        # The flat branch tests membership rather than the value's type, so
+        # this is the case that proves a junk errno still fails closed.
+        self._set_error(422, body={"message": "gone", "errno": "2"})
+
+        with self.assertRaises(TrueNASAPIError) as ctx:
+            self.client.rename_zvol("tank", "v", "volume-abc")
+
+        self.assertNotIsInstance(ctx.exception, TrueNASAPINotFoundError)
+
+    def test_nested_shape_wins_when_a_body_carries_both(self):
+        # A body with per-field lists is read from the lists; the flat
+        # branch is a fallback, not an override. Here the nested error is a
+        # validation failure, so the ENOENT-looking top-level errno must
+        # not rescue it.
+        self._set_error(422, body={
+            "message": "outer", "errno": 2,
+            "id": [{"message": "invalid", "errno": 22}],
+        })
+
+        with self.assertRaises(TrueNASAPIError) as ctx:
+            self.client.rename_zvol("tank", "v", "volume-abc")
+
+        self.assertNotIsInstance(ctx.exception, TrueNASAPINotFoundError)
 
     def test_422_validation_error_is_not_not_found(self):
         # The regression this guards: the message says "does not exist" but

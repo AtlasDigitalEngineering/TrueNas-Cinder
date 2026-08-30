@@ -59,12 +59,23 @@ RETRY_STATUS_CODES = frozenset({429, 503})
 # DELETE -- the one operation idempotent deletes actually depend on -- is in
 # the second group, so a 404-only mapping would never fire where it matters.
 #
-# The 422 body is {<field>: [{"message": str, "errno": int}, ...], ...} where
-# the field key varies ("null", "id", "pool_dataset_create.name"), so the
-# whole body is scanned. `errno`, not the message text, is the discriminator:
-# creating into a nonexistent pool returns errno 22 with the message "zpool
-# (X) does not exist.", which string matching would misread as "already
-# deleted" and report a failed create as a successful delete.
+# The 422 body comes in two shapes, and both have to be understood:
+#
+#   nested  {<field>: [{"message": str, "errno": int}, ...], ...}
+#   flat    {"message": str, "errno": int}
+#
+# Everything above uses the nested form, where the field key varies ("null",
+# "id", "pool_dataset_create.name"), so the whole body is scanned. The
+# /pool/dataset/rename and /pool/snapshot/rename endpoints added in #20 use
+# the flat form instead; before it was handled, a rename of a missing source
+# raised a plain TrueNASAPIError and the ENOENT mapping never fired.
+#
+# `errno`, not the message text, is the discriminator: creating into a
+# nonexistent pool returns errno 22 with the message "zpool (X) does not
+# exist.", which string matching would misread as "already deleted" and
+# report a failed create as a successful delete. Note that a missing
+# *snapshot* rename source reports errno 14, not 2, so it is deliberately
+# not an ENOENT -- see rename_snapshot.
 ENOENT = 2
 
 
@@ -254,6 +265,10 @@ class TrueNASAPIClient:
         only fails a delete that would have been a no-op. Never raises --
         see :meth:`_response_detail`.
 
+        Handles both body shapes described above. The flat form carries a
+        single error, so "every reported error" and "the reported error"
+        coincide there.
+
         Args:
             response: The 422 response to inspect
 
@@ -271,6 +286,11 @@ class TrueNASAPIClient:
             for errors in body.values() if isinstance(errors, list)
             for entry in errors if isinstance(entry, dict)
         ]
+        # Membership, not an isinstance check: a non-integer errno simply
+        # fails the ENOENT comparison below, so narrowing the type here
+        # would only add a branch that can never change the outcome.
+        if not errnos and "errno" in body:
+            errnos = [body["errno"]]
         return bool(errnos) and all(errno == ENOENT for errno in errnos)
 
     def _retry_delay(self, response: Any, attempt: int) -> float:
@@ -609,6 +629,57 @@ class TrueNASAPIClient:
             "PUT",
             f"/pool/dataset/id/{dataset_id}",
             json={"volsize": new_size_gb * GIB},
+        )
+
+    def rename_zvol(
+        self,
+        pool: str,
+        name: str,
+        new_name: str
+    ) -> None:
+        """
+        Rename a zvol within its pool.
+
+        A ZFS rename is metadata-only: no data moves and the dataset keeps
+        its identity, verified in #20 by `creation` surviving the rename
+        byte-for-byte while the source id disappeared. That is what makes
+        adopting a Proxmox-created zvol free rather than a full copy.
+
+        Two traps, both confirmed against TrueNAS-25.10.5:
+
+        `new_name` is a **full dataset path**, not a leaf. The leaf form is
+        rejected with "cannot create 'volume-x': missing dataset name".
+        This method takes the name relative to the pool, matching
+        :meth:`create_zvol`, and builds the path itself.
+
+        `force` is **mandatory** -- the appliance refuses without it even
+        when nothing is using the dataset. It therefore performs no safety
+        check on the caller's behalf, and the caller must establish that
+        the zvol is not already exported before calling this.
+
+        Args:
+            pool: Pool the zvol lives in
+            name: Current zvol name relative to the pool; may contain '/'
+            new_name: New zvol name relative to the pool
+
+        Raises:
+            TrueNASAPINotFoundError: If the source zvol does not exist;
+                the appliance reports this as 422 with errno 2
+            TrueNASAPIError: If the rename was refused for any other
+                reason. A destination that already exists is errno 14, not
+                errno 2, so it stays a plain error rather than being
+                mistaken for a missing source.
+        """
+        self._make_request(
+            "POST",
+            "/pool/dataset/rename",
+            json={
+                "id": f"{pool}/{name}",
+                "data": {
+                    "new_name": f"{pool}/{new_name}",
+                    "force": True,
+                },
+            },
         )
 
     def list_zvols(self, pool: str) -> List[Dict[str, Any]]:
@@ -1379,6 +1450,29 @@ class TrueNASAPIClient:
             "GET", "/pool/snapshot", params={"dataset": dataset},
         )
 
+    def get_snapshot(self, id: str) -> Dict[str, Any]:
+        """
+        Get a single snapshot by id.
+
+        Unlike a missing dataset delete, a missing snapshot **GET** answers
+        404 rather than 422/errno 2, so it maps to
+        :class:`TrueNASAPINotFoundError` through the status branch.
+
+        Args:
+            id: Full snapshot id, ``pool/dataset@snapshot``
+
+        Returns:
+            Snapshot metadata carrying ``id``, ``name``, ``dataset``,
+            ``snapshot_name``, ``pool``, ``createtxg``, ``type`` and
+            ``properties``
+
+        Raises:
+            TrueNASAPINotFoundError: If no such snapshot exists
+        """
+        return self._make_request(
+            "GET", f"/pool/snapshot/id/{self._snapshot_path(id)}",
+        )
+
     def create_snapshot(
         self,
         dataset: str,
@@ -1408,6 +1502,52 @@ class TrueNASAPIClient:
             **kwargs
         }
         return self._make_request("POST", "/pool/snapshot", json=payload)
+
+    def rename_snapshot(self, id: str, new_name: str) -> None:
+        """
+        Rename a snapshot, keeping it on the same dataset.
+
+        The appliance wants the new name in full ``<dataset>@<snapshot>``
+        form and rejects a bare snapshot name outright. Since ZFS cannot
+        move a snapshot between datasets anyway, this method takes the
+        snapshot name alone and composes the full form from the source
+        id -- the only correct dataset is the one it already sits on.
+
+        Note the asymmetry with :meth:`rename_zvol`, which is easy to trip
+        over: the wrapper key here is ``options``, not ``data``, and a
+        missing source is reported as errno **14**, not errno 2, so it
+        surfaces as a plain :class:`TrueNASAPIError` rather than
+        :class:`TrueNASAPINotFoundError`. Callers that need to distinguish
+        "already gone" must check with :meth:`get_snapshot` first.
+
+        ``force`` is mandatory here for the same reason as
+        :meth:`rename_zvol`.
+
+        Args:
+            id: Full snapshot id to rename, ``pool/dataset@snapshot``
+            new_name: New snapshot name, without the ``@``
+
+        Raises:
+            TrueNASAPIError: If ``id`` is not a snapshot id, or the
+                appliance refused the rename
+        """
+        dataset, sep, _ = id.rpartition("@")
+        if not sep:
+            raise TrueNASAPIError(
+                f"Not a snapshot id: {id!r}. Expected "
+                f"'pool/dataset@snapshot'.",
+                method="POST", endpoint="/pool/snapshot/rename")
+        self._make_request(
+            "POST",
+            "/pool/snapshot/rename",
+            json={
+                "id": id,
+                "options": {
+                    "new_name": f"{dataset}@{new_name}",
+                    "force": True,
+                },
+            },
+        )
 
     def delete_snapshot(self, id: str, defer: bool = False) -> None:
         """

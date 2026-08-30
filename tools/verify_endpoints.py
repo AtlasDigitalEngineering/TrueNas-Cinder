@@ -47,6 +47,8 @@ TARGET_NAME = "cinder-verify-target"
 EXTENT_NAME = "cinder-verify-extent"
 VERIFY_IQN = "iqn.2005-03.org.open-iscsi:cinder-verify-probe"
 SNAPSHOT_NAME = "cinder-verify-snap"
+RENAMED = "cinder-verify-renamed"
+RENAMED_SNAPSHOT = "cinder-verify-snap-renamed"
 
 
 def load_env(path=".env"):
@@ -239,6 +241,119 @@ def verify_snapshots(client, pool, zvol_name):
             ok = False
         else:
             print("  ok    snapshot is gone")
+
+    return ok
+
+
+def verify_rename(client, pool, zvol_name):
+    """Exercise the rename endpoints that volume adoption depends on (#20).
+
+    ``manage_existing`` adopts a Proxmox-created zvol by renaming it into
+    Cinder's naming convention, so every claim this makes about rename is
+    load-bearing for the migration.
+
+    Three of these probes assert that a *wrong* form is still wrong rather
+    than merely unused: the leaf destination, and the unforced rename for
+    both endpoints. The unforced case is the one that matters most. If a
+    future release starts accepting it, `rename_zvol` is silently passing
+    ``force: true`` where it no longer has to, and the safety check the
+    driver performs on the appliance's behalf could be handed back.
+
+    Renames the zvol away and back, so the caller's cleanup still finds it
+    under its original name even when a probe fails.
+
+    Args:
+        client: A configured TrueNASAPIClient
+        pool: Pool the zvol lives in
+        zvol_name: Zvol to rename
+
+    Returns:
+        True if every probe passed
+    """
+    ok = True
+
+    before = check("get_zvol() before the rename",
+                   lambda: client.get_zvol(pool, zvol_name).get("creation"))
+
+    ok &= expect_raises(
+        "a leaf destination is still rejected",
+        TrueNASAPIError,
+        lambda: client._make_request(
+            "POST", "/pool/dataset/rename",
+            json={"id": f"{pool}/{zvol_name}",
+                  "data": {"new_name": RENAMED, "force": True}}),
+    )
+    ok &= expect_raises(
+        "an unforced dataset rename is still rejected",
+        TrueNASAPIError,
+        lambda: client._make_request(
+            "POST", "/pool/dataset/rename",
+            json={"id": f"{pool}/{zvol_name}",
+                  "data": {"new_name": f"{pool}/{RENAMED}"}}),
+    )
+
+    renamed = False
+    try:
+        if check("rename_zvol()",
+                 lambda: client.rename_zvol(pool, zvol_name, RENAMED)
+                 or "renamed") is not None:
+            renamed = True
+
+        after = check("get_zvol() at the new name",
+                      lambda: client.get_zvol(pool, RENAMED).get("creation"))
+        if before is not None and after is not None:
+            if before == after:
+                print(f"  ok    rename preserved dataset identity\n"
+                      f"        -> creation {before} on both sides")
+            else:
+                print(f"  FAIL  creation changed across the rename: "
+                      f"{before} -> {after}. That is a copy, not a rename.")
+                ok = False
+
+        ok &= expect_raises(
+            "the old name is gone after the rename",
+            TrueNASAPINotFoundError,
+            lambda: client.get_zvol(pool, zvol_name),
+        )
+        ok &= expect_raises(
+            "renaming a source that does not exist maps to NotFound",
+            TrueNASAPINotFoundError,
+            lambda: client.rename_zvol(pool, "cinder-verify-absent", RENAMED),
+        )
+
+        # Snapshot rename, on the zvol under its temporary name.
+        snapshot_id = client.snapshot_id(pool, RENAMED, SNAPSHOT_NAME)
+        if check("create_snapshot() for the rename probe",
+                 lambda: client.create_snapshot(
+                     f"{pool}/{RENAMED}", SNAPSHOT_NAME)) is not None:
+            ok &= expect_raises(
+                "an unforced snapshot rename is still rejected",
+                TrueNASAPIError,
+                lambda: client._make_request(
+                    "POST", "/pool/snapshot/rename",
+                    json={"id": snapshot_id,
+                          "options": {"new_name": f"{pool}/{RENAMED}@x"}}),
+            )
+            check("rename_snapshot()",
+                  lambda: client.rename_snapshot(
+                      snapshot_id, RENAMED_SNAPSHOT) or "renamed")
+            new_id = client.snapshot_id(pool, RENAMED, RENAMED_SNAPSHOT)
+            if check("get_snapshot() at the new name",
+                     lambda: client.get_snapshot(new_id).get("id")) != new_id:
+                print("  FAIL  snapshot did not arrive at the expected id")
+                ok = False
+            check("delete_snapshot() cleanup",
+                  lambda: client.delete_snapshot(new_id) or "deleted")
+    finally:
+        if renamed:
+            restored = check(
+                "rename_zvol() back to the original name",
+                lambda: client.rename_zvol(pool, RENAMED, zvol_name)
+                or "restored")
+            if restored is None:
+                print(f"  FAIL  {pool}/{RENAMED} was left behind; the "
+                      f"cleanup below will not find it")
+                ok = False
 
     return ok
 
@@ -673,6 +788,12 @@ def main():
             print("  ->    snapshot lifecycle verified")
         else:
             print("  ->    SNAPSHOT PROBES REPORTED FAILURES (see above)")
+
+        print(f"\nRename probes (#20), on {THROWAWAY}")
+        if verify_rename(client, pool, THROWAWAY):
+            print("  ->    rename endpoints verified, zvol name restored")
+        else:
+            print("  ->    RENAME PROBES REPORTED FAILURES (see above)")
 
         print(f"\niSCSI pipeline probes (#12), exporting {THROWAWAY}")
         if verify_iscsi_pipeline(client, pool, THROWAWAY):
