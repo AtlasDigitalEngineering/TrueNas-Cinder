@@ -203,7 +203,8 @@ status does **not** belong here — that is what the issue tracker is for. Run
 
 **The zvol, auth, error-mapping, iSCSI-pipeline, snapshot and rename paths
 have been verified against real hardware** (TrueNAS-25.10.5, #35, #11, #12,
-#42 and #20). The clone, rollback and promote endpoints (#13, #21) have not.
+#42, #20 and #13). The rollback endpoint has not — nothing calls
+`/pool/snapshot/rollback` yet.
 Every design-doc guess checked so far has had at least one error in it —
 `/zfs/zvol` was not a real endpoint, `volmode: GEOM` is FreeBSD-only,
 `name__startswith` is not a valid operator, the EULA endpoint returns a bare

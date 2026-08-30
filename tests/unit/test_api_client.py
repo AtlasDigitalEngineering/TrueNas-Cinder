@@ -27,8 +27,8 @@ were swallowed as "already deleted". The result reported success on every call
 while deleting nothing. So the tests assert the *absence* of ``/zfs/`` and the
 *presence* of percent-encoding, not merely that the happy path works.
 
-Coverage is deliberately partial: clone, rollback and promote are untested
-here because #13 and #21 add them along with their own test requirements.
+Coverage is deliberately partial: snapshot rollback is untested here
+because nothing calls `/pool/snapshot/rollback` yet.
 """
 
 import importlib.metadata
