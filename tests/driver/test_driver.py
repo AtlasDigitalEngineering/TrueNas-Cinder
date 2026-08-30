@@ -533,6 +533,13 @@ class ExportTestCase(DriverTestCase):
         driver.client.create_target_extent.return_value = 10
         driver.client.zvol_disk_path.side_effect = (
             lambda pool, name: f'zvol/{pool}/{name}')
+        # Nothing left over from a previous export unless a test says so.
+        driver.client.get_extent_by_name.return_value = None
+        driver.client.get_target_by_name.return_value = None
+        driver.client.get_target_extent.return_value = None
+        driver.client.target_groups.side_effect = (
+            lambda group, portals: [{'portal': portals, 'initiator': group,
+                                     'authmethod': 'NONE'}])
         return driver
 
 
@@ -648,6 +655,157 @@ class TestCreateExport(ExportTestCase):
             driver.create_export(None, FakeVolume(), {'initiator': IQN})
 
         driver.client.best_effort_delete.assert_not_called()
+
+
+class TestCreateExportIsIdempotent(ExportTestCase):
+    """Recovering from an export left behind by a failed attach (#62).
+
+    Cinder does not always call remove_export when an attach fails -- an
+    attachment deleted without a connector skips backend cleanup entirely.
+    Creating unconditionally then fails with "Extent name must be unique"
+    and the volume can never be attached again.
+    """
+
+    def test_adopts_an_existing_matching_extent(self):
+        driver = self._driver()
+        volume = FakeVolume()
+        driver.client.get_extent_by_name.return_value = {
+            'id': 27, 'name': volume.name,
+            'disk': f'zvol/{POOL}/{volume.name}'}
+
+        update = driver.create_export(None, volume, {'initiator': IQN})
+
+        driver.client.create_extent.assert_not_called()
+        self.assertTrue(update['provider_id'].endswith(':27'))
+
+    def test_refuses_an_extent_backed_by_a_different_zvol(self):
+        # Adopting this would export another volume's data.
+        driver = self._driver()
+        volume = FakeVolume()
+        driver.client.get_extent_by_name.return_value = {
+            'id': 27, 'name': volume.name,
+            'disk': f'zvol/{POOL}/volume-someone-else'}
+
+        with self.assertRaises(exception.VolumeBackendAPIException) as caught:
+            driver.create_export(None, volume, {'initiator': IQN})
+
+        message = str(caught.exception)
+        self.assertIn('volume-someone-else', message)
+        self.assertIn(volume.name, message)
+
+    def test_a_mismatched_extent_is_never_deleted(self):
+        # It belongs to something else. Refuse, do not "repair".
+        driver = self._driver()
+        driver.client.get_extent_by_name.return_value = {
+            'id': 27, 'disk': f'zvol/{POOL}/volume-someone-else'}
+
+        with self.assertRaises(exception.VolumeBackendAPIException):
+            driver.create_export(None, FakeVolume(), {'initiator': IQN})
+
+        driver.client.delete_extent.assert_not_called()
+        driver.client.best_effort_delete.assert_not_called()
+
+    def test_adopts_an_existing_target_and_repoints_it(self):
+        # The stale target names the PREVIOUS host's initiator group.
+        driver = self._driver()
+        volume = FakeVolume()
+        driver.client.get_target_by_name.return_value = {
+            'id': 27, 'name': volume.name,
+            'groups': [{'portal': 1, 'initiator': 999,
+                        'authmethod': 'NONE'}]}
+
+        driver.create_export(None, volume, {'initiator': IQN})
+
+        driver.client.create_target.assert_not_called()
+        driver.client.update_target_groups.assert_called_once_with(27, 7, 1)
+
+    def test_a_target_already_pointing_the_right_way_is_left_alone(self):
+        driver = self._driver()
+        driver.client.get_target_by_name.return_value = {
+            'id': 27,
+            'groups': [{'portal': 1, 'initiator': 7, 'authmethod': 'NONE'}]}
+
+        driver.create_export(None, FakeVolume(), {'initiator': IQN})
+
+        driver.client.update_target_groups.assert_not_called()
+
+    def test_an_existing_link_is_not_recreated(self):
+        driver = self._driver()
+        driver.client.get_extent_by_name.return_value = {
+            'id': 27, 'disk': f'zvol/{POOL}/{FakeVolume().name}'}
+        driver.client.get_target_by_name.return_value = {
+            'id': 27,
+            'groups': [{'portal': 1, 'initiator': 7, 'authmethod': 'NONE'}]}
+        driver.client.get_target_extent.return_value = {'id': 25}
+
+        driver.create_export(None, FakeVolume(), {'initiator': IQN})
+
+        driver.client.create_target_extent.assert_not_called()
+
+    def test_a_missing_link_is_created_even_when_both_ends_exist(self):
+        # The orphan from #62 had all three, but a half-built export may
+        # have the extent and target without the association.
+        driver = self._driver()
+        volume = FakeVolume()
+        driver.client.get_extent_by_name.return_value = {
+            'id': 27, 'disk': f'zvol/{POOL}/{volume.name}'}
+        driver.client.get_target_by_name.return_value = {
+            'id': 27,
+            'groups': [{'portal': 1, 'initiator': 7, 'authmethod': 'NONE'}]}
+        driver.client.get_target_extent.return_value = None
+
+        driver.create_export(None, volume, {'initiator': IQN})
+
+        driver.client.create_target_extent.assert_called_once_with(27, 27)
+
+    def test_adopted_resources_are_not_rolled_back(self):
+        # They existed before this call. Deleting them on failure could
+        # tear down an export this attach did not create.
+        driver = self._driver()
+        volume = FakeVolume()
+        driver.client.get_extent_by_name.return_value = {
+            'id': 27, 'disk': f'zvol/{POOL}/{volume.name}'}
+        driver.client.get_target_by_name.return_value = {
+            'id': 27,
+            'groups': [{'portal': 1, 'initiator': 7, 'authmethod': 'NONE'}]}
+        driver.client.reload_iscsi_service.side_effect = (
+            api_client.TrueNASAPIError('service gone'))
+
+        with self.assertRaises(exception.VolumeBackendAPIException):
+            driver.create_export(None, volume, {'initiator': IQN})
+
+        driver.client.best_effort_delete.assert_not_called()
+
+    def test_a_freshly_created_extent_is_still_rolled_back(self):
+        # The adopt path must not weaken cleanup for what we did create.
+        driver = self._driver()
+        driver.client.create_target.side_effect = (
+            api_client.TrueNASAPIError('nope'))
+
+        with self.assertRaises(exception.VolumeBackendAPIException):
+            driver.create_export(None, FakeVolume(), {'initiator': IQN})
+
+        driver.client.best_effort_delete.assert_called_once()
+
+    def test_full_orphan_recovery_creates_nothing_new(self):
+        # The exact state observed on the appliance in #62.
+        driver = self._driver()
+        volume = FakeVolume()
+        driver.client.get_extent_by_name.return_value = {
+            'id': 27, 'disk': f'zvol/{POOL}/{volume.name}'}
+        driver.client.get_target_by_name.return_value = {
+            'id': 27,
+            'groups': [{'portal': 1, 'initiator': 7, 'authmethod': 'NONE'}]}
+        driver.client.get_target_extent.return_value = {'id': 25}
+
+        update = driver.create_export(None, volume, {'initiator': IQN})
+
+        driver.client.create_extent.assert_not_called()
+        driver.client.create_target.assert_not_called()
+        driver.client.create_target_extent.assert_not_called()
+        self.assertEqual(update['provider_id'], '27:27')
+        # Still reloaded -- the export must be live even if nothing changed.
+        driver.client.reload_iscsi_service.assert_called_once_with()
 
 
 class TestRemoveExport(ExportTestCase):
