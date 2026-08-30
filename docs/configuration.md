@@ -140,6 +140,24 @@ its data intact. The zvol keeps the name Cinder gave it, so it can be adopted
 again later with `source-name: <pool>/<volume-name>`. Delete it by hand if you
 do not want it — nothing else will.
 
+### Adopting snapshots
+
+A snapshot is adopted onto the volume it belongs to, and only that volume:
+
+```bash
+cinder snapshot-manage --id-type source-name --name <name> \
+  <volume> <pool>/<zvol>@<snapshot>
+```
+
+Adopt the volume first. A snapshot named on any other volume is refused — the
+driver resolves snapshots through their volume's name, so such a record could
+never be resolved, and so could never be deleted through Cinder.
+
+`cinder snapshot-unmanage` releases it and leaves the ZFS snapshot in place.
+
+The step-by-step procedure for a whole estate is in
+[migration.md](migration.md).
+
 ## Volume naming
 
 Cinder's `volume_name_template` becomes the iSCSI target name. TrueNAS accepts

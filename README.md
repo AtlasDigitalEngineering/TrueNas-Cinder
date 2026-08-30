@@ -20,7 +20,8 @@ TrueNas-Cinder/
 ├── docs/
 │   ├── PLANNING.md         # Project roadmap and milestones
 │   ├── configuration.md    # cinder.conf backend section + prerequisites
-│   └── deployment.md       # Building the image and deploying under Kolla
+│   ├── deployment.md       # Building the image and deploying under Kolla
+│   └── migration.md        # Adopting existing zvols into Cinder
 ├── images/
 │   └── cinder-volume/      # Dockerfile for the Kolla cinder-volume image
 ├── truenas_cinder_driver/

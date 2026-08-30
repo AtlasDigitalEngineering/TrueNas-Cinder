@@ -838,6 +838,275 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         return bool(prefix) and snapshot_name.startswith(prefix)
 
     # ------------------------------------------------------------------
+    # Snapshots
+    #
+    # A ZFS snapshot is a point-in-time reference to the blocks a zvol held
+    # when it was taken, so creating one moves no data and costs no space
+    # until the zvol diverges from it.
+    #
+    # Every method here resolves its snapshot from ``snapshot.volume_name``
+    # and ``snapshot.name``, the same name-based approach the volume and
+    # export paths use, so nothing depends on an id staying valid.
+    # ------------------------------------------------------------------
+
+    def _snapshot_id(self, snapshot):
+        """Build the appliance id for a Cinder snapshot.
+
+        Args:
+            snapshot: The Cinder snapshot
+
+        Returns:
+            Full snapshot id, ``pool/volume@snapshot``
+        """
+        return self.client.snapshot_id(
+            self.configuration.truenas_pool,
+            snapshot.volume_name,
+            snapshot.name)
+
+    def create_snapshot(self, snapshot):
+        """Snapshot the zvol backing a Cinder volume.
+
+        Args:
+            snapshot: The Cinder snapshot to create
+
+        Raises:
+            VolumeBackendAPIException: If the appliance refused
+        """
+        pool = self.configuration.truenas_pool
+        dataset = '%s/%s' % (pool, snapshot.volume_name)
+        try:
+            self.client.create_snapshot(dataset, snapshot.name)
+        except api_client.TrueNASAPIError as exc:
+            raise exception.VolumeBackendAPIException(
+                data=_('Could not snapshot %(dataset)s as %(name)s: '
+                       '%(err)s')
+                % {'dataset': dataset, 'name': snapshot.name, 'err': exc})
+
+        LOG.info('Created snapshot %(dataset)s@%(name)s.',
+                 {'dataset': dataset, 'name': snapshot.name})
+
+    def delete_snapshot(self, snapshot):
+        """Delete a Cinder snapshot from the appliance.
+
+        Idempotent: a snapshot that is already gone counts as deleted, so a
+        retried delete converges instead of wedging the snapshot in
+        ``error_deleting``.
+
+        **Never deferred.** ``delete_snapshot(defer=True)`` would tell ZFS
+        to destroy the snapshot once its last clone is released, which
+        reports success now and destroys data later, out of Cinder's sight.
+        A snapshot a clone depends on is reported busy instead.
+
+        Args:
+            snapshot: The Cinder snapshot to delete
+
+        Raises:
+            SnapshotIsBusy: If a clone still depends on the snapshot
+            VolumeBackendAPIException: For any other failure
+        """
+        snapshot_id = self._snapshot_id(snapshot)
+        try:
+            self.client.delete_snapshot(snapshot_id)
+        except api_client.TrueNASAPINotFoundError:
+            LOG.info('Snapshot %s was already gone; treating the delete as '
+                     'complete.', snapshot_id)
+        except api_client.TrueNASAPIError as exc:
+            self._raise_snapshot_delete_failure(snapshot, snapshot_id, exc)
+        else:
+            LOG.info('Deleted snapshot %s.', snapshot_id)
+
+    def _raise_snapshot_delete_failure(self, snapshot, snapshot_id, exc):
+        """Re-raise a failed snapshot delete, naming any dependent clones.
+
+        The appliance reports the clone case as errno 22 under an
+        ``options.defer`` key, which is both undocumented and indirect --
+        it is really telling the caller to pass ``defer``, which this
+        driver deliberately will not do. Following
+        :meth:`_raise_delete_failure`, this asks the appliance what depends
+        on the snapshot instead of parsing that message, which costs a
+        request only on the failure path and names the blocker.
+
+        Args:
+            snapshot: The Cinder snapshot whose delete failed
+            snapshot_id: Its appliance id
+            exc: The error the delete raised
+
+        Raises:
+            SnapshotIsBusy: If a clone still depends on it. The manager
+                returns the snapshot to ``available``, which is correct --
+                it still exists and is still usable.
+            VolumeBackendAPIException: For any other failure
+        """
+        try:
+            clones = (self.client.get_snapshot(snapshot_id)
+                      .get('properties', {}).get('clones', {})
+                      .get('value') or '')
+        except api_client.TrueNASAPIError:
+            # Asking was a courtesy. Report the original failure.
+            clones = ''
+
+        if clones:
+            LOG.error('Cannot delete snapshot %(id)s: %(clones)s still '
+                      'depend on it. Delete the volumes cloned from this '
+                      'snapshot first; the driver will not defer the '
+                      'destroy, because that reports success now and '
+                      'destroys data later.',
+                      {'id': snapshot_id, 'clones': clones})
+            raise exception.SnapshotIsBusy(snapshot_name=snapshot.name)
+
+        raise exception.VolumeBackendAPIException(
+            data=_('Could not delete snapshot %(id)s: %(err)s')
+            % {'id': snapshot_id, 'err': exc})
+
+    def manage_existing_snapshot(self, snapshot, existing_ref):
+        """Bring an existing ZFS snapshot under Cinder management.
+
+        Adopts by rename, as :meth:`manage_existing` does, so the snapshot
+        afterwards resolves from ``snapshot.volume_name`` and
+        ``snapshot.name`` like any other.
+
+        Args:
+            snapshot: The Cinder snapshot to adopt it as
+            existing_ref: ``{'source-name': '<pool>/<zvol>@<snapshot>'}``
+
+        Raises:
+            ManageExistingInvalidReference: If the reference is malformed,
+                names nothing, or names a snapshot of a different volume
+            VolumeBackendAPIException: If the rename failed
+        """
+        source_id, _dataset, source_name = self._parse_existing_snapshot_ref(
+            snapshot, existing_ref)
+
+        try:
+            self.client.rename_snapshot(source_id, snapshot.name)
+        except api_client.TrueNASAPIError as exc:
+            raise exception.VolumeBackendAPIException(
+                data=_('Could not adopt snapshot %(source)s as %(name)s: '
+                       '%(err)s')
+                % {'source': source_id, 'name': snapshot.name, 'err': exc})
+
+        LOG.info('Adopted snapshot %(source)s as %(name)s on volume '
+                 '%(volume)s.',
+                 {'source': source_name, 'name': snapshot.name,
+                  'volume': snapshot.volume_name})
+
+    def manage_existing_snapshot_get_size(self, snapshot, existing_ref):
+        """Report the size Cinder should record for an adopted snapshot.
+
+        Cinder requires a snapshot's size to match its volume's, and a ZFS
+        snapshot has no size of its own -- it references the zvol's blocks
+        -- so this reports the **parent zvol's** size. ``used`` would be the
+        space the snapshot uniquely pins, which is near zero when it is
+        taken and is not what Cinder is asking for.
+
+        Args:
+            snapshot: The Cinder snapshot to adopt it as
+            existing_ref: ``{'source-name': '<pool>/<zvol>@<snapshot>'}``
+
+        Returns:
+            The parent zvol's size in GiB, rounded up
+
+        Raises:
+            ManageExistingInvalidReference: If the reference is malformed
+                or names nothing adoptable
+            VolumeBackendAPIException: If the appliance could not be read
+        """
+        self._parse_existing_snapshot_ref(snapshot, existing_ref)
+        # Validated above as sitting on this volume's zvol, so the parent is
+        # snapshot.volume_name by construction.
+        return self._zvol_size_gb(
+            self._adoptable_zvol(existing_ref, snapshot.volume_name))
+
+    def unmanage_snapshot(self, snapshot):
+        """Release a snapshot from Cinder without destroying it.
+
+        **Deliberately makes no API call**, for the same reason as
+        :meth:`unmanage`: Cinder calls this *instead of*
+        ``delete_snapshot()``, so the only thing left to decide is the ZFS
+        snapshot's fate, and for an unmanage that is to leave it alone.
+
+        The snapshot keeps the name Cinder gave it, so it can be adopted
+        again with ``source-name: <pool>/<volume>@<snapshot.name>``.
+
+        Args:
+            snapshot: The Cinder snapshot to stop managing
+        """
+        LOG.info('Stopped managing snapshot %(id)s. The ZFS snapshot was '
+                 'left in place; delete it by hand if it is not wanted.',
+                 {'id': self._snapshot_id(snapshot)})
+
+    def _parse_existing_snapshot_ref(self, snapshot, existing_ref):
+        """Validate a snapshot adoption reference.
+
+        Args:
+            snapshot: The Cinder snapshot being adopted into
+            existing_ref: The reference Cinder passed through
+
+        Returns:
+            ``(source_id, dataset, name)`` -- the full snapshot id, its
+            dataset path, and the bare snapshot name
+
+        Raises:
+            ManageExistingInvalidReference: With a reason naming what was
+                wrong
+            VolumeBackendAPIException: If the appliance could not be read
+        """
+        pool = self.configuration.truenas_pool
+        expected_dataset = '%s/%s' % (pool, snapshot.volume_name)
+        example = _("Expected {'source-name': "
+                    "'%(dataset)s/<zvol>@<snapshot>'}.") % {'dataset': pool}
+
+        if not isinstance(existing_ref, dict):
+            raise exception.ManageExistingInvalidReference(
+                existing_ref=existing_ref,
+                reason=_('The reference is not a mapping. %s') % example)
+
+        source = existing_ref.get('source-name')
+        if not isinstance(source, str) or not source.strip():
+            raise exception.ManageExistingInvalidReference(
+                existing_ref=existing_ref,
+                reason=_("No 'source-name' was given. %s") % example)
+        source = source.strip()
+
+        dataset, sep, name = source.rpartition('@')
+        if not sep or not name:
+            raise exception.ManageExistingInvalidReference(
+                existing_ref=existing_ref,
+                reason=_("'%(source)s' does not name a snapshot. %(example)s")
+                % {'source': source, 'example': example})
+
+        # The snapshot must sit on the zvol backing the volume Cinder
+        # attached this snapshot record to. Adopting one from a different
+        # dataset would produce a record whose id is derived from
+        # `snapshot.volume_name` and so resolves to something that does not
+        # exist -- undeletable through Cinder from the moment it is made.
+        if dataset != expected_dataset:
+            raise exception.ManageExistingInvalidReference(
+                existing_ref=existing_ref,
+                reason=_("'%(source)s' is a snapshot of '%(dataset)s', but "
+                         "this snapshot belongs to volume '%(volume)s', "
+                         "whose zvol is '%(expected)s'. A snapshot can only "
+                         "be adopted onto its own volume.")
+                % {'source': source, 'dataset': dataset,
+                   'volume': snapshot.volume_name,
+                   'expected': expected_dataset})
+
+        try:
+            self.client.get_snapshot(source)
+        except api_client.TrueNASAPINotFoundError:
+            raise exception.ManageExistingInvalidReference(
+                existing_ref=existing_ref,
+                reason=_("No snapshot '%(source)s' exists on the appliance.")
+                % {'source': source})
+        except api_client.TrueNASAPIError as exc:
+            raise exception.VolumeBackendAPIException(
+                data=_('Could not read snapshot %(source)s from the '
+                       'appliance: %(err)s')
+                % {'source': source, 'err': exc})
+
+        return source, dataset, name
+
+    # ------------------------------------------------------------------
     # Adoption (#20)
     #
     # The migration this driver exists for: every disk already lives on the
