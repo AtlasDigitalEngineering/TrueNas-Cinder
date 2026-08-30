@@ -203,7 +203,8 @@ status does **not** belong here — that is what the issue tracker is for. Run
 
 **The zvol, auth, error-mapping, iSCSI-pipeline, snapshot and rename paths
 have been verified against real hardware** (TrueNAS-25.10.5, #35, #11, #12,
-#42 and #20). The clone, rollback and promote endpoints (#13, #21) have not.
+#42, #20 and #13). The rollback endpoint has not — nothing calls
+`/pool/snapshot/rollback` yet.
 Every design-doc guess checked so far has had at least one error in it —
 `/zfs/zvol` was not a real endpoint, `volmode: GEOM` is FreeBSD-only,
 `name__startswith` is not a valid operator, the EULA endpoint returns a bare
@@ -258,6 +259,28 @@ destroys data later, outside Cinder's view, so `delete_snapshot` never defers
 and reports `SnapshotIsBusy` instead. It identifies the case by asking the
 appliance rather than by reading that message: `GET /pool/snapshot/id/<id>`
 returns `properties.clones.value` naming the dependents, verified in #20.
+
+**Promoting a clone reverses the dependency and moves the snapshot; it does
+not sever anything.** This is the opposite of what #13 was written assuming,
+and it decides how `create_volume_from_snapshot` has to work. Verified in #13:
+
+| | before promote | after promote |
+| --- | --- | --- |
+| snapshots on source | `[src@s1]` | `[]` |
+| snapshots on clone | `[]` | `[clone@s1]` |
+| `origin` of source | — | `clone@s1` |
+| `origin` of clone | `src@s1` | — |
+
+So promoting makes the **source** destroyable, at the cost of making the clone
+undestroyable while the source lives — and the snapshot physically moves to
+another dataset. Anything resolving that snapshot by its old dataset path stops
+finding it, which for this driver means a Cinder snapshot record whose id is
+derived from `snapshot.volume_name`. Somebody always depends on somebody; ZFS
+offers no way out of that short of a full copy.
+
+`POST /pool/dataset/id/<id>/promote` takes **no request body at all**. An empty
+JSON object is counted as a second positional argument and rejected with
+`Too many arguments (expected 1, found 2)`.
 
 **Never point tests or exploration at the production TrueNAS.** It holds every
 production VM disk as a zvol, and those are the migration's only copy. Use the
