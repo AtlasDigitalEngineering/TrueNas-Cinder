@@ -959,6 +959,469 @@ class TestSnapshotOrigin(DriverTestCase):
         self.assertFalse(driver._is_cinder_snapshot('anything-at-all'))
 
 
+class AdoptionTestCase(ExportTestCase):
+    """A driver ready to adopt, with nothing exporting the target zvol."""
+
+    SOURCE = 'vm-100-disk-0'
+
+    def _driver(self, **over):
+        driver = super()._driver(**over)
+        driver.client.get_zvol.return_value = {
+            'name': f'{POOL}/{self.SOURCE}',
+            'type': 'VOLUME',
+            'volsize': {'parsed': 10 * 1024 ** 3,
+                        'rawvalue': str(10 * 1024 ** 3),
+                        'value': '10 GiB'},
+        }
+        driver.client.get_extents.return_value = []
+        driver.client.get_target_extents.return_value = []
+        driver.client.get_targets.return_value = []
+        driver.client.get_iscsi_sessions.return_value = []
+        return driver
+
+    def _ref(self, source=None):
+        return {'source-name': f'{POOL}/{source or self.SOURCE}'}
+
+    def _export_the_source(self, driver, with_session=False):
+        """Point the mocks at a zvol that already has an export."""
+        disk = f'zvol/{POOL}/{self.SOURCE}'
+        driver.client.get_extents.return_value = [
+            {'id': 8, 'name': self.SOURCE, 'disk': disk},
+            {'id': 9, 'name': 'unrelated', 'disk': f'zvol/{POOL}/other'},
+        ]
+        driver.client.get_target_extents.return_value = [
+            {'id': 10, 'target': 11, 'extent': 8},
+            {'id': 12, 'target': 13, 'extent': 9},
+        ]
+        driver.client.get_targets.return_value = [
+            {'id': 11, 'name': self.SOURCE},
+            {'id': 13, 'name': 'unrelated'},
+        ]
+        if with_session:
+            driver.client.get_iscsi_sessions.return_value = [{
+                'initiator': 'iqn.2016-04.com.open-iscsi:2a16da8389ad',
+                'initiator_addr': '10.20.213.129',
+                'target': f'{BASENAME}:{self.SOURCE}',
+            }]
+        return driver
+
+
+class TestManageExistingGetSize(AdoptionTestCase):
+    """Sizing an adoption candidate."""
+
+    def test_reports_the_zvol_size_in_gb(self):
+        driver = self._driver()
+
+        self.assertEqual(
+            driver.manage_existing_get_size(FakeVolume(), self._ref()), 10)
+
+    def test_rounds_a_non_aligned_size_up(self):
+        # 10.5 GiB must report 11, never 10. Reporting less than the zvol
+        # holds would let Cinder believe data fits where it does not.
+        driver = self._driver()
+        driver.client.get_zvol.return_value = {
+            'name': f'{POOL}/{self.SOURCE}', 'type': 'VOLUME',
+            'volsize': {'parsed': int(10.5 * 1024 ** 3)},
+        }
+
+        self.assertEqual(
+            driver.manage_existing_get_size(FakeVolume(), self._ref()), 11)
+
+    def test_rounds_a_single_byte_over_up(self):
+        driver = self._driver()
+        driver.client.get_zvol.return_value = {
+            'name': f'{POOL}/{self.SOURCE}', 'type': 'VOLUME',
+            'volsize': {'parsed': 10 * 1024 ** 3 + 1},
+        }
+
+        self.assertEqual(
+            driver.manage_existing_get_size(FakeVolume(), self._ref()), 11)
+
+    def test_an_exactly_aligned_size_is_not_rounded_up(self):
+        # The other half of ceil: exact multiples must not gain a GB.
+        driver = self._driver()
+
+        self.assertEqual(
+            driver.manage_existing_get_size(FakeVolume(), self._ref()), 10)
+
+    def test_falls_back_to_rawvalue_when_parsed_is_absent(self):
+        driver = self._driver()
+        driver.client.get_zvol.return_value = {
+            'name': f'{POOL}/{self.SOURCE}', 'type': 'VOLUME',
+            'volsize': {'rawvalue': str(3 * 1024 ** 3)},
+        }
+
+        self.assertEqual(
+            driver.manage_existing_get_size(FakeVolume(), self._ref()), 3)
+
+    def test_accepts_a_bare_integer_volsize(self):
+        driver = self._driver()
+        driver.client.get_zvol.return_value = {
+            'name': f'{POOL}/{self.SOURCE}', 'type': 'VOLUME',
+            'volsize': 2 * 1024 ** 3,
+        }
+
+        self.assertEqual(
+            driver.manage_existing_get_size(FakeVolume(), self._ref()), 2)
+
+    def test_an_unreadable_volsize_fails_loudly(self):
+        driver = self._driver()
+        driver.client.get_zvol.return_value = {
+            'name': f'{POOL}/{self.SOURCE}', 'type': 'VOLUME',
+            'volsize': {'value': '10 GiB'},
+        }
+
+        self.assertRaises(exception.VolumeBackendAPIException,
+                          driver.manage_existing_get_size,
+                          FakeVolume(), self._ref())
+
+    def test_a_zero_length_zvol_is_refused(self):
+        driver = self._driver()
+        driver.client.get_zvol.return_value = {
+            'name': f'{POOL}/{self.SOURCE}', 'type': 'VOLUME',
+            'volsize': {'parsed': 0},
+        }
+
+        self.assertRaises(exception.VolumeBackendAPIException,
+                          driver.manage_existing_get_size,
+                          FakeVolume(), self._ref())
+
+    def test_sizing_does_not_rename_anything(self):
+        # Cinder calls this before manage_existing and may never call the
+        # second half; sizing must have no side effect.
+        driver = self._driver()
+
+        driver.manage_existing_get_size(FakeVolume(), self._ref())
+
+        driver.client.rename_zvol.assert_not_called()
+
+
+class TestManageExistingReferences(AdoptionTestCase):
+    """Every way a reference can be wrong, and what the operator is told."""
+
+    def _assert_invalid(self, driver, ref, *expected):
+        with self.assertRaises(
+                exception.ManageExistingInvalidReference) as caught:
+            driver.manage_existing(FakeVolume(), ref)
+        message = str(caught.exception)
+        for fragment in expected:
+            self.assertIn(fragment, message)
+        driver.client.rename_zvol.assert_not_called()
+        return message
+
+    def test_missing_source_name(self):
+        self._assert_invalid(self._driver(), {}, 'source-name', POOL)
+
+    def test_empty_source_name(self):
+        self._assert_invalid(self._driver(), {'source-name': '   '},
+                             'source-name')
+
+    def test_source_name_of_the_wrong_type(self):
+        self._assert_invalid(self._driver(), {'source-name': 42},
+                             'source-name')
+
+    def test_reference_that_is_not_a_mapping(self):
+        self._assert_invalid(self._driver(), 'Dev-Pool/vm-100-disk-0',
+                             'mapping')
+
+    def test_reference_naming_a_snapshot(self):
+        # Diagnosed before the pool check, so naming a snapshot gets the
+        # answer that helps rather than a pool complaint.
+        self._assert_invalid(
+            self._driver(), {'source-name': f'{POOL}/vm-100-disk-0@snap'},
+            'snapshot')
+
+    def test_reference_in_another_pool(self):
+        self._assert_invalid(
+            self._driver(), {'source-name': 'OtherPool/vm-100-disk-0'},
+            'OtherPool/vm-100-disk-0', POOL)
+
+    def test_reference_naming_the_pool_itself(self):
+        self._assert_invalid(self._driver(), {'source-name': f'{POOL}/'},
+                             'zvol')
+
+    def test_reference_to_a_zvol_that_does_not_exist(self):
+        driver = self._driver()
+        driver.client.get_zvol.side_effect = (
+            api_client.TrueNASAPINotFoundError('gone'))
+
+        self._assert_invalid(driver, self._ref(), 'No dataset')
+
+    def test_reference_to_a_filesystem_rather_than_a_zvol(self):
+        # A GET on a filesystem answers 200, so this arrives looking like a
+        # successful lookup and has to be caught on `type`.
+        driver = self._driver()
+        driver.client.get_zvol.return_value = {
+            'name': f'{POOL}/{self.SOURCE}', 'type': 'FILESYSTEM',
+        }
+
+        self._assert_invalid(driver, self._ref(), 'FILESYSTEM', 'zvol')
+
+    def test_source_name_is_stripped_before_use(self):
+        driver = self._driver()
+
+        driver.manage_existing(FakeVolume(),
+                               {'source-name': f'  {POOL}/{self.SOURCE}  '})
+
+        driver.client.rename_zvol.assert_called_once_with(
+            POOL, self.SOURCE, FakeVolume().name)
+
+    def test_a_nested_source_is_adopted_from_where_it_sits(self):
+        # Hand-provisioned disks are often nested under a parent dataset.
+        driver = self._driver()
+        nested = 'proxmox/vm-100-disk-0'
+        driver.client.get_zvol.return_value = {
+            'name': f'{POOL}/{nested}', 'type': 'VOLUME',
+            'volsize': {'parsed': 1024 ** 3},
+        }
+
+        driver.manage_existing(FakeVolume(), self._ref(nested))
+
+        driver.client.rename_zvol.assert_called_once_with(
+            POOL, nested, FakeVolume().name)
+
+    def test_a_failed_lookup_is_a_backend_error_not_a_bad_reference(self):
+        # An appliance that cannot be read says nothing about the
+        # reference, and telling the operator their reference is wrong
+        # would send them looking in the wrong place.
+        driver = self._driver()
+        driver.client.get_zvol.side_effect = (
+            api_client.TrueNASAPIError('appliance on fire'))
+
+        self.assertRaises(exception.VolumeBackendAPIException,
+                          driver.manage_existing, FakeVolume(), self._ref())
+
+
+class TestManageExisting(AdoptionTestCase):
+    """The adoption itself."""
+
+    def test_renames_the_zvol_to_the_cinder_name(self):
+        driver = self._driver()
+        volume = FakeVolume()
+
+        driver.manage_existing(volume, self._ref())
+
+        driver.client.rename_zvol.assert_called_once_with(
+            POOL, self.SOURCE, volume.name)
+
+    def test_adoption_never_creates_or_deletes_a_zvol(self):
+        # The whole point: no data is copied and nothing is destroyed.
+        driver = self._driver()
+
+        driver.manage_existing(FakeVolume(), self._ref())
+
+        driver.client.create_zvol.assert_not_called()
+        driver.client.delete_zvol.assert_not_called()
+
+    def test_returns_no_model_update(self):
+        # provider_location is built by create_export at first attach.
+        driver = self._driver()
+
+        self.assertIsNone(
+            driver.manage_existing(FakeVolume(), self._ref()))
+
+    def test_a_failed_rename_is_reported_as_a_backend_error(self):
+        driver = self._driver()
+        driver.client.rename_zvol.side_effect = (
+            api_client.TrueNASAPIError('refused'))
+
+        self.assertRaises(exception.VolumeBackendAPIException,
+                          driver.manage_existing, FakeVolume(), self._ref())
+
+
+class TestAdoptionSafetyGate(AdoptionTestCase):
+    """Refusing to rename a zvol something else is still exporting.
+
+    The appliance will not do this for us: both rename endpoints demand
+    `force` and refuse without it even when idle, so TrueNAS renames
+    whatever it is pointed at.
+    """
+
+    def test_an_idle_export_is_refused_by_default(self):
+        driver = self._export_the_source(self._driver())
+
+        with self.assertRaises(
+                exception.ManageExistingInvalidReference) as caught:
+            driver.manage_existing(FakeVolume(), self._ref())
+
+        driver.client.rename_zvol.assert_not_called()
+        self.assertIn('target 11', str(caught.exception))
+        self.assertIn('extent 8', str(caught.exception))
+
+    def test_the_refusal_names_only_the_conflicting_objects(self):
+        # An export belonging to a different zvol must not be named, or
+        # the operator deletes the wrong thing.
+        driver = self._export_the_source(self._driver())
+
+        with self.assertRaises(
+                exception.ManageExistingInvalidReference) as caught:
+            driver.manage_existing(FakeVolume(), self._ref())
+
+        self.assertNotIn('target 13', str(caught.exception))
+        self.assertNotIn('extent 9', str(caught.exception))
+
+    def test_default_refusal_deletes_nothing(self):
+        driver = self._export_the_source(self._driver())
+
+        self.assertRaises(exception.ManageExistingInvalidReference,
+                          driver.manage_existing, FakeVolume(), self._ref())
+
+        driver.client.delete_target.assert_not_called()
+        driver.client.delete_extent.assert_not_called()
+
+    def test_a_live_session_is_refused_even_with_removal_enabled(self):
+        # The one case no configuration may authorise: renaming a zvol out
+        # from under a connected initiator breaks it mid-write.
+        driver = self._export_the_source(
+            self._driver(truenas_adopt_removes_export=True),
+            with_session=True)
+
+        with self.assertRaises(
+                exception.ManageExistingInvalidReference) as caught:
+            driver.manage_existing(FakeVolume(), self._ref())
+
+        driver.client.rename_zvol.assert_not_called()
+        driver.client.delete_target.assert_not_called()
+        driver.client.delete_extent.assert_not_called()
+        self.assertIn('10.20.213.129', str(caught.exception))
+
+    def test_a_session_on_an_unrelated_target_does_not_block(self):
+        driver = self._export_the_source(
+            self._driver(truenas_adopt_removes_export=True))
+        driver.client.get_iscsi_sessions.return_value = [{
+            'initiator': 'iqn.1994-05.com.redhat:other',
+            'initiator_addr': '10.20.213.200',
+            'target': f'{BASENAME}:unrelated',
+        }]
+
+        driver.manage_existing(FakeVolume(), self._ref())
+
+        driver.client.rename_zvol.assert_called_once()
+
+    def test_removal_when_enabled_takes_the_target_before_the_extent(self):
+        # Same order as remove_export: deleting either end cascades the
+        # association, and the extent is what pins the zvol.
+        driver = self._export_the_source(
+            self._driver(truenas_adopt_removes_export=True))
+        order = []
+        driver.client.delete_target.side_effect = (
+            lambda i: order.append(('target', i)))
+        driver.client.delete_extent.side_effect = (
+            lambda i: order.append(('extent', i)))
+
+        driver.manage_existing(FakeVolume(), self._ref())
+
+        self.assertEqual(order, [('target', 11), ('extent', 8)])
+
+    def test_removal_leaves_unrelated_exports_alone(self):
+        driver = self._export_the_source(
+            self._driver(truenas_adopt_removes_export=True))
+
+        driver.manage_existing(FakeVolume(), self._ref())
+
+        driver.client.delete_target.assert_called_once_with(11)
+        driver.client.delete_extent.assert_called_once_with(8)
+
+    def test_removal_never_touches_the_zvol(self):
+        driver = self._export_the_source(
+            self._driver(truenas_adopt_removes_export=True))
+
+        driver.manage_existing(FakeVolume(), self._ref())
+
+        driver.client.delete_zvol.assert_not_called()
+
+    def test_the_rename_follows_the_removal(self):
+        driver = self._export_the_source(
+            self._driver(truenas_adopt_removes_export=True))
+        order = []
+        driver.client.delete_extent.side_effect = (
+            lambda i: order.append('delete'))
+        driver.client.rename_zvol.side_effect = (
+            lambda *a: order.append('rename'))
+
+        driver.manage_existing(FakeVolume(), self._ref())
+
+        self.assertEqual(order, ['delete', 'rename'])
+
+    def test_a_failed_removal_stops_before_the_rename(self):
+        driver = self._export_the_source(
+            self._driver(truenas_adopt_removes_export=True))
+        driver.client.delete_extent.side_effect = (
+            api_client.TrueNASAPIError('busy'))
+
+        self.assertRaises(exception.VolumeBackendAPIException,
+                          driver.manage_existing, FakeVolume(), self._ref())
+
+        driver.client.rename_zvol.assert_not_called()
+
+    def test_an_unreadable_appliance_refuses_rather_than_assuming_idle(self):
+        # Failing open here would rename a zvol that might be in use.
+        driver = self._driver(truenas_adopt_removes_export=True)
+        driver.client.get_extents.side_effect = (
+            api_client.TrueNASAPIError('timeout'))
+
+        self.assertRaises(exception.VolumeBackendAPIException,
+                          driver.manage_existing, FakeVolume(), self._ref())
+
+        driver.client.rename_zvol.assert_not_called()
+
+    def test_an_orphan_extent_with_no_target_still_blocks(self):
+        # No target means no session is possible, but the extent still
+        # pins the old zvol path and would break on rename.
+        driver = self._driver()
+        driver.client.get_extents.return_value = [
+            {'id': 8, 'name': self.SOURCE, 'disk': f'zvol/{POOL}/'
+             f'{self.SOURCE}'},
+        ]
+
+        self.assertRaises(exception.ManageExistingInvalidReference,
+                          driver.manage_existing, FakeVolume(), self._ref())
+
+        driver.client.rename_zvol.assert_not_called()
+
+    def test_an_unexported_zvol_is_adopted_without_a_session_lookup(self):
+        driver = self._driver()
+
+        driver.manage_existing(FakeVolume(), self._ref())
+
+        driver.client.rename_zvol.assert_called_once()
+
+
+class TestUnmanage(AdoptionTestCase):
+    """unmanage must release the volume and destroy nothing."""
+
+    def test_unmanage_issues_no_delete_of_any_kind(self):
+        # The acceptance criterion on #20. Getting this wrong destroys a
+        # production disk that Cinder was only ever borrowing.
+        driver = self._driver()
+
+        driver.unmanage(FakeVolume())
+
+        driver.client.delete_zvol.assert_not_called()
+        driver.client.delete_extent.assert_not_called()
+        driver.client.delete_target.assert_not_called()
+        driver.client.delete_target_extent.assert_not_called()
+        driver.client.delete_snapshot.assert_not_called()
+
+    def test_unmanage_makes_no_api_call_at_all(self):
+        # Cinder calls remove_export() immediately before this and then
+        # calls unmanage() *instead of* delete_volume(), so there is
+        # nothing left for it to do.
+        driver = self._driver()
+
+        driver.unmanage(FakeVolume())
+
+        self.assertEqual(driver.client.method_calls, [])
+
+    def test_unmanage_does_not_rename_the_zvol_back(self):
+        # The zvol keeps its Cinder name so it can be adopted again.
+        driver = self._driver()
+
+        driver.unmanage(FakeVolume())
+
+        driver.client.rename_zvol.assert_not_called()
+
+
 class TestVolumeStats(DriverTestCase):
     """Capacity reporting -- without it the backend is unschedulable."""
 

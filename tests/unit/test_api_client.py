@@ -1308,6 +1308,43 @@ class TestIscsiService(IscsiTestCase):
         self.assertFalse(self.client.reload_iscsi_service())
 
 
+class TestIscsiSessions(IscsiTestCase):
+    """The live-session read the adoption safety gate depends on (#20)."""
+
+    def test_sessions_is_a_post_despite_being_a_read(self):
+        # It takes query filters, so the middleware models it as a call.
+        # A GET is a 405, which would surface as a plain API error and
+        # could be misread as "no sessions" by a careless caller.
+        self._set_response([])
+
+        self.client.get_iscsi_sessions()
+
+        method, url = self.session.request.call_args.args
+        self.assertEqual(method, "POST")
+        self.assertEqual(url, f"{BASE_URL}/iscsi/global/sessions")
+
+    def test_sessions_returns_the_rows(self):
+        self._set_response([{
+            "initiator": "iqn.2016-04.com.open-iscsi:2a16da8389ad",
+            "initiator_addr": "10.20.213.129",
+            "target": "iqn.2005-10.org.freenas.ctl:volume-abc",
+            "target_alias": "volume-abc",
+        }])
+
+        sessions = self.client.get_iscsi_sessions()
+
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sessions[0]["target"],
+                         "iqn.2005-10.org.freenas.ctl:volume-abc")
+
+    def test_no_sessions_is_an_empty_list_not_an_error(self):
+        # The gate reads "empty" as "safe to rename", so an empty result
+        # has to arrive as data rather than as an exception.
+        self._set_response([])
+
+        self.assertEqual(self.client.get_iscsi_sessions(), [])
+
+
 class TestNameLookup(IscsiTestCase):
     """Name-based lookup -- the authoritative teardown path (#16).
 
@@ -1519,12 +1556,36 @@ class TestUpdateTargetGroups(IscsiTestCase):
             self.client.update_target_groups(9, 4, 1)
 
 
+# X.Y.Z, optionally with a PEP 440 pre-release suffix. Pre-releases are
+# allowed because the publish workflow derives the image tag from
+# __version__ rather than from the git tag, so shipping a release
+# candidate means putting the rc in the package version -- a tag alone
+# would publish over the final release's image tag.
+#
+# Deliberately narrower than PEP 440 itself: no epochs, dev builds or
+# local versions. Those are all legal Python versions and none of them
+# should ever reach a published container image.
+VERSION_PATTERN = r"^\d+\.\d+\.\d+(?:(?:a|b|rc)\d+)?$"
+
+
 class TestPackageVersion(unittest.TestCase):
     """The version must not drift between pyproject.toml and the package."""
 
     def test_version_is_a_release_string(self):
-        self.assertRegex(truenas_cinder_driver.__version__,
-                         r"^\d+\.\d+\.\d+$")
+        self.assertRegex(truenas_cinder_driver.__version__, VERSION_PATTERN)
+
+    def test_the_pattern_accepts_releases_and_pre_releases(self):
+        for good in ("1.0.0", "1.0.0rc1", "0.9.12b2", "10.20.30a7"):
+            with self.subTest(version=good):
+                self.assertRegex(good, VERSION_PATTERN)
+
+    def test_the_pattern_still_rejects_everything_else(self):
+        # Broadening a validation pattern is how it quietly stops
+        # validating, so the rejections are asserted rather than assumed.
+        for bad in ("1.0", "1.0.0.1", "1.0.0-rc1", "1.0.0rc", "v1.0.0",
+                    "1.0.0.dev1", "1.0.0+local", "1!1.0.0", "", "abc"):
+            with self.subTest(version=bad):
+                self.assertNotRegex(bad, VERSION_PATTERN)
 
     def test_installed_metadata_matches_the_package(self):
         # pyproject.toml reads __version__ dynamically, so these can only

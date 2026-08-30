@@ -1313,6 +1313,33 @@ class TrueNASAPIClient:
             "DELETE", f"/iscsi/targetextent/id/{targetextent_id}",
         )
 
+    def get_iscsi_sessions(self) -> List[Dict[str, Any]]:
+        """
+        List the iSCSI sessions currently connected to the appliance.
+
+        This is the only way to tell "a zvol has an export configured"
+        apart from "a zvol is being served right now", and adoption (#20)
+        turns on that distinction: renaming a zvol out from under a live
+        initiator corrupts whatever is using it, while renaming one whose
+        export is merely configured is recoverable.
+
+        Note the shape: a **POST** that reads. It takes query filters, so
+        the middleware models it as a call rather than a collection, and a
+        GET is a 405.
+
+        Each session names its target by full IQN
+        (``<basename>:<target name>``), not by id, so a caller correlating
+        back to a zvol has to go target name -> target -> targetextent ->
+        extent -> ``disk``.
+
+        Returns:
+            One dict per session, carrying ``initiator``,
+            ``initiator_addr``, ``target`` and ``target_alias`` among
+            others. Empty when nothing is connected.
+        """
+        return self._make_request(
+            "POST", "/iscsi/global/sessions", json={})
+
     def get_iscsi_service(self) -> Dict[str, Any]:
         """
         Get the state of the ``iscsitarget`` service.
