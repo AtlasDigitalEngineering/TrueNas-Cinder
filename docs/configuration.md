@@ -158,6 +158,36 @@ never be resolved, and so could never be deleted through Cinder.
 The step-by-step procedure for a whole estate is in
 [migration.md](migration.md).
 
+## Clones share blocks, and that has a visible cost
+
+`create-from-snapshot` and `volume clone` both produce a **ZFS clone**: a
+writable dataset sharing the source's blocks. It is created instantly and
+consumes nothing until it diverges, whatever the size of the source. That is
+the reason to do it this way.
+
+The cost is a dependency that ZFS will not let you ignore. Until the derived
+volume is deleted:
+
+- the **snapshot** it was cloned from cannot be deleted — `cinder
+  snapshot-delete` reports the snapshot busy and leaves it `available`;
+- the **volume** that snapshot belongs to cannot be deleted either — it reports
+  busy and stays `available`.
+
+Deleting the derived volume itself always works, and clears both.
+
+Cloning a volume takes a snapshot of it first, because ZFS can only clone a
+snapshot. That snapshot is named `snapshot-clone-src-<volume>` and is kept
+deliberately — the clone's blocks are defined by it. It is what makes the
+source report busy, and it is named as Cinder's so the delete failure says so
+rather than blaming an unknown snapshot task.
+
+**The driver does not promote clones.** Promotion is often suggested as the fix
+for the above; it is not. It reverses the dependency rather than removing it —
+the source becomes deletable and the *clone* stops being deletable — and it
+moves the snapshot onto the clone, where this driver could no longer resolve
+it. Trading a rare annoyance for a constant one is a bad deal, so the
+dependency is left pointing the way that keeps the common operations working.
+
 ## Volume naming
 
 Cinder's `volume_name_template` becomes the iSCSI target name. TrueNAS accepts
