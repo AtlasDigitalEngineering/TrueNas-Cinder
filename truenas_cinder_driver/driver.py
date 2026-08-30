@@ -727,6 +727,11 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
                 reason
         """
         pool = self.configuration.truenas_pool
+        # Read before the zvol goes away: after the delete there is nothing
+        # left to ask. A clone-source snapshot has no Cinder object, so if
+        # it is not reclaimed here nothing ever reclaims it -- and it goes
+        # on blocking the source volume's own delete forever.
+        origin = self._reclaimable_clone_source(pool, volume)
         try:
             self.client.delete_zvol(pool, volume.name, recursive=False)
         except api_client.TrueNASAPINotFoundError:
@@ -738,6 +743,16 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         else:
             LOG.info('Deleted zvol %(pool)s/%(name)s.',
                      {'pool': pool, 'name': volume.name})
+
+        if origin:
+            # Best effort: the volume is already gone, so failing here
+            # would report a successful delete as a failure and invite a
+            # retry that cannot succeed.
+            LOG.info('Reclaiming the clone-source snapshot %s, which existed '
+                     'only to back the volume just deleted.', origin)
+            self.client.best_effort_delete(
+                self.client.delete_snapshot, origin,
+                what=f'clone-source snapshot {origin}')
 
     def _raise_delete_failure(self, volume, pool, exc):
         """Re-raise a failed zvol delete, naming snapshots when they caused it.
@@ -1105,6 +1120,213 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
                 % {'source': source, 'err': exc})
 
         return source, dataset, name
+
+    def extend_volume(self, volume, new_size):
+        """Grow the zvol backing a Cinder volume.
+
+        ZFS grows a zvol online, so no reconnect is needed and an attached
+        volume keeps serving throughout. The guest still has to notice --
+        that is Nova's business, not this driver's.
+
+        Growth only: ZFS rejects a ``volsize`` below current usage, and
+        Cinder never asks to shrink.
+
+        Args:
+            volume: The Cinder volume to grow
+            new_size: Desired size in GiB
+
+        Raises:
+            VolumeBackendAPIException: If the appliance refused
+        """
+        pool = self.configuration.truenas_pool
+        try:
+            self.client.resize_zvol(pool, volume.name, new_size)
+        except api_client.TrueNASAPIError as exc:
+            raise exception.VolumeBackendAPIException(
+                data=_('Could not extend volume %(name)s to %(size)s GiB: '
+                       '%(err)s')
+                % {'name': volume.name, 'size': new_size, 'err': exc})
+
+        LOG.info('Extended %(pool)s/%(name)s to %(size)s GiB.',
+                 {'pool': pool, 'name': volume.name, 'size': new_size})
+
+    def create_volume_from_snapshot(self, volume, snapshot):
+        """Create a volume from a snapshot, by cloning it.
+
+        A ZFS clone is instant and initially free: it shares the
+        snapshot's blocks and grows only as it diverges. That is the point
+        of doing it this way rather than copying.
+
+        **The clone is not promoted.** Promotion does not sever the
+        dependency, it reverses it -- and it moves the snapshot onto the
+        clone, where this driver could no longer resolve it, since snapshot
+        ids are derived from ``snapshot.volume_name``. Verified in #13; see
+        AGENTS.md.
+
+        The consequence is worth stating plainly, because operators will
+        meet it: the source snapshot, and the volume it belongs to, cannot
+        be deleted while this volume exists. Both report themselves busy
+        rather than failing obscurely. Deleting *this* volume is always
+        fine.
+
+        Args:
+            volume: The Cinder volume to create
+            snapshot: The snapshot to clone from
+
+        Raises:
+            VolumeBackendAPIException: If the clone failed
+        """
+        pool = self.configuration.truenas_pool
+        snapshot_id = self._snapshot_id(snapshot)
+        try:
+            self.client.clone_snapshot(snapshot_id, pool, volume.name)
+        except api_client.TrueNASAPIError as exc:
+            raise exception.VolumeBackendAPIException(
+                data=_('Could not create volume %(name)s from snapshot '
+                       '%(snapshot)s: %(err)s')
+                % {'name': volume.name, 'snapshot': snapshot_id,
+                   'err': exc})
+
+        LOG.info('Created %(pool)s/%(name)s as a clone of %(snapshot)s. The '
+                 'snapshot and its volume cannot be deleted until this '
+                 'volume is.',
+                 {'pool': pool, 'name': volume.name,
+                  'snapshot': snapshot_id})
+
+    def create_cloned_volume(self, volume, src_vref):
+        """Copy an existing volume, by snapshotting it and cloning that.
+
+        ZFS cannot clone a dataset directly, only a snapshot of one, so
+        this takes a snapshot first. That snapshot then **has to stay** --
+        the clone's blocks are defined by it -- so it is named to be
+        recognisable rather than hidden, and it is what makes the source
+        volume report itself busy on delete until this volume is gone.
+
+        The snapshot is reclaimed by :meth:`delete_volume` when this
+        volume is deleted. It has no Cinder object of its own, so nothing
+        else could ever remove it, and leaving it would block the source
+        volume's delete permanently rather than temporarily.
+
+        Not promoted, for the reasons in
+        :meth:`create_volume_from_snapshot`.
+
+        Args:
+            volume: The Cinder volume to create
+            src_vref: The volume to copy
+
+        Raises:
+            VolumeBackendAPIException: If the snapshot or the clone failed
+        """
+        pool = self.configuration.truenas_pool
+        dataset = '%s/%s' % (pool, src_vref.name)
+        snap_name = self._clone_source_snapshot_name(volume)
+        snapshot_id = self.client.snapshot_id(pool, src_vref.name, snap_name)
+
+        try:
+            self.client.create_snapshot(dataset, snap_name)
+        except api_client.TrueNASAPIError as exc:
+            raise exception.VolumeBackendAPIException(
+                data=_('Could not snapshot %(source)s in order to clone it '
+                       'as %(name)s: %(err)s')
+                % {'source': dataset, 'name': volume.name, 'err': exc})
+
+        try:
+            self.client.clone_snapshot(snapshot_id, pool, volume.name)
+        except api_client.TrueNASAPIError as exc:
+            # The snapshot is useless without its clone, and leaving it
+            # would pin the source volume against deletion for a copy that
+            # does not exist.
+            self.client.best_effort_delete(
+                self.client.delete_snapshot, snapshot_id,
+                what=f'clone-source snapshot {snapshot_id}')
+            raise exception.VolumeBackendAPIException(
+                data=_('Could not clone %(source)s as %(name)s: %(err)s')
+                % {'source': dataset, 'name': volume.name, 'err': exc})
+
+        LOG.info('Cloned %(source)s as %(pool)s/%(name)s via %(snapshot)s. '
+                 'That snapshot is retained because the clone depends on '
+                 'it, and %(source)s cannot be deleted until this volume '
+                 'is.',
+                 {'source': dataset, 'pool': pool, 'name': volume.name,
+                  'snapshot': snapshot_id})
+
+    def _reclaimable_clone_source(self, pool, volume):
+        """Return the clone-source snapshot backing this volume, if any.
+
+        Only ever returns a snapshot **this driver created to serve a
+        clone**. A volume made by :meth:`create_volume_from_snapshot` also
+        has an ``origin``, but that origin is a real Cinder snapshot with
+        its own lifecycle and its own delete path -- removing it here would
+        destroy an object Cinder still believes exists.
+
+        The two are told apart by name, which is why
+        :meth:`_clone_source_snapshot_name` builds a distinctive one.
+
+        Never raises. The lookup is a courtesy ahead of a delete that has
+        to proceed regardless.
+
+        Args:
+            pool: Pool the zvol lives in
+            volume: The Cinder volume about to be deleted
+
+        Returns:
+            The full snapshot id to reclaim, or None
+        """
+        try:
+            zvol = self.client.get_zvol(pool, volume.name)
+        except api_client.TrueNASAPIError:
+            return None
+
+        origin = zvol.get('origin')
+        if isinstance(origin, dict):
+            origin = origin.get('rawvalue')
+        if not origin:
+            return None
+
+        _dataset, _sep, name = str(origin).rpartition('@')
+        return origin if self._is_clone_source_snapshot(name) else None
+
+    def _is_clone_source_snapshot(self, snapshot_name):
+        """Decide whether a snapshot name is one taken to back a clone.
+
+        Args:
+            snapshot_name: Bare snapshot name, without the dataset or ``@``
+
+        Returns:
+            True if this driver created it for :meth:`create_cloned_volume`
+        """
+        return snapshot_name.startswith(self._clone_source_prefix())
+
+    def _clone_source_prefix(self):
+        """Return the naming prefix shared by clone-source snapshots.
+
+        Returns:
+            The prefix, carrying ``snapshot_name_template``'s own
+        """
+        template = (self.configuration.safe_get('snapshot_name_template')
+                    or DEFAULT_SNAPSHOT_NAME_TEMPLATE)
+        prefix = template.split('%s')[0] or 'snapshot-'
+        return '%sclone-src-' % prefix
+
+    def _clone_source_snapshot_name(self, volume):
+        """Name the snapshot a clone is taken from.
+
+        Carries ``snapshot_name_template``'s prefix deliberately. The
+        snapshot outlives the call and will show up as a blocker when
+        somebody tries to delete the source volume, and
+        :meth:`_is_cinder_snapshot` decides whether that message says
+        "Cinder made this" or "something else on the appliance is
+        snapshotting your volumes". Without the prefix it would be the
+        second, which is both wrong and sends the reader hunting a
+        periodic-snapshot task that does not exist.
+
+        Args:
+            volume: The Cinder volume being created by the clone
+
+        Returns:
+            A snapshot name, unique to that volume
+        """
+        return '%s%s' % (self._clone_source_prefix(), volume.name)
 
     # ------------------------------------------------------------------
     # Adoption (#20)

@@ -1275,6 +1275,257 @@ class TestUnmanageSnapshot(SnapshotTestCase):
              if not c[0].startswith('snapshot_id')], [])
 
 
+class TestDeleteClonedVolume(SnapshotTestCase):
+    """delete_volume reclaims the snapshot a clone was taken from.
+
+    That snapshot has no Cinder object: it never appears in
+    `cinder snapshot-list`, so nothing but this can remove it, and left
+    behind it blocks the source volume's delete permanently rather than
+    while the clone exists.
+    """
+
+    def _driver(self, origin=None, **over):
+        driver = super()._driver(**over)
+        driver.client.get_zvol.return_value = {
+            'name': 'z', 'type': 'VOLUME',
+            'volsize': {'parsed': 1024 ** 3},
+            'origin': {'rawvalue': origin or ''},
+        }
+        return driver
+
+    def test_a_cloned_volume_reclaims_its_source_snapshot(self):
+        volume = FakeVolume()
+        snap = f'{POOL}/volume-src@snapshot-clone-src-{volume.name}'
+        driver = self._driver(origin=snap)
+
+        driver.delete_volume(volume)
+
+        driver.client.best_effort_delete.assert_called_once()
+        self.assertEqual(
+            driver.client.best_effort_delete.call_args.args[1], snap)
+
+    def test_a_volume_cloned_from_a_cinder_snapshot_reclaims_nothing(self):
+        # Its origin is a real Cinder snapshot with its own lifecycle.
+        # Deleting it here would destroy an object Cinder still lists.
+        driver = self._driver(
+            origin=f'{POOL}/volume-src@snapshot-1b2c3d4e-5f60-4718-9a2b-3c4')
+
+        driver.delete_volume(FakeVolume())
+
+        driver.client.best_effort_delete.assert_not_called()
+
+    def test_a_plain_volume_reclaims_nothing(self):
+        driver = self._driver(origin='')
+
+        driver.delete_volume(FakeVolume())
+
+        driver.client.best_effort_delete.assert_not_called()
+
+    def test_the_zvol_is_deleted_before_its_origin(self):
+        volume = FakeVolume()
+        snap = f'{POOL}/volume-src@snapshot-clone-src-{volume.name}'
+        driver = self._driver(origin=snap)
+        order = []
+        driver.client.delete_zvol.side_effect = (
+            lambda *a, **k: order.append('zvol'))
+        driver.client.best_effort_delete.side_effect = (
+            lambda *a, **k: order.append('origin'))
+
+        driver.delete_volume(volume)
+
+        self.assertEqual(order, ['zvol', 'origin'])
+
+    def test_a_busy_volume_does_not_reclaim_anything(self):
+        # The volume still exists, so its clone-source snapshot is still
+        # load-bearing.
+        volume = FakeVolume()
+        driver = self._driver(
+            origin=f'{POOL}/volume-src@snapshot-clone-src-{volume.name}')
+        driver.client.delete_zvol.side_effect = (
+            api_client.TrueNASAPIError('has children'))
+        driver.client.get_snapshot_list.return_value = [
+            {'snapshot_name': 'snapshot-abc'}]
+
+        self.assertRaises(exception.VolumeIsBusy,
+                          driver.delete_volume, volume)
+
+        driver.client.best_effort_delete.assert_not_called()
+
+    def test_an_unreadable_origin_does_not_block_the_delete(self):
+        # The lookup is a courtesy; the delete has to proceed regardless.
+        driver = self._driver()
+        driver.client.get_zvol.side_effect = (
+            api_client.TrueNASAPIError('timeout'))
+
+        driver.delete_volume(FakeVolume())
+
+        driver.client.delete_zvol.assert_called_once()
+        driver.client.best_effort_delete.assert_not_called()
+
+    def test_reclaiming_uses_best_effort_not_a_raising_delete(self):
+        # The volume is already gone; failing here would report a
+        # successful delete as a failure and invite a doomed retry.
+        volume = FakeVolume()
+        driver = self._driver(
+            origin=f'{POOL}/volume-src@snapshot-clone-src-{volume.name}')
+
+        driver.delete_volume(volume)
+
+        driver.client.delete_snapshot.assert_not_called()
+
+
+class TestExtendVolume(SnapshotTestCase):
+    """extend_volume."""
+
+    def test_resizes_the_zvol(self):
+        driver = self._driver()
+        volume = FakeVolume()
+
+        driver.extend_volume(volume, 20)
+
+        driver.client.resize_zvol.assert_called_once_with(
+            POOL, volume.name, 20)
+
+    def test_a_failure_is_reported_as_a_backend_error(self):
+        driver = self._driver()
+        driver.client.resize_zvol.side_effect = (
+            api_client.TrueNASAPIError('refused'))
+
+        self.assertRaises(exception.VolumeBackendAPIException,
+                          driver.extend_volume, FakeVolume(), 20)
+
+    def test_extending_does_not_touch_snapshots_or_exports(self):
+        # ZFS grows a zvol online; nothing needs rebuilding.
+        driver = self._driver()
+
+        driver.extend_volume(FakeVolume(), 20)
+
+        driver.client.create_snapshot.assert_not_called()
+        driver.client.create_extent.assert_not_called()
+
+
+class TestCreateVolumeFromSnapshot(SnapshotTestCase):
+    """create_volume_from_snapshot."""
+
+    def test_clones_the_snapshot_into_the_new_volume(self):
+        driver = self._driver()
+        volume = FakeVolume(name='volume-new')
+        snapshot = FakeSnapshot()
+
+        driver.create_volume_from_snapshot(volume, snapshot)
+
+        driver.client.clone_snapshot.assert_called_once_with(
+            f'{POOL}/{snapshot.volume_name}@{snapshot.name}',
+            POOL, 'volume-new')
+
+    def test_it_does_not_promote(self):
+        # Promotion reverses the dependency rather than removing it, and
+        # moves the snapshot onto the clone -- where this driver could no
+        # longer resolve it, since ids come from snapshot.volume_name.
+        driver = self._driver()
+
+        driver.create_volume_from_snapshot(FakeVolume(), FakeSnapshot())
+
+        driver.client.promote_clone.assert_not_called()
+
+    def test_it_creates_no_zvol_of_its_own(self):
+        # The whole point: the clone shares the snapshot's blocks.
+        driver = self._driver()
+
+        driver.create_volume_from_snapshot(FakeVolume(), FakeSnapshot())
+
+        driver.client.create_zvol.assert_not_called()
+
+    def test_a_failed_clone_is_reported_as_a_backend_error(self):
+        driver = self._driver()
+        driver.client.clone_snapshot.side_effect = (
+            api_client.TrueNASAPIError('no such snapshot'))
+
+        self.assertRaises(exception.VolumeBackendAPIException,
+                          driver.create_volume_from_snapshot,
+                          FakeVolume(), FakeSnapshot())
+
+
+class TestCreateClonedVolume(SnapshotTestCase):
+    """create_cloned_volume."""
+
+    def test_snapshots_the_source_then_clones_that(self):
+        driver = self._driver()
+        volume = FakeVolume(name='volume-new')
+        src = FakeVolume(name='volume-src')
+        order = []
+        driver.client.create_snapshot.side_effect = (
+            lambda *a: order.append('snapshot'))
+        driver.client.clone_snapshot.side_effect = (
+            lambda *a: order.append('clone'))
+
+        driver.create_cloned_volume(volume, src)
+
+        self.assertEqual(order, ['snapshot', 'clone'])
+        driver.client.clone_snapshot.assert_called_once_with(
+            f'{POOL}/volume-src@'
+            f'{driver._clone_source_snapshot_name(volume)}',
+            POOL, 'volume-new')
+
+    def test_the_source_snapshot_is_named_as_cinders(self):
+        # It outlives the call and shows up as a blocker on the source's
+        # delete. _is_cinder_snapshot must recognise it, or the operator is
+        # told something else on the appliance is snapshotting their
+        # volumes and goes hunting a task that does not exist.
+        driver = self._driver()
+
+        name = driver._clone_source_snapshot_name(FakeVolume())
+
+        self.assertTrue(driver._is_cinder_snapshot(name))
+
+    def test_the_source_snapshot_name_is_unique_per_new_volume(self):
+        driver = self._driver()
+
+        a = driver._clone_source_snapshot_name(FakeVolume(name='volume-a'))
+        b = driver._clone_source_snapshot_name(FakeVolume(name='volume-b'))
+
+        self.assertNotEqual(a, b)
+
+    def test_it_does_not_promote(self):
+        driver = self._driver()
+
+        driver.create_cloned_volume(FakeVolume(), FakeVolume(name='src'))
+
+        driver.client.promote_clone.assert_not_called()
+
+    def test_a_failed_clone_removes_the_snapshot_it_created(self):
+        # Leaving it would pin the source against deletion for a copy that
+        # does not exist.
+        driver = self._driver()
+        driver.client.clone_snapshot.side_effect = (
+            api_client.TrueNASAPIError('destination exists'))
+
+        volume = FakeVolume()
+        self.assertRaises(exception.VolumeBackendAPIException,
+                          driver.create_cloned_volume,
+                          volume, FakeVolume(name='volume-src'))
+
+        # Which snapshot, not merely that something was deleted.
+        driver.client.best_effort_delete.assert_called_once()
+        args = driver.client.best_effort_delete.call_args
+        self.assertEqual(
+            args.args[1],
+            f'{POOL}/volume-src@'
+            f'{driver._clone_source_snapshot_name(volume)}')
+
+    def test_a_failed_snapshot_does_not_attempt_a_clone(self):
+        driver = self._driver()
+        driver.client.create_snapshot.side_effect = (
+            api_client.TrueNASAPIError('nope'))
+
+        self.assertRaises(exception.VolumeBackendAPIException,
+                          driver.create_cloned_volume,
+                          FakeVolume(), FakeVolume(name='volume-src'))
+
+        driver.client.clone_snapshot.assert_not_called()
+        driver.client.best_effort_delete.assert_not_called()
+
+
 class AdoptionTestCase(ExportTestCase):
     """A driver ready to adopt, with nothing exporting the target zvol."""
 
