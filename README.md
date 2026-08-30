@@ -19,7 +19,10 @@ TrueNas-Cinder/
 ├── .github/                # CI workflows and CODEOWNERS
 ├── docs/
 │   ├── PLANNING.md         # Project roadmap and milestones
-│   └── configuration.md    # cinder.conf backend section + prerequisites
+│   ├── configuration.md    # cinder.conf backend section + prerequisites
+│   └── deployment.md       # Building the image and deploying under Kolla
+├── images/
+│   └── cinder-volume/      # Dockerfile for the Kolla cinder-volume image
 ├── truenas_cinder_driver/
 │   ├── __init__.py         # Package initialization
 │   ├── api_client.py       # TrueNAS REST API client wrapper

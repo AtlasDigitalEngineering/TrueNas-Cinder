@@ -1,0 +1,98 @@
+name: Image
+
+# Publishes the cinder-volume image carrying the driver.
+#
+# Tags only, never on push to main: a container running in a cluster should
+# be traceable to a release, not to whatever main happened to be that day.
+# workflow_dispatch is there for rebuilding a tag against a newer base image
+# without cutting a new driver release.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to rebuild, e.g. v1.0.0'
+        required: true
+
+env:
+  # Any OCI registry works. ghcr.io needs no secret beyond the workflow's own
+  # GITHUB_TOKEN and lives in the same namespace as the repository.
+  REGISTRY: ghcr.io
+  IMAGE_NAME: cinder-volume-truenas
+  # Kolla 2025.1 builds its Ubuntu images on Noble; there is no jammy tag for
+  # this release. Overridable to build against a different OpenStack release.
+  KOLLA_BASE: quay.io/openstack.kolla/cinder-volume:2025.1-ubuntu-noble
+
+jobs:
+  publish:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    permissions:
+      # write, not read: the final step uploads the wheel as a release asset
+      # via GITHUB_TOKEN, which needs contents:write. With read it 403s -- and
+      # only ever on a real tag, since this workflow does not run otherwise.
+      contents: write
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Build the wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+
+      # The image tag is the driver version, taken from the package rather
+      # than from the git tag, so the container and `pip show` cannot
+      # disagree about what is installed.
+      - name: Determine the version and image reference
+        id: version
+        run: |
+          python -m pip install -e .
+          version=$(python -c 'import truenas_cinder_driver as p; print(p.__version__)')
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          # OCI repository names must be lowercase, and the owner login keeps
+          # its original case (AtlasDigitalEngineering). Passing it through
+          # verbatim fails the push with "invalid reference format" before the
+          # registry is ever contacted.
+          image="${REGISTRY}/${GITHUB_REPOSITORY_OWNER,,}/${IMAGE_NAME}"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "building ${image}:${version}"
+
+      - name: Log in to ${{ env.REGISTRY }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: images/cinder-volume/Dockerfile
+          build-args: KOLLA_BASE=${{ env.KOLLA_BASE }}
+          push: true
+          tags: >-
+            ${{ steps.version.outputs.image }}:${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.base.name=${{ env.KOLLA_BASE }}
+
+      - name: Attach the wheel to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.whl
