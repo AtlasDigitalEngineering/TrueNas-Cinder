@@ -8,7 +8,11 @@ name: Image
 # without cutting a new driver release.
 on:
   push:
-    tags: ['v*']
+    # '[0-9]*' is here so a tag written without the `v` cannot be a silent
+    # no-op. It is rejected by the guard below rather than published --
+    # failing loudly beats a release page with no image behind it, which is
+    # what a bare `1.0.0rc1` produced before this pattern existed.
+    tags: ['v*', '[0-9]*']
   workflow_dispatch:
     inputs:
       tag:
@@ -77,6 +81,32 @@ jobs:
           echo "image=${image}" >> "$GITHUB_OUTPUT"
           echo "building ${image}:${version} (prerelease=${prerelease})"
 
+      # The image tag comes from the package, not from the git tag, so
+      # nothing else here would notice them disagreeing: tagging v1.0.1
+      # while __version__ says 1.0.0 republishes :1.0.0 over itself and
+      # attaches a 1.0.0 wheel to a v1.0.1 release. Observed on v1.0.0rc2.
+      #
+      # Deliberately before the registry login, so a mismatch cannot push
+      # anything. Skipped for workflow_dispatch, whose whole purpose is
+      # rebuilding an existing tag against a newer base image.
+      - name: Refuse a tag that disagrees with the package version
+        if: github.event_name == 'push'
+        run: |
+          version='${{ steps.version.outputs.version }}'
+          expected="v${version}"
+          # Three outcomes, not two. Reporting a missing `v` as a version
+          # mismatch produces "tag 1.0.0 does not match the package version
+          # 1.0.0", which is both false and unactionable.
+          if [ "${GITHUB_REF_NAME}" = "${expected}" ]; then
+            echo "tag ${GITHUB_REF_NAME} matches the package version."
+          elif [ "${GITHUB_REF_NAME}" = "${version}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} is missing the leading 'v'. The version is right; re-tag as ${expected}."
+            exit 1
+          else
+            echo "::error::Tag ${GITHUB_REF_NAME} disagrees with the package version ${version}, so it would publish ${{ steps.version.outputs.image }}:${version} and overwrite it. Either re-tag as ${expected}, or bump __version__ in truenas_cinder_driver/__init__.py to ${GITHUB_REF_NAME#v} and re-tag."
+            exit 1
+          fi
+
       - name: Log in to ${{ env.REGISTRY }}
         uses: docker/login-action@v3
         with:
@@ -117,20 +147,39 @@ jobs:
           repo="${image#*/}"
           docs='docs/deployment.md, "The first publish creates a private package"'
 
-          token=$(curl -sf \
+          # Bounded: this step is advisory and exits 0 whatever it finds,
+          # so the only way it can affect a release is by not finishing.
+          # An unbounded curl against a stalled endpoint would hang the
+          # job to its six-hour limit.
+          body=$(mktemp)
+          status=$(curl -s -o "${body}" -w '%{http_code}' \
+            --connect-timeout 10 --max-time 30 \
             "https://ghcr.io/token?scope=repository:${repo}:pull" \
-            | jq -r '.token // empty') || true
+            || echo 000)
+          token=$(jq -r '.token // empty' < "${body}" 2>/dev/null || true)
 
           # One line per annotation: a workflow command stops at the
           # first newline, so a wrapped message loses everything after it.
           if [ -z "${token}" ]; then
-            echo "::warning::${image}:${tag} was published but is NOT anonymously pullable - the package is private, so deployments will fail to pull it. Change the package visibility to public, or configure registry credentials on every node. See ${docs}."
+            # 401/403 is the registry declining; anything else did not get
+            # far enough to say anything about visibility, and reporting it
+            # as private would send the reader to fix a setting that is
+            # already correct.
+            case "${status}" in
+              401|403)
+                echo "::warning::${image}:${tag} was published but is NOT anonymously pullable - the package is private, so deployments will fail to pull it. Change the package visibility to public, or configure registry credentials on every node. See ${docs}."
+                ;;
+              *)
+                echo "::warning::Could not check whether ${image}:${tag} is anonymously pullable: the ghcr.io token request returned HTTP ${status}. This says nothing about package visibility - verify by hand. See ${docs}."
+                ;;
+            esac
             exit 0
           fi
 
           # The Accept header is required: without it the registry answers
           # 404 for an image that is public and present.
           code=$(curl -s -o /dev/null -w '%{http_code}' \
+            --connect-timeout 10 --max-time 30 \
             -H "Authorization: Bearer ${token}" \
             -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json' \
             "https://ghcr.io/v2/${repo}/manifests/${tag}")

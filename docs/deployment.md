@@ -53,6 +53,24 @@ workflow.
 **Never deploy `:latest`.** Tag with the driver version, so a running container
 can be traced back to a release.
 
+### Cutting a release
+
+The image tag comes from `__version__` in `truenas_cinder_driver/__init__.py`,
+never from the git tag. That is what stops the container and `pip show`
+disagreeing, but it means **the git tag has to be bumped in lockstep** — a tag
+of `v1.0.1` while `__version__` still says `1.0.0` would republish `:1.0.0`
+over itself and attach a `1.0.0` wheel to a `v1.0.1` release.
+
+The workflow refuses that rather than letting it through, so the order is:
+
+1. Bump `__version__`, merge it.
+2. Tag `main` as `v<__version__>` — exactly, including the `v`.
+3. Push the tag.
+
+A tag that disagrees fails the job before it can log in to the registry, and
+says which of the two to change. A tag written without the `v` fails too,
+rather than silently matching nothing and publishing no image at all.
+
 ### The first publish creates a private package
 
 **Package visibility is separate from repository visibility, and publishing
