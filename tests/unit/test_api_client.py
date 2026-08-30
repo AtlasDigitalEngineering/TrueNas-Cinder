@@ -31,6 +31,7 @@ Coverage is deliberately partial: clone, rollback and promote are untested
 here because #13 and #21 add them along with their own test requirements.
 """
 
+import importlib.metadata
 import json
 import logging
 import traceback
@@ -39,6 +40,7 @@ from unittest import mock
 
 import requests
 
+import truenas_cinder_driver
 from truenas_cinder_driver import api_client
 from truenas_cinder_driver.api_client import (
     DEFAULT_TIMEOUT,
@@ -1423,6 +1425,26 @@ class TestUpdateTargetGroups(IscsiTestCase):
 
         with self.assertRaises(TrueNASAPINotFoundError):
             self.client.update_target_groups(9, 4, 1)
+
+
+class TestPackageVersion(unittest.TestCase):
+    """The version must not drift between pyproject.toml and the package."""
+
+    def test_version_is_a_release_string(self):
+        self.assertRegex(truenas_cinder_driver.__version__,
+                         r"^\d+\.\d+\.\d+$")
+
+    def test_installed_metadata_matches_the_package(self):
+        # pyproject.toml reads __version__ dynamically, so these can only
+        # disagree if that wiring breaks. Skipped when running from a
+        # checkout without an install -- the nix dev shell does exactly
+        # that, and CI installs with `pip install -e .` so it runs there.
+        try:
+            declared = importlib.metadata.version("truenas-cinder-driver")
+        except importlib.metadata.PackageNotFoundError:
+            self.skipTest("package not installed; nothing to compare")
+
+        self.assertEqual(declared, truenas_cinder_driver.__version__)
 
 
 SNAP = "snapshot-7f2c1b9e-3a44-4d61-8e05-9b7c2f0a1d38"

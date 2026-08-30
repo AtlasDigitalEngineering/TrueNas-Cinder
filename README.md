@@ -27,6 +27,7 @@ TrueNas-Cinder/
 ├── tests/
 │   ├── unit/               # API client tests (no Cinder needed)
 │   └── driver/             # Driver tests (Cinder required)
+├── pyproject.toml          # Packaging and dependencies (extras)
 ├── flake.nix               # Nix dev shell (Python, uv, gh)
 ├── AGENTS.md               # Conventions and workflow for contributors
 └── CONTRIBUTING.md         # Contribution guidelines
@@ -57,16 +58,16 @@ With Nix — the API client tests, linter and verification tool need no setup at
 all; only the driver tests, which need Cinder, install anything:
 
 ```bash
-nix develop                                       # ready immediately
-uv venv && uv pip install -r driver-test-requirements.txt   # driver tests only
+nix develop                            # ready immediately
+uv venv && uv pip install -e '.[driver]'   # driver tests only
 ```
 
 Without Nix:
 
 1. Clone the repository.
 2. Create a virtual environment: `python -m venv .venv && source .venv/bin/activate`
-3. Install test dependencies: `pip install -r test-requirements.txt`
-4. For the driver tests as well: `pip install -r driver-test-requirements.txt`
+3. Install the package and its test dependencies: `pip install -e '.[test]'`
+4. For the driver tests as well: `pip install -e '.[driver]'`
 
 ### Running the tests
 

@@ -18,6 +18,7 @@ from cinder.i18n import _
 from cinder.volume import configuration
 from cinder.volume.drivers.san import san
 
+from truenas_cinder_driver import __version__
 from truenas_cinder_driver import api_client
 
 LOG = logging.getLogger(__name__)
@@ -77,7 +78,8 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         1.0.0 - Configuration, setup validation and capacity reporting.
     """
 
-    VERSION = '1.0.0'
+    # From the package, so `pip show` and get_volume_stats agree.
+    VERSION = __version__
 
     # Informational. This driver is maintained out of tree and has no
     # third-party CI reporting to OpenStack.
