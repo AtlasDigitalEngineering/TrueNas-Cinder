@@ -451,17 +451,9 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
 
         try:
             group_id = self.client.get_or_create_initiator_group([initiator])
-            extent_id = self.client.create_extent(
-                self.client.zvol_disk_path(pool, name), name)
-            rollback.append(('iSCSI extent %s' % extent_id,
-                             self.client.delete_extent, extent_id))
-
-            target_id = self.client.create_target(
-                name, group_id, self.portal_id)
-            rollback.append(('iSCSI target %s' % target_id,
-                             self.client.delete_target, target_id))
-
-            self.client.create_target_extent(target_id, extent_id)
+            extent_id = self._ensure_extent(pool, name, rollback)
+            target_id = self._ensure_target(name, group_id, rollback)
+            self._ensure_target_extent(target_id, extent_id)
 
             # Until the service reloads, everything above is inert: the
             # appliance accepts the configuration and no initiator can see
@@ -483,6 +475,105 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
             # teardown -- see remove_export.
             'provider_id': '%s:%s' % (target_id, extent_id),
         }
+
+    def _ensure_extent(self, pool, name, rollback):
+        """Return the volume's extent, creating it only if absent.
+
+        An earlier attach that failed after the export was built leaves the
+        extent behind, and Cinder does not always call `remove_export` to
+        clean it up (#62). Creating unconditionally then fails with "Extent
+        name must be unique" and the volume can never be attached again.
+
+        **A name match is not enough to adopt one.** If an extent of this
+        name is backed by a different zvol, adopting it would export another
+        volume's data into the instance. That is refused rather than
+        repaired, because there is no safe automatic answer.
+
+        Args:
+            pool: Pool the zvol lives in
+            name: Volume name, used for both the zvol and the extent
+            rollback: Cleanup stack; only appended to for what is created
+                here, never for something adopted
+
+        Returns:
+            Id of the extent backing this volume
+
+        Raises:
+            VolumeBackendAPIException: If an extent of this name exists but
+                is backed by a different disk
+        """
+        disk = self.client.zvol_disk_path(pool, name)
+        existing = self.client.get_extent_by_name(name)
+
+        if existing is None:
+            extent_id = self.client.create_extent(disk, name)
+            rollback.append(('iSCSI extent %s' % extent_id,
+                             self.client.delete_extent, extent_id))
+            return extent_id
+
+        if existing.get('disk') != disk:
+            raise exception.VolumeBackendAPIException(
+                data=_('An iSCSI extent named %(name)s already exists on '
+                       'the appliance but is backed by %(actual)s, not '
+                       '%(expected)s. Refusing to export it: it belongs to '
+                       'something else. Remove or rename it on the '
+                       'appliance before attaching this volume.')
+                % {'name': name, 'actual': existing.get('disk'),
+                   'expected': disk})
+
+        LOG.info('Reusing existing iSCSI extent %(id)s for %(name)s; it was '
+                 'left over from an earlier export.',
+                 {'id': existing['id'], 'name': name})
+        return existing['id']
+
+    def _ensure_target(self, name, group_id, rollback):
+        """Return the volume's target, creating it only if absent.
+
+        An adopted target carries the initiator group from whichever host
+        attached it last. Re-attaching elsewhere would otherwise appear to
+        succeed while the new initiator is refused by an access list naming
+        the old one, so the groups are repointed rather than accepted.
+
+        Args:
+            name: Volume name, used as the target name
+            group_id: Initiator group the attaching host belongs to
+            rollback: Cleanup stack; only appended to for what is created
+                here
+
+        Returns:
+            Id of the target for this volume
+        """
+        existing = self.client.get_target_by_name(name)
+
+        if existing is None:
+            target_id = self.client.create_target(name, group_id,
+                                                  self.portal_id)
+            rollback.append(('iSCSI target %s' % target_id,
+                             self.client.delete_target, target_id))
+            return target_id
+
+        wanted = self.client.target_groups(group_id, self.portal_id)
+        if existing.get('groups') != wanted:
+            LOG.info('Repointing iSCSI target %(id)s at initiator group '
+                     '%(group)s and portal %(portal)s.',
+                     {'id': existing['id'], 'group': group_id,
+                      'portal': self.portal_id})
+            self.client.update_target_groups(existing['id'], group_id,
+                                             self.portal_id)
+        else:
+            LOG.info('Reusing existing iSCSI target %(id)s for %(name)s.',
+                     {'id': existing['id'], 'name': name})
+        return existing['id']
+
+    def _ensure_target_extent(self, target_id, extent_id):
+        """Link the target to the extent unless they are already linked.
+
+        Args:
+            target_id: Target id
+            extent_id: Extent id
+        """
+        if self.client.get_target_extent(target_id, extent_id) is None:
+            self.client.create_target_extent(target_id, extent_id)
 
     def _provider_location(self, name):
         """Build the iSCSI discovery string Cinder stores and parses back.

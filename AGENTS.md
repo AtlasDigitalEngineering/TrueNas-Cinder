@@ -425,6 +425,30 @@ starts with all of them empty, so "restoring" the call fails CI.
 backend would silently accept no volumes at all, and nothing would say why.
 Capacity comes from `GET /pool`, which reports `size` and `free` in bytes.
 
+**`create_export` must stay idempotent, and adoption must stay verified.**
+Cinder does not always clean up after a failed attach: `attachment_delete`
+skips `remove_export` when the attachment has no connector recorded
+(*"None indicates we don't know and don't care"*), so an attach that fails on
+the compute side can leave a complete export behind. Creating unconditionally
+then fails with "Extent name must be unique" and the volume is **permanently
+unattachable** until someone removes it on the appliance by hand — found on a
+real deployment in #62.
+
+So `create_export` adopts what is already there. Two parts of that are load
+bearing:
+
+- **An extent is adopted only if its `disk` matches this volume's zvol.** A
+  name match alone would export a different volume's data into the instance.
+  A mismatch fails loudly and the extent is left untouched; there is no safe
+  automatic repair.
+- **An adopted target is repointed at the attaching host's initiator group.**
+  It carries whichever group attached it last, so re-attaching elsewhere
+  would otherwise appear to succeed while the new initiator is refused.
+
+Adopted resources are never added to the rollback stack — only what this call
+created. Rolling back something that existed beforehand could tear down an
+export this attach did not make.
+
 **An export is inert until the service reloads.** `create_export` reloads
 after building the pipeline, and rolls the whole thing back if that reload
 fails — configuration the appliance accepted but never activated is not an

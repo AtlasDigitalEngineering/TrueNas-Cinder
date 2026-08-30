@@ -1075,17 +1075,62 @@ class TrueNASAPIClient:
             )
         payload = {
             "name": target_name,
-            "groups": [
-                {
-                    "portal": portal_id,
-                    "initiator": initiator_group_id,
-                    "authmethod": "NONE",
-                }
-                for portal_id in portal_ids
-            ],
+            "groups": self.target_groups(initiator_group_id, portal_ids),
         }
         response = self._make_request("POST", "/iscsi/target", json=payload)
         return self._created_id(response, "iSCSI target")
+
+    @staticmethod
+    def target_groups(initiator_group_id, portal_ids):
+        """Build a target's ``groups`` payload.
+
+        Shared by :meth:`create_target` and :meth:`update_target_groups` so
+        the two cannot drift -- a target updated with a different shape than
+        it was created with would be a subtle and hard-to-spot bug.
+
+        Args:
+            initiator_group_id: Group of IQNs permitted to connect
+            portal_ids: One portal id, or a list of them
+
+        Returns:
+            List of group dicts for the ``groups`` field
+        """
+        if isinstance(portal_ids, int):
+            portal_ids = [portal_ids]
+        return [
+            {
+                "portal": portal_id,
+                "initiator": initiator_group_id,
+                "authmethod": "NONE",
+            }
+            for portal_id in portal_ids
+        ]
+
+    def update_target_groups(self, target_id, initiator_group_id,
+                             portal_ids):
+        """Repoint an existing target at an initiator group and portals.
+
+        Needed when adopting a target left behind by an earlier attach:
+        it carries the *previous* initiator group, so a volume re-attaching
+        on a different compute host would be denied by an access list that
+        still names the old one (#62).
+
+        Sends only ``groups``; every other field on the target is left as
+        it is.
+
+        Args:
+            target_id: Target to update
+            initiator_group_id: Group of IQNs permitted to connect
+            portal_ids: One portal id, or a list of them
+
+        Returns:
+            The updated target
+        """
+        return self._make_request(
+            "PUT", f"/iscsi/target/id/{target_id}",
+            json={"groups": self.target_groups(initiator_group_id,
+                                               portal_ids)},
+        )
 
     def delete_target(self, target_id: int) -> None:
         """
@@ -1114,6 +1159,45 @@ class TrueNASAPIClient:
             ``lunid``
         """
         return self._make_request("GET", "/iscsi/targetextent")
+
+    def get_target_extent(
+        self,
+        target_id: int,
+        extent_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Find the association between a specific target and extent.
+
+        Filtered on both fields at the appliance. As with
+        :meth:`_get_one_by_name`, more than one match means the filter was
+        not applied and the whole collection came back, so it is refused
+        rather than indexed into.
+
+        Args:
+            target_id: Target id
+            extent_id: Extent id
+
+        Returns:
+            The association, or None if the two are not linked
+
+        Raises:
+            TrueNASAPIError: If the appliance returns more than one match
+        """
+        rows = self._make_request(
+            "GET", "/iscsi/targetextent",
+            params={"target": target_id, "extent": extent_id},
+        )
+        if not rows:
+            return None
+        if len(rows) > 1:
+            raise TrueNASAPIError(
+                f"Expected at most one association between iSCSI target "
+                f"{target_id} and extent {extent_id} but got {len(rows)}. "
+                f"The filter appears to have been ignored; refusing to "
+                f"guess which one is correct.",
+                method="GET",
+                endpoint="/iscsi/targetextent",
+            )
+        return rows[0]
 
     def create_target_extent(
         self,
