@@ -49,6 +49,7 @@ an earlier version of this file said Jammy, which put the driver tests on
 .github/
   CODEOWNERS               # * @setkeh
   workflows/test.yml       # unit (3.12, 3.10) + driver (3.12) + flake8
+  workflows/image.yml      # build + publish the cinder-volume image on tag
   workflows/claude-code-review.yml
 truenas_cinder_driver/
   __init__.py      # exports TrueNASAPIClient, the exception hierarchy, __version__
@@ -67,6 +68,8 @@ tools/
 .env.example       # template; .env itself is gitignored
 docs/PLANNING.md   # why the project exists, its shape, milestone outcomes
 docs/configuration.md  # sample cinder.conf backend section + prerequisites
+docs/deployment.md     # building the image and deploying under Kolla
+images/cinder-volume/  # Dockerfile + build-time install check
 flake.nix          # dev shell: python312, uv, gh, LD_LIBRARY_PATH
 pyproject.toml     # packaging + ALL dependencies, via extras
 uv.lock            # pinned resolution of those, for reproducible installs
@@ -423,6 +426,21 @@ starts with all of them empty, so "restoring" the call fails CI.
 `reserved_percentage=100`, which the scheduler's capacity filter rejects — the
 backend would silently accept no volumes at all, and nothing would say why.
 Capacity comes from `GET /pool`, which reports `size` and `free` in bytes.
+
+**The image installs the driver with `--no-deps`, on purpose.** Its only
+runtime dependency is `requests`, which the Kolla base image already carries
+because Cinder depends on it. Letting pip resolve dependencies inside
+`/var/lib/kolla/venv` risks it upgrading a package underneath OpenStack to
+satisfy this driver, which is not a trade a storage driver gets to make.
+`images/cinder-volume/verify_install.py` checks the requirement explicitly and
+fails the **build** instead — along with importing the driver class, so an
+install that landed somewhere the service cannot see it breaks the build rather
+than crash-looping `cinder-volume` after a rollout.
+
+Never hardcode a site-packages path in that Dockerfile. Verified against the
+published image: it is `/var/lib/kolla/venv/lib/python3.12/site-packages` on
+2025.1-ubuntu-noble, and both the prefix and the version move between releases.
+`pip` already knows; let it decide.
 
 **`create_export` must stay idempotent, and adoption must stay verified.**
 Cinder does not always clean up after a failed attach: `attachment_delete`
