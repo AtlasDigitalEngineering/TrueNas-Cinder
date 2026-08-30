@@ -173,13 +173,23 @@ volume is deleted:
 - the **volume** that snapshot belongs to cannot be deleted either — it reports
   busy and stays `available`.
 
-Deleting the derived volume itself always works, and clears both.
+Deleting the derived volume itself always works, and lifts both blocks.
 
 Cloning a volume takes a snapshot of it first, because ZFS can only clone a
 snapshot. That snapshot is named `snapshot-clone-src-<volume>` and is kept
-deliberately — the clone's blocks are defined by it. It is what makes the
-source report busy, and it is named as Cinder's so the delete failure says so
-rather than blaming an unknown snapshot task.
+while the clone lives — the clone's blocks are defined by it. It is what makes
+the source report busy, and it is named as Cinder's so the delete failure says
+so rather than blaming an unknown snapshot task.
+
+**It is reclaimed when the clone is deleted.** That matters more than it
+sounds: this snapshot has no Cinder object of its own, never appears in
+`cinder snapshot-list`, and so could not be removed through Cinder by anyone.
+Left behind it would go on blocking the source volume's delete permanently
+rather than temporarily, and only someone in the TrueNAS UI who knew to look
+for `snapshot-clone-src-*` could clear it. The driver reads the zvol's
+`origin` before deleting it and removes that snapshot afterwards, but only
+when the name marks it as one taken for a clone — a volume created from a
+*Cinder* snapshot also has an origin, and that one belongs to Cinder.
 
 **The driver does not promote clones.** Promotion is often suggested as the fix
 for the above; it is not. It reverses the dependency rather than removing it —

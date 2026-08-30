@@ -727,6 +727,11 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
                 reason
         """
         pool = self.configuration.truenas_pool
+        # Read before the zvol goes away: after the delete there is nothing
+        # left to ask. A clone-source snapshot has no Cinder object, so if
+        # it is not reclaimed here nothing ever reclaims it -- and it goes
+        # on blocking the source volume's own delete forever.
+        origin = self._reclaimable_clone_source(pool, volume)
         try:
             self.client.delete_zvol(pool, volume.name, recursive=False)
         except api_client.TrueNASAPINotFoundError:
@@ -738,6 +743,16 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         else:
             LOG.info('Deleted zvol %(pool)s/%(name)s.',
                      {'pool': pool, 'name': volume.name})
+
+        if origin:
+            # Best effort: the volume is already gone, so failing here
+            # would report a successful delete as a failure and invite a
+            # retry that cannot succeed.
+            LOG.info('Reclaiming the clone-source snapshot %s, which existed '
+                     'only to back the volume just deleted.', origin)
+            self.client.best_effort_delete(
+                self.client.delete_snapshot, origin,
+                what=f'clone-source snapshot {origin}')
 
     def _raise_delete_failure(self, volume, pool, exc):
         """Re-raise a failed zvol delete, naming snapshots when they caused it.
@@ -1187,6 +1202,11 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         recognisable rather than hidden, and it is what makes the source
         volume report itself busy on delete until this volume is gone.
 
+        The snapshot is reclaimed by :meth:`delete_volume` when this
+        volume is deleted. It has no Cinder object of its own, so nothing
+        else could ever remove it, and leaving it would block the source
+        volume's delete permanently rather than temporarily.
+
         Not promoted, for the reasons in
         :meth:`create_volume_from_snapshot`.
 
@@ -1230,6 +1250,64 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
                  {'source': dataset, 'pool': pool, 'name': volume.name,
                   'snapshot': snapshot_id})
 
+    def _reclaimable_clone_source(self, pool, volume):
+        """Return the clone-source snapshot backing this volume, if any.
+
+        Only ever returns a snapshot **this driver created to serve a
+        clone**. A volume made by :meth:`create_volume_from_snapshot` also
+        has an ``origin``, but that origin is a real Cinder snapshot with
+        its own lifecycle and its own delete path -- removing it here would
+        destroy an object Cinder still believes exists.
+
+        The two are told apart by name, which is why
+        :meth:`_clone_source_snapshot_name` builds a distinctive one.
+
+        Never raises. The lookup is a courtesy ahead of a delete that has
+        to proceed regardless.
+
+        Args:
+            pool: Pool the zvol lives in
+            volume: The Cinder volume about to be deleted
+
+        Returns:
+            The full snapshot id to reclaim, or None
+        """
+        try:
+            zvol = self.client.get_zvol(pool, volume.name)
+        except api_client.TrueNASAPIError:
+            return None
+
+        origin = zvol.get('origin')
+        if isinstance(origin, dict):
+            origin = origin.get('rawvalue')
+        if not origin:
+            return None
+
+        _dataset, _sep, name = str(origin).rpartition('@')
+        return origin if self._is_clone_source_snapshot(name) else None
+
+    def _is_clone_source_snapshot(self, snapshot_name):
+        """Decide whether a snapshot name is one taken to back a clone.
+
+        Args:
+            snapshot_name: Bare snapshot name, without the dataset or ``@``
+
+        Returns:
+            True if this driver created it for :meth:`create_cloned_volume`
+        """
+        return snapshot_name.startswith(self._clone_source_prefix())
+
+    def _clone_source_prefix(self):
+        """Return the naming prefix shared by clone-source snapshots.
+
+        Returns:
+            The prefix, carrying ``snapshot_name_template``'s own
+        """
+        template = (self.configuration.safe_get('snapshot_name_template')
+                    or DEFAULT_SNAPSHOT_NAME_TEMPLATE)
+        prefix = template.split('%s')[0] or 'snapshot-'
+        return '%sclone-src-' % prefix
+
     def _clone_source_snapshot_name(self, volume):
         """Name the snapshot a clone is taken from.
 
@@ -1248,10 +1326,7 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         Returns:
             A snapshot name, unique to that volume
         """
-        template = (self.configuration.safe_get('snapshot_name_template')
-                    or DEFAULT_SNAPSHOT_NAME_TEMPLATE)
-        prefix = template.split('%s')[0] or 'snapshot-'
-        return '%sclone-src-%s' % (prefix, volume.name)
+        return '%s%s' % (self._clone_source_prefix(), volume.name)
 
     # ------------------------------------------------------------------
     # Adoption (#20)
