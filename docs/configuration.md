@@ -7,8 +7,11 @@ never creates or changes them: they are appliance-wide, shared by every volume
 and every `cinder-volume` worker, so provisioning a volume must not have them as
 a side effect.
 
-1. **An API key for a service account.** Credentials → API Keys in the TrueNAS
-   UI. The driver authenticates with a Bearer key, not a username and password.
+1. **An API key whose account has `FULL_ADMIN`.** Credentials → API Keys in
+   the TrueNAS UI. The driver authenticates with a Bearer key, not a username
+   and password. A scoped or read-only account **does not work** — see
+   [The API key needs a full-admin account](#the-api-key-needs-a-full-admin-account)
+   before planning around least privilege.
 2. **A ZFS pool** for volumes. Volumes are created in it as zvols.
 3. **The iSCSI service running, and enabled at boot.** System Settings →
    Services → iSCSI. If it is stopped the driver refuses to start — with good
