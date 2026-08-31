@@ -284,6 +284,24 @@ offers no way out of that short of a full copy.
 JSON object is counted as a second positional argument and rejected with
 `Too many arguments (expected 1, found 2)`.
 
+**API keys only work for accounts with `FULL_ADMIN`.** Granular roles are
+denied for API-key authentication on TrueNAS-25.10.5 — `READONLY_ADMIN` cannot
+even `GET /pool`. Measured in #60 by granting one role set at a time to a
+throwaway account and replaying the same requests, with an A-B-A control to
+rule out ordering or caching. Only the **read** roles were measured; that the
+write roles also fail is inference from `READONLY_ADMIN` being unable to read
+at all. Least privilege is therefore not available to
+this driver, and the key is effectively root on the appliance: say so rather
+than implying a scoped key is possible. The set to retry on a future release
+is in `docs/configuration.md`.
+
+**401 and 403 mean opposite things and used to read identically.** 401 is the
+key being rejected; 403 is a valid key whose account lacks a role. Telling an
+operator to check their key when the key is fine sends them to reissue it and
+hit the same error — which is what happened on the M1 acceptance run (#59).
+Both still raise `TrueNASAPIAuthError`, so `except` clauses are unaffected;
+only the message differs.
+
 **Never point tests or exploration at the production TrueNAS.** It holds every
 production VM disk as a zvol, and those are the migration's only copy. Use the
 dev appliance and a scratch pool; the functional suite refuses to run

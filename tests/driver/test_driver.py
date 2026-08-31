@@ -164,6 +164,55 @@ class TestDoSetup(DriverTestCase):
         request.assert_not_called()
 
 
+class TestAuthFailureMessages(DriverTestCase):
+    """The line an operator reads when the service will not start.
+
+    #59 is the case that matters: a Sharing Admin key produced "check that
+    it is a valid, unrevoked key", so the obvious next step was to reissue
+    the key -- which cannot help, because the key was never the problem.
+    """
+
+    def _fail_with(self, status):
+        driver = self._driver()
+        driver.client.get_pool_list.side_effect = (
+            api_client.TrueNASAPIAuthError('HTTP %s' % status,
+                                           status_code=status))
+        with self.assertRaises(exception.InvalidInput) as caught:
+            driver.check_for_setup_error()
+        return str(caught.exception)
+
+    def test_403_tells_the_operator_not_to_reissue_the_key(self):
+        message = self._fail_with(403)
+
+        self.assertIn('do not reissue', message)
+        self.assertIn('FULL_ADMIN', message)
+
+    def test_401_tells_the_operator_to_issue_a_new_key(self):
+        message = self._fail_with(401)
+
+        self.assertIn('Issue a new key', message)
+        self.assertIn('not a role problem', message)
+
+    def test_the_two_messages_are_not_interchangeable(self):
+        # A wrapper that mentioned both remedies would satisfy each
+        # assertion above while telling the operator to try both things --
+        # which is what the single previous message effectively did.
+        unauthorised = self._fail_with(401)
+        forbidden = self._fail_with(403)
+
+        self.assertNotEqual(unauthorised, forbidden)
+        self.assertNotIn('do not reissue', unauthorised)
+        self.assertNotIn('Issue a new key', forbidden)
+
+    def test_an_auth_error_with_no_status_is_treated_as_a_bad_key(self):
+        # status_code is optional on the exception. Defaulting to the
+        # role branch would tell someone their roles are wrong on the
+        # strength of no evidence at all.
+        message = self._fail_with(None)
+
+        self.assertIn('Issue a new key', message)
+
+
 class TestSetupValidation(DriverTestCase):
     """check_for_setup_error, one failure mode at a time."""
 

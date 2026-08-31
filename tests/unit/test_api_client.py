@@ -2154,6 +2154,51 @@ class TestAuthMapping(TrueNASAPIClientTestCase):
         with self.assertRaises(TrueNASAPIError):
             self.client.get_pool_list()
 
+    def test_403_says_the_key_is_valid_and_the_role_is_not(self):
+        # The remedies are opposite. An operator told to check their key
+        # will reissue a key that was never the problem, and hit the same
+        # 403 again -- which is what happened on the M1 acceptance run
+        # with a Sharing Admin key (#59, #60).
+        self._set_error(403, text="Forbidden")
+
+        with self.assertRaises(TrueNASAPIAuthError) as ctx:
+            self.client.get_pool_list()
+
+        message = str(ctx.exception)
+        self.assertIn("do not reissue", message)
+        # Names the role that works. "grant the roles in the docs" pointed
+        # at the eleven-role table, which is documented as returning 403 --
+        # and at a repo path an operator inside a container cannot open.
+        self.assertIn("FULL_ADMIN", message)
+        self.assertNotIn("docs/configuration.md", message)
+
+    def test_401_says_the_key_itself_was_rejected(self):
+        self._set_error(401, text="Invalid API key")
+
+        with self.assertRaises(TrueNASAPIAuthError) as ctx:
+            self.client.get_pool_list()
+
+        message = str(ctx.exception)
+        self.assertIn("Issue a new one", message)
+        self.assertIn("not a role problem", message)
+
+    def test_the_two_messages_are_not_interchangeable(self):
+        # A single shared message would pass both tests above only by
+        # mentioning everything, which is how the original one managed to
+        # be unhelpful in both directions at once.
+        self._set_error(401, text="Invalid API key")
+        with self.assertRaises(TrueNASAPIAuthError) as unauthorised:
+            self.client.get_pool_list()
+
+        self._set_error(403, text="Forbidden")
+        with self.assertRaises(TrueNASAPIAuthError) as forbidden:
+            self.client.get_pool_list()
+
+        self.assertNotEqual(str(unauthorised.exception),
+                            str(forbidden.exception))
+        self.assertNotIn("do not reissue", str(unauthorised.exception))
+        self.assertNotIn("Issue a new one", str(forbidden.exception))
+
 
 class TestTimeouts(TrueNASAPIClientTestCase):
     """Every request is bounded; an unbounded one wedges a cinder worker."""

@@ -7,8 +7,11 @@ never creates or changes them: they are appliance-wide, shared by every volume
 and every `cinder-volume` worker, so provisioning a volume must not have them as
 a side effect.
 
-1. **An API key for a service account.** Credentials → API Keys in the TrueNAS
-   UI. The driver authenticates with a Bearer key, not a username and password.
+1. **An API key whose account has `FULL_ADMIN`.** Credentials → API Keys in
+   the TrueNAS UI. The driver authenticates with a Bearer key, not a username
+   and password. A scoped or read-only account **does not work** — see
+   [The API key needs a full-admin account](#the-api-key-needs-a-full-admin-account)
+   before planning around least privilege.
 2. **A ZFS pool** for volumes. Volumes are created in it as zvols.
 3. **The iSCSI service running, and enabled at boot.** System Settings →
    Services → iSCSI. If it is stopped the driver refuses to start — with good
@@ -60,6 +63,59 @@ truenas_verify_ssl = true
 `truenas_api_key` is declared `secret=True`, so oslo_config redacts it from
 logged configuration dumps. It is still plain text in `cinder.conf` — protect
 that file as you would any other credential store.
+
+## The API key needs a full-admin account
+
+**The account the API key belongs to must hold `FULL_ADMIN`.** Granular roles
+do not work for API-key authentication on TrueNAS 25.10.5 — not even
+`READONLY_ADMIN` for plain reads.
+
+This is not the driver being greedy. It was measured on the appliance: a
+throwaway account was granted one role set at a time and the same requests
+replayed with its key.
+
+| Roles on the key's account | `GET /pool` | `GET /pool/dataset` | `GET /iscsi/extent` | `GET /service` |
+|---|---|---|---|---|
+| `FULL_ADMIN` | 200 | 200 | 200 | 200 |
+| `SHARING_ADMIN` | 403 | 403 | 403 | 403 |
+| `READONLY_ADMIN` | 403 | 403 | 403 | 403 |
+| `POOL_READ` | 403 | 403 | 403 | 403 |
+| `DATASET_READ` | 403 | 403 | 403 | 403 |
+| `SHARING_ISCSI_READ` | 403 | 403 | 403 | 403 |
+| all five read roles together | 403 | 403 | 403 | 403 |
+
+Run as `FULL_ADMIN → others → FULL_ADMIN`, so the result is not an artefact of
+ordering or caching.
+
+**Only the read roles were measured.** The write and delete roles in the retry
+list below were not granted or exercised — the conclusion that they would also
+fail is inference, not measurement. It is a short inference, since an account
+that cannot complete `GET /pool` under `READONLY_ADMIN` is not going to
+complete a write under `DATASET_WRITE`, but it is worth labelling so nobody
+later reads the table as covering more than it does.
+
+Worth knowing before you plan around least privilege: **a scoped key for this
+driver is not currently possible.** Treat the key as equivalent to root on the
+appliance, and protect `cinder.conf` accordingly.
+
+If a future TrueNAS release changes this, the smallest set to retry is
+`POOL_READ`, `DATASET_READ`, `DATASET_WRITE`, `DATASET_DELETE`,
+`SNAPSHOT_READ`, `SNAPSHOT_WRITE`, `SNAPSHOT_DELETE`, `SHARING_ISCSI_READ`,
+`SHARING_ISCSI_WRITE`, `SERVICE_READ`, `SERVICE_WRITE` — which is what the
+driver actually calls.
+
+### Telling a bad key apart from an unprivileged one
+
+The two look alike and need opposite fixes, so the driver distinguishes them:
+
+| Status | Meaning | What to do |
+|---|---|---|
+| `401` | The key is wrong, revoked or expired | Issue a new key. **Not** a role problem. |
+| `403` | The key is valid; the account lacks the role | Grant `FULL_ADMIN`. **Do not** reissue the key. |
+
+A `403` at startup now reads `The key was accepted, so it is valid -- the
+account it belongs to lacks the role this call needs.` That is the case an
+operator is most likely to hit, and reissuing the key will not fix it.
 
 ## Options
 

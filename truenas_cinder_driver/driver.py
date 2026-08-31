@@ -186,16 +186,28 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
             List of pools, reused by the pool check rather than re-fetched
 
         Raises:
-            InvalidInput: If the API key is rejected
+            InvalidInput: If the API key is rejected, or accepted but
+                unprivileged. The two get different messages, because the
+                remedies are opposite -- this is the line an operator
+                actually reads when the service refuses to start, so
+                leading with "check your key" when the key is fine sends
+                them to reissue it and meet the identical error (#59).
             VolumeBackendAPIException: If the appliance cannot be reached
         """
         try:
             return self.client.get_pool_list()
         except api_client.TrueNASAPIAuthError as exc:
-            raise exception.InvalidInput(
-                reason=_('TrueNAS rejected truenas_api_key. Check that it '
-                         'is a valid, unrevoked key for a service account '
-                         'with sufficient privileges. %s') % exc)
+            if exc.status_code == 403:
+                reason = _('The TrueNAS account behind truenas_api_key does '
+                           'not have the role this driver needs. The key '
+                           'itself is valid, so do not reissue it -- grant '
+                           'that account FULL_ADMIN. %s') % exc
+            else:
+                reason = _('TrueNAS rejected truenas_api_key: it is wrong, '
+                           'revoked or expired. Issue a new key and set '
+                           'truenas_api_key. This is not a role '
+                           'problem. %s') % exc
+            raise exception.InvalidInput(reason=reason)
         except api_client.TrueNASAPIError as exc:
             raise exception.VolumeBackendAPIException(
                 data=_('Cannot reach the TrueNAS appliance at '
