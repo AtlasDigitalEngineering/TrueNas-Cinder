@@ -74,11 +74,10 @@ def driver(config, pool, request, portals, portal_addresses, iscsi_service):
 
 
 @pytest.fixture
-def foreign_zvol(client, pool, names, cleanup):
+def foreign_zvol(client, pool, names, cleanup, destroy_zvol):
     """A zvol created out of band, as a hand-provisioned disk would be."""
     client.create_zvol(pool, names.zvol, size_gb=1)
-    cleanup(f"foreign zvol {names.zvol}", client.delete_zvol, pool,
-            names.zvol)
+    cleanup(f"foreign zvol {names.zvol}", destroy_zvol, pool, names.zvol)
     return names.zvol
 
 
@@ -219,3 +218,119 @@ def test_unmanage_touches_nothing_on_the_appliance(
     after = client.get_zvol(pool, foreign_zvol)
     assert after["creation"]["rawvalue"] == before["creation"]["rawvalue"]
     assert after["volsize"]["parsed"] == before["volsize"]["parsed"]
+
+
+def _entry_for(entries, pool, name):
+    wanted = f"{pool}/{name}"
+    for entry in entries:
+        if entry["reference"]["source-name"] == wanted:
+            return entry
+    return None
+
+
+def test_the_listing_finds_an_adoptable_zvol(driver, pool, foreign_zvol):
+    entries = driver.get_manageable_volumes(
+        [], None, 1000, 0, ["reference"], ["asc"])
+
+    entry = _entry_for(entries, pool, foreign_zvol)
+    assert entry is not None, "the zvol under test was not listed"
+    assert entry["safe_to_manage"] is True
+    assert entry["reason_not_safe"] is None
+    assert entry["size"] == 1
+
+
+def test_a_listed_reference_is_one_adoption_accepts(
+        driver, pool, foreign_zvol):
+    # The listing exists to feed `cinder manage`. If the reference it
+    # hands out is not one the driver parses, the feature is decorative.
+    entries = driver.get_manageable_volumes(
+        [], None, 1000, 0, ["reference"], ["asc"])
+    entry = _entry_for(entries, pool, foreign_zvol)
+
+    assert driver.manage_existing_get_size(
+        _Volume("unused"), entry["reference"]) == 1
+
+
+def test_an_exported_zvol_is_listed_unsafe_and_names_its_export(
+        client, driver, pool, foreign_zvol, names, portals, cleanup):
+    disk = client.zvol_disk_path(pool, foreign_zvol)
+    group = client.get_or_create_initiator_group([names.iqn])
+    cleanup(f"initiator group {group}", client._make_request,
+            "DELETE", f"/iscsi/initiator/id/{group}")
+    extent = client.create_extent(disk, names.extent)
+    cleanup(f"extent {extent}", client.delete_extent, extent)
+    target = client.create_target(names.target, group, portals)
+    cleanup(f"target {target}", client.delete_target, target)
+    client.create_target_extent(target, extent)
+
+    entries = driver.get_manageable_volumes(
+        [], None, 1000, 0, ["reference"], ["asc"])
+    entry = _entry_for(entries, pool, foreign_zvol)
+
+    assert entry["safe_to_manage"] is False
+    assert f"target {target}" in entry["reason_not_safe"]
+    assert f"extent {extent}" in entry["reason_not_safe"]
+
+
+def test_a_volume_with_a_live_session_is_listed_as_in_use(client, driver,
+                                                          pool):
+    """The in-use path, against a genuinely attached volume.
+
+    Skipped when nothing is attached. Constructing a real iSCSI session
+    from here would need an initiator and root, which is #90 -- but when
+    the appliance happens to be serving one, that is the strongest
+    available evidence that this branch works.
+    """
+    sessions = client.get_iscsi_sessions()
+    if not sessions:
+        pytest.skip("no live iSCSI session on the appliance to observe")
+
+    entries = driver.get_manageable_volumes(
+        [], None, 1000, 0, ["reference"], ["asc"])
+    unsafe = [e for e in entries
+              if e["reason_not_safe"] and "in use" in e["reason_not_safe"]]
+
+    assert unsafe, (
+        f"{len(sessions)} live session(s) exist but no entry reports one; "
+        f"targets in session: "
+        f"{[s.get('target') for s in sessions]}")
+    for entry in unsafe:
+        assert entry["safe_to_manage"] is False
+        assert any(s.get("initiator") in entry["reason_not_safe"]
+                   for s in sessions)
+
+
+def test_an_already_managed_volume_reports_its_cinder_id(
+        client, driver, pool):
+    # Any zvol named volume-<uuid> that Cinder claims to manage.
+    entries = driver.get_manageable_volumes(
+        [], None, 1000, 0, ["reference"], ["asc"])
+    named = [e for e in entries
+             if e["reference"]["source-name"].rsplit("/", 1)[-1]
+             .startswith("volume-")]
+    if not named:
+        pytest.skip("no volume-<uuid> zvol on the appliance to claim")
+
+    uuid = named[0]["reference"]["source-name"].rsplit("/volume-", 1)[-1]
+    entries = driver.get_manageable_volumes(
+        [{"id": uuid}], None, 1000, 0, ["reference"], ["asc"])
+
+    entry = next(e for e in entries if e["cinder_id"] == uuid)
+    assert entry["safe_to_manage"] is False
+    assert "already managed" in entry["reason_not_safe"]
+
+
+def test_the_snapshot_listing_points_at_its_volume(
+        client, driver, pool, foreign_zvol, names, cleanup):
+    client.create_snapshot(f"{pool}/{foreign_zvol}", names.snapshot)
+
+    entries = driver.get_manageable_snapshots(
+        [], None, 1000, 0, ["reference"], ["asc"])
+    wanted = client.snapshot_id(pool, foreign_zvol, names.snapshot)
+    entry = next((e for e in entries
+                  if e["reference"]["source-name"] == wanted), None)
+
+    assert entry is not None, "the snapshot under test was not listed"
+    assert entry["source_reference"]["source-name"] == foreign_zvol
+    # A ZFS snapshot has no size of its own; Cinder wants the volume's.
+    assert entry["size"] == 1

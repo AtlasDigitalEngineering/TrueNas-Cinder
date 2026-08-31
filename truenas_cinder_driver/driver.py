@@ -17,6 +17,7 @@ from cinder import exception
 from cinder.i18n import _
 from cinder.volume import configuration
 from cinder.volume.drivers.san import san
+from cinder.volume import volume_utils
 
 from truenas_cinder_driver import __version__
 from truenas_cinder_driver import api_client
@@ -1340,6 +1341,213 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         """
         return '%s%s' % (self._clone_source_prefix(), volume.name)
 
+    def get_manageable_volumes(self, cinder_volumes, marker, limit, offset,
+                               sort_keys, sort_dirs):
+        """List zvols in the pool that Cinder could adopt.
+
+        This is the discovery half of :meth:`manage_existing`. Without it
+        an operator planning a migration has to enumerate zvols on the
+        appliance by hand and work out which are adoptable, which assumes
+        familiarity with TrueNAS that the person driving OpenStack may not
+        have.
+
+        ``safe_to_manage`` answers the same question the adoption gate
+        does, through the same helpers, so the listing cannot drift from
+        what an adoption would actually do. A volume reported safe here is
+        one :meth:`manage_existing` would accept.
+
+        The appliance's iSCSI collections are read **once** for the whole
+        listing rather than once per zvol. The per-adoption cost is
+        different and deliberate -- see :meth:`_clear_conflicting_export`.
+
+        Args:
+            cinder_volumes: Volumes Cinder already manages on this host
+            marker: Last item of the previous page
+            limit: Maximum entries to return
+            offset: Entries to skip after the marker
+            sort_keys: Keys to sort by
+            sort_dirs: Directions for those keys
+
+        Returns:
+            One entry per zvol, in Cinder's manageable-listing shape
+
+        Raises:
+            VolumeBackendAPIException: If the appliance could not be read
+        """
+        pool = self.configuration.truenas_pool
+        cinder_ids = [volume['id'] for volume in cinder_volumes]
+
+        try:
+            zvols = self.client.list_zvols(pool)
+            extents = self.client.get_extents()
+            links = self.client.get_target_extents()
+            targets = self.client.get_targets()
+            sessions = self.client.get_iscsi_sessions()
+        except api_client.TrueNASAPIError as exc:
+            raise exception.VolumeBackendAPIException(
+                data=_('Could not list manageable volumes in pool '
+                       '%(pool)s: %(err)s') % {'pool': pool, 'err': exc})
+
+        entries = []
+        for zvol in zvols:
+            name = zvol['name'][len(pool) + 1:]
+            entries.append(self._manageable_entry(
+                pool, name, zvol, cinder_ids, extents, links, targets,
+                sessions))
+
+        return volume_utils.paginate_entries_list(
+            entries, marker, limit, offset, sort_keys, sort_dirs)
+
+    def get_manageable_snapshots(self, cinder_snapshots, marker, limit,
+                                 offset, sort_keys, sort_dirs):
+        """List ZFS snapshots Cinder could adopt.
+
+        Only snapshots of zvols this pool holds are listed. A snapshot is
+        adoptable onto its own volume and no other, so the entry carries
+        ``source_reference`` naming that volume -- an operator adopting one
+        needs the volume adopted first, and this is where they find out
+        which.
+
+        Unlike volumes, there is no export to reason about: a snapshot
+        cannot be attached, so nothing makes one unsafe except already
+        being managed.
+
+        Args:
+            cinder_snapshots: Snapshots Cinder already manages on this host
+            marker: Last item of the previous page
+            limit: Maximum entries to return
+            offset: Entries to skip after the marker
+            sort_keys: Keys to sort by
+            sort_dirs: Directions for those keys
+
+        Returns:
+            One entry per snapshot, in Cinder's manageable-listing shape
+
+        Raises:
+            VolumeBackendAPIException: If the appliance could not be read
+        """
+        pool = self.configuration.truenas_pool
+        cinder_ids = [snapshot['id'] for snapshot in cinder_snapshots]
+
+        try:
+            zvols = self.client.list_zvols(pool)
+            # One unfiltered read, then scoped here. Asking per dataset
+            # would be a request per zvol -- the same N+1 the volume
+            # listing exists to avoid, and worse on the estates this
+            # feature is for.
+            #
+            # `get_snapshot_list()` warns against the unfiltered form
+            # because it returns the appliance's own boot-pool snapshots
+            # too, which is easy to misread as "ours". Scoping to the
+            # zvols just listed is exact -- stricter than a name prefix,
+            # since it also excludes snapshots of filesystem datasets
+            # sharing the pool.
+            datasets = {zvol['name'] for zvol in zvols}
+            snapshots = [snapshot
+                         for snapshot in self.client.get_snapshot_list() or []
+                         if snapshot.get('dataset') in datasets]
+        except api_client.TrueNASAPIError as exc:
+            raise exception.VolumeBackendAPIException(
+                data=_('Could not list manageable snapshots in pool '
+                       '%(pool)s: %(err)s') % {'pool': pool, 'err': exc})
+
+        sizes = {zvol['name']: self._zvol_size_gb(zvol) for zvol in zvols}
+
+        entries = []
+        for snapshot in snapshots:
+            dataset = snapshot['dataset']
+            name = snapshot['snapshot_name']
+            entry = {
+                'reference': {'source-name': snapshot['id']},
+                # A ZFS snapshot has no size of its own; Cinder wants the
+                # volume's, and requires the two to agree.
+                'size': sizes.get(dataset, 0),
+                'cinder_id': None,
+                'extra_info': None,
+                'safe_to_manage': True,
+                'reason_not_safe': None,
+                'source_reference': {
+                    'source-name': dataset[len(pool) + 1:]},
+            }
+            managed = volume_utils.extract_id_from_snapshot_name(name)
+            if managed in cinder_ids:
+                entry['cinder_id'] = managed
+                entry['safe_to_manage'] = False
+                entry['reason_not_safe'] = _('already managed')
+            entries.append(entry)
+
+        return volume_utils.paginate_entries_list(
+            entries, marker, limit, offset, sort_keys, sort_dirs)
+
+    def _manageable_entry(self, pool, name, zvol, cinder_ids, extents,
+                          links, targets, sessions):
+        """Describe one zvol for the manageable listing.
+
+        Args:
+            pool: Pool the zvol lives in
+            name: Zvol name relative to the pool
+            zvol: The zvol's metadata
+            cinder_ids: Ids of volumes Cinder already manages here
+            extents: All extent rows
+            links: All target-extent rows
+            targets: All target rows
+            sessions: All live iSCSI sessions
+
+        Returns:
+            One manageable-listing entry
+        """
+        entry = {
+            'reference': {'source-name': '%s/%s' % (pool, name)},
+            'size': self._zvol_size_gb(zvol),
+            'cinder_id': None,
+            'extra_info': None,
+            'safe_to_manage': True,
+            'reason_not_safe': None,
+        }
+
+        managed = volume_utils.extract_id_from_volume_name(name)
+        if managed in cinder_ids:
+            entry['cinder_id'] = managed
+            entry['safe_to_manage'] = False
+            entry['reason_not_safe'] = _('already managed')
+            return entry
+
+        disk = self.client.zvol_disk_path(pool, name)
+        exported = self._extents_for_disk(extents, disk)
+        if not exported:
+            return entry
+
+        serving = self._targets_for_extents(exported, links, targets)
+        live = self._sessions_matching(serving, sessions)
+        if live:
+            # Refused whatever the configuration says, so it is never
+            # safe -- reporting otherwise would invite an adoption that
+            # cannot succeed.
+            entry['safe_to_manage'] = False
+            entry['reason_not_safe'] = _(
+                'in use: %(count)d live iSCSI session(s) from %(who)s') % {
+                    'count': len(live),
+                    'who': ', '.join(sorted(
+                        session.get('initiator') or '?'
+                        for session in live))}
+            return entry
+
+        if self.configuration.truenas_adopt_removes_export:
+            # The driver will clear it, so adoption would succeed. Say
+            # what will happen rather than reporting a bare "safe".
+            entry['extra_info'] = _(
+                'an idle iSCSI export exists and will be removed on adopt')
+            return entry
+
+        entry['safe_to_manage'] = False
+        entry['reason_not_safe'] = _(
+            'exported over iSCSI by %(what)s; remove it, or set '
+            'truenas_adopt_removes_export') % {
+                'what': ', '.join(
+                    ['target %s' % target['id'] for target in serving]
+                    + ['extent %s' % extent['id'] for extent in exported])}
+        return entry
+
     # ------------------------------------------------------------------
     # Adoption (#20)
     #
@@ -1609,18 +1817,22 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         """
         disk = self.client.zvol_disk_path(pool, name)
         try:
-            extents = [extent for extent in self.client.get_extents()
-                       if extent.get('disk') == disk]
+            # Fetched lazily and in this order on purpose. Most adoptions
+            # find nothing here, and returning after one request rather
+            # than four is the difference between a migration that drags
+            # and one that does not (#72). The collections are read whole
+            # rather than filtered server-side: an unrecognised filter
+            # field answers 200 with an empty list rather than an error,
+            # so a renamed field would read as "no export exists" and this
+            # gate would wave through a zvol that something is serving.
+            extents = self._extents_for_disk(self.client.get_extents(), disk)
             if not extents:
                 LOG.debug('No iSCSI extent references %s; safe to adopt.',
                           disk)
                 return
-            extent_ids = {extent['id'] for extent in extents}
-            links = [link for link in self.client.get_target_extents()
-                     if link.get('extent') in extent_ids]
-            target_ids = {link['target'] for link in links}
-            targets = [target for target in self.client.get_targets()
-                       if target['id'] in target_ids]
+            targets = self._targets_for_extents(
+                extents, self.client.get_target_extents(),
+                self.client.get_targets())
             sessions = self._sessions_for(targets)
         except api_client.TrueNASAPIError as exc:
             raise exception.VolumeBackendAPIException(
@@ -1659,11 +1871,41 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
 
         self._remove_conflicting_export(disk, targets, extents)
 
+    @staticmethod
+    def _extents_for_disk(extents, disk):
+        """Return the extents pointing at one zvol.
+
+        Args:
+            extents: Extent rows from the appliance
+            disk: Zvol disk path, ``zvol/<pool>/<name>``
+
+        Returns:
+            The matching extent rows
+        """
+        return [extent for extent in extents if extent.get('disk') == disk]
+
+    @staticmethod
+    def _targets_for_extents(extents, links, targets):
+        """Return the targets serving a set of extents.
+
+        Args:
+            extents: Extent rows to resolve
+            links: Target-extent rows from the appliance
+            targets: Target rows from the appliance
+
+        Returns:
+            The target rows linked to any of those extents
+        """
+        extent_ids = {extent['id'] for extent in extents}
+        target_ids = {link['target'] for link in links
+                      if link.get('extent') in extent_ids}
+        return [target for target in targets if target['id'] in target_ids]
+
     def _sessions_for(self, targets):
         """Return the live iSCSI sessions served by any of these targets.
 
-        Sessions name their target by full IQN rather than by id, so the
-        comparison is built from the basename resolved during setup.
+        Fetches the sessions itself, for the per-adoption path where they
+        are only needed once an export has already been found.
 
         Args:
             targets: Target rows from the appliance
@@ -1673,9 +1915,39 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         """
         if not targets:
             return []
+        return self._sessions_matching(targets,
+                                       self.client.get_iscsi_sessions())
+
+    def _sessions_matching(self, targets, sessions):
+        """Return which of these sessions are served by these targets.
+
+        Sessions name their target by full IQN rather than by id, so the
+        comparison is built from the basename resolved during setup.
+
+        Matching the whole IQN rather than the part after the last colon
+        is defensive rather than load-bearing: the basename is
+        appliance-global, so in practice every session carries the one
+        this driver resolved at setup. It is an exact comparison against a
+        value already in hand, which costs nothing, and it means a session
+        naming some other appliance's target cannot be read as evidence
+        that *our* zvol is busy.
+
+        One mechanism, used by both the adoption gate and the manageable
+        listing, so the two cannot disagree about whether a zvol is in
+        use.
+
+        Args:
+            targets: Target rows to check
+            sessions: Session rows to filter
+
+        Returns:
+            The matching session rows, empty if none
+        """
+        if not targets:
+            return []
         iqns = {'%s:%s' % (self.iscsi_basename, target['name'])
                 for target in targets}
-        return [session for session in self.client.get_iscsi_sessions()
+        return [session for session in sessions
                 if session.get('target') in iqns]
 
     def _remove_conflicting_export(self, disk, targets, extents):

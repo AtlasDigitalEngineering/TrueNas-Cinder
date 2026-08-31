@@ -225,6 +225,13 @@ an unrecognised key in a `/pool/dataset` create breaks discrimination of the
 and the JSON `filters=[[...]]` query form returns `200` with an empty list
 rather than an error, so a wrong query reads as "nothing exists".
 
+The same is true of a **plain field filter**: `GET /iscsi/extent?disk=<path>`
+does filter server-side, but `GET /iscsi/extent?nonsense=x` also answers `200`
+with `[]` rather than rejecting the unknown field (#85). That makes
+server-side filtering unsafe anywhere an empty result would be read as "no
+such object" and acted on — the adoption safety gate reads the collections
+whole for exactly this reason, and says so in `_clear_conflicting_export`.
+
 **Renaming is how adoption works, and both rename endpoints demand `force`.**
 `POST /pool/dataset/rename` and `POST /pool/snapshot/rename` refuse without
 `force: true` even when nothing is using the object, so **the appliance

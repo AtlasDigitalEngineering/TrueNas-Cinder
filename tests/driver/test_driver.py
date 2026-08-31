@@ -1995,12 +1995,385 @@ class TestAdoptionSafetyGate(AdoptionTestCase):
 
         driver.client.rename_zvol.assert_not_called()
 
+    def test_a_nested_zvol_with_a_conflict_names_the_right_export(self):
+        """Nested name and export conflict together (#71).
+
+        Both paths derive the zvol's disk path, and a nested name is where
+        a path-construction slip would show: `zvol/pool/a/b` rather than
+        the flat form every other test uses. It is also the shape a
+        hand-provisioned disk most often has.
+        """
+        driver = self._driver()
+        nested = 'proxmox/vm-100-disk-0'
+        disk = f'zvol/{POOL}/{nested}'
+        driver.client.get_zvol.return_value = {
+            'name': f'{POOL}/{nested}', 'type': 'VOLUME',
+            'volsize': {'parsed': 1024 ** 3},
+        }
+        driver.client.get_extents.return_value = [
+            {'id': 21, 'name': 'nested', 'disk': disk},
+            {'id': 22, 'name': 'flat', 'disk': f'zvol/{POOL}/vm-100-disk-0'},
+        ]
+        driver.client.get_target_extents.return_value = [
+            {'id': 23, 'target': 24, 'extent': 21},
+            {'id': 25, 'target': 26, 'extent': 22},
+        ]
+        driver.client.get_targets.return_value = [
+            {'id': 24, 'name': 'nested'}, {'id': 26, 'name': 'flat'},
+        ]
+
+        with self.assertRaises(
+                exception.ManageExistingInvalidReference) as caught:
+            driver.manage_existing(FakeVolume(), self._ref(nested))
+
+        message = str(caught.exception)
+        self.assertIn('target 24', message)
+        self.assertIn('extent 21', message)
+        # The flat zvol whose name is a suffix of the nested one must not
+        # be caught up in it.
+        self.assertNotIn('target 26', message)
+        self.assertNotIn('extent 22', message)
+
+    def test_a_nested_zvol_conflict_is_cleared_when_the_option_allows(self):
+        driver = self._driver(truenas_adopt_removes_export=True)
+        nested = 'proxmox/vm-100-disk-0'
+        disk = f'zvol/{POOL}/{nested}'
+        driver.client.get_zvol.return_value = {
+            'name': f'{POOL}/{nested}', 'type': 'VOLUME',
+            'volsize': {'parsed': 1024 ** 3},
+        }
+        driver.client.get_extents.return_value = [
+            {'id': 21, 'name': 'nested', 'disk': disk},
+            {'id': 22, 'name': 'flat', 'disk': f'zvol/{POOL}/vm-100-disk-0'},
+        ]
+        driver.client.get_target_extents.return_value = [
+            {'id': 23, 'target': 24, 'extent': 21},
+            {'id': 25, 'target': 26, 'extent': 22},
+        ]
+        driver.client.get_targets.return_value = [
+            {'id': 24, 'name': 'nested'}, {'id': 26, 'name': 'flat'},
+        ]
+        volume = FakeVolume()
+
+        driver.manage_existing(volume, self._ref(nested))
+
+        driver.client.delete_target.assert_called_once_with(24)
+        driver.client.delete_extent.assert_called_once_with(21)
+        driver.client.rename_zvol.assert_called_once_with(
+            POOL, nested, volume.name)
+
     def test_an_unexported_zvol_is_adopted_without_a_session_lookup(self):
         driver = self._driver()
 
         driver.manage_existing(FakeVolume(), self._ref())
 
         driver.client.rename_zvol.assert_called_once()
+
+
+class ManageableTestCase(AdoptionTestCase):
+    """A pool holding one adoptable zvol, with the iSCSI lists empty."""
+
+    UUID = '9f1c2d3e-4a5b-4c6d-8e7f-0a1b2c3d4e5f'
+
+    def _driver(self, **over):
+        driver = super()._driver(**over)
+        driver.client.list_zvols.return_value = [
+            {'name': f'{POOL}/vm-100-disk-0',
+             'volsize': {'parsed': 10 * 1024 ** 3}},
+        ]
+        driver.client.get_snapshot_list.return_value = []
+        return driver
+
+    def _listing(self, driver, managed=()):
+        return driver.get_manageable_volumes(
+            managed, None, 1000, 0, ['reference'], ['asc'])
+
+
+class TestManageableVolumes(ManageableTestCase):
+    """get_manageable_volumes."""
+
+    def test_an_unexported_zvol_is_reported_safe(self):
+        driver = self._driver()
+
+        entry, = self._listing(driver)
+
+        self.assertTrue(entry['safe_to_manage'])
+        self.assertIsNone(entry['reason_not_safe'])
+        self.assertIsNone(entry['cinder_id'])
+
+    def test_the_reference_is_what_manage_existing_accepts(self):
+        # The listing exists to feed adoption. If the reference it hands
+        # out is not one manage_existing parses, the feature is decorative.
+        driver = self._driver()
+
+        entry, = self._listing(driver)
+
+        self.assertEqual(
+            driver._parse_existing_ref(entry['reference']), 'vm-100-disk-0')
+
+    def test_the_size_is_the_zvols_own_rounded_up(self):
+        driver = self._driver()
+        driver.client.list_zvols.return_value = [
+            {'name': f'{POOL}/vm-100-disk-0',
+             'volsize': {'parsed': int(10.5 * 1024 ** 3)}},
+        ]
+
+        entry, = self._listing(driver)
+
+        self.assertEqual(entry['size'], 11)
+
+    def test_an_already_managed_zvol_reports_its_cinder_id(self):
+        driver = self._driver()
+        driver.client.list_zvols.return_value = [
+            {'name': f'{POOL}/volume-{self.UUID}',
+             'volsize': {'parsed': 1024 ** 3}},
+        ]
+
+        entry, = self._listing(driver, managed=[{'id': self.UUID}])
+
+        self.assertEqual(entry['cinder_id'], self.UUID)
+        self.assertFalse(entry['safe_to_manage'])
+        self.assertIn('already managed', entry['reason_not_safe'])
+
+    def test_a_zvol_with_a_live_session_is_never_safe(self):
+        driver = self._export_the_source(self._driver())
+        driver.client.list_zvols.return_value = [
+            {'name': f'{POOL}/{self.SOURCE}',
+             'volsize': {'parsed': 1024 ** 3}},
+        ]
+        driver.client.get_iscsi_sessions.return_value = [{
+            'initiator': 'iqn.1994-05.com.redhat:abc',
+            'target': f'{BASENAME}:{self.SOURCE}',
+        }]
+
+        entry, = self._listing(driver)
+
+        self.assertFalse(entry['safe_to_manage'])
+        self.assertIn('in use', entry['reason_not_safe'])
+        self.assertIn('iqn.1994-05.com.redhat:abc', entry['reason_not_safe'])
+
+    def test_a_live_session_is_unsafe_even_with_removal_enabled(self):
+        # manage_existing refuses this whatever the option says, so
+        # reporting it safe would invite an adoption that cannot succeed.
+        driver = self._export_the_source(
+            self._driver(truenas_adopt_removes_export=True))
+        driver.client.list_zvols.return_value = [
+            {'name': f'{POOL}/{self.SOURCE}',
+             'volsize': {'parsed': 1024 ** 3}},
+        ]
+        driver.client.get_iscsi_sessions.return_value = [{
+            'initiator': 'iqn.1994-05.com.redhat:abc',
+            'target': f'{BASENAME}:{self.SOURCE}',
+        }]
+
+        entry, = self._listing(driver)
+
+        self.assertFalse(entry['safe_to_manage'])
+
+    def test_a_session_on_a_foreign_basename_is_not_our_volume_in_use(self):
+        # The basename is appliance-global, so this should not occur in
+        # practice -- which is exactly why it is asserted. The comparison
+        # is exact, and an inexact one would read a stranger's session as
+        # evidence that our zvol is busy and refuse an adoption that is
+        # perfectly safe.
+        driver = self._export_the_source(self._driver())
+        driver.client.list_zvols.return_value = [
+            {'name': f'{POOL}/{self.SOURCE}',
+             'volsize': {'parsed': 1024 ** 3}},
+        ]
+        driver.client.get_iscsi_sessions.return_value = [{
+            'initiator': 'iqn.1994-05.com.redhat:abc',
+            'target': f'iqn.2001-01.com.example:{self.SOURCE}',
+        }]
+
+        entry, = self._listing(driver)
+
+        # Still unsafe -- but for the idle-export reason, not "in use".
+        self.assertFalse(entry['safe_to_manage'])
+        self.assertNotIn('in use', entry['reason_not_safe'])
+
+    def test_an_idle_export_is_unsafe_by_default_and_names_what_to_remove(
+            self):
+        driver = self._export_the_source(self._driver())
+        driver.client.list_zvols.return_value = [
+            {'name': f'{POOL}/{self.SOURCE}',
+             'volsize': {'parsed': 1024 ** 3}},
+        ]
+
+        entry, = self._listing(driver)
+
+        self.assertFalse(entry['safe_to_manage'])
+        self.assertIn('target 11', entry['reason_not_safe'])
+        self.assertIn('extent 8', entry['reason_not_safe'])
+        self.assertNotIn('target 13', entry['reason_not_safe'])
+
+    def test_an_idle_export_is_safe_when_the_driver_may_remove_it(self):
+        driver = self._export_the_source(
+            self._driver(truenas_adopt_removes_export=True))
+        driver.client.list_zvols.return_value = [
+            {'name': f'{POOL}/{self.SOURCE}',
+             'volsize': {'parsed': 1024 ** 3}},
+        ]
+
+        entry, = self._listing(driver)
+
+        self.assertTrue(entry['safe_to_manage'])
+        self.assertIn('will be removed', entry['extra_info'])
+
+    def test_the_listing_agrees_with_what_adoption_would_do(self):
+        # The listing and the gate must not drift: a volume reported safe
+        # is one manage_existing accepts, and vice versa.
+        for removes in (False, True):
+            with self.subTest(truenas_adopt_removes_export=removes):
+                driver = self._export_the_source(
+                    self._driver(truenas_adopt_removes_export=removes))
+                driver.client.list_zvols.return_value = [
+                    {'name': f'{POOL}/{self.SOURCE}',
+                     'volsize': {'parsed': 1024 ** 3}},
+                ]
+                entry, = self._listing(driver)
+
+                if entry['safe_to_manage']:
+                    driver.manage_existing(FakeVolume(), entry['reference'])
+                else:
+                    self.assertRaises(
+                        exception.ManageExistingInvalidReference,
+                        driver.manage_existing, FakeVolume(),
+                        entry['reference'])
+
+    def test_the_iscsi_collections_are_read_once_for_the_whole_listing(self):
+        # Not once per zvol (#72). On an estate being migrated this is the
+        # difference between four requests and four per disk.
+        driver = self._driver()
+        driver.client.list_zvols.return_value = [
+            {'name': f'{POOL}/vm-{n}', 'volsize': {'parsed': 1024 ** 3}}
+            for n in range(25)
+        ]
+
+        self._listing(driver)
+
+        self.assertEqual(driver.client.get_extents.call_count, 1)
+        self.assertEqual(driver.client.get_target_extents.call_count, 1)
+        self.assertEqual(driver.client.get_targets.call_count, 1)
+        self.assertEqual(driver.client.get_iscsi_sessions.call_count, 1)
+
+    def test_an_unreadable_appliance_is_a_backend_error(self):
+        driver = self._driver()
+        driver.client.list_zvols.side_effect = (
+            api_client.TrueNASAPIError('timeout'))
+
+        self.assertRaises(exception.VolumeBackendAPIException,
+                          self._listing, driver)
+
+    def test_pagination_is_honoured(self):
+        driver = self._driver()
+        driver.client.list_zvols.return_value = [
+            {'name': f'{POOL}/vm-{n}', 'volsize': {'parsed': 1024 ** 3}}
+            for n in range(10)
+        ]
+
+        page = driver.get_manageable_volumes(
+            [], None, 3, 0, ['reference'], ['asc'])
+
+        self.assertEqual(len(page), 3)
+
+
+class TestManageableSnapshots(ManageableTestCase):
+    """get_manageable_snapshots."""
+
+    def _snapshots(self, driver, managed=()):
+        return driver.get_manageable_snapshots(
+            managed, None, 1000, 0, ['reference'], ['asc'])
+
+    def test_a_snapshot_is_listed_against_its_volume(self):
+        driver = self._driver()
+        driver.client.get_snapshot_list.return_value = [
+            {'id': f'{POOL}/vm-100-disk-0@nightly',
+             'dataset': f'{POOL}/vm-100-disk-0',
+             'snapshot_name': 'nightly'},
+        ]
+
+        entry, = self._snapshots(driver)
+
+        self.assertEqual(entry['reference']['source-name'],
+                         f'{POOL}/vm-100-disk-0@nightly')
+        self.assertEqual(entry['source_reference']['source-name'],
+                         'vm-100-disk-0')
+        self.assertTrue(entry['safe_to_manage'])
+
+    def test_the_size_reported_is_the_parent_volumes(self):
+        # A ZFS snapshot has no size of its own, and Cinder requires a
+        # snapshot's size to match its volume's.
+        driver = self._driver()
+        driver.client.list_zvols.return_value = [
+            {'name': f'{POOL}/vm-100-disk-0',
+             'volsize': {'parsed': int(10.5 * 1024 ** 3)}},
+        ]
+        driver.client.get_snapshot_list.return_value = [
+            {'id': f'{POOL}/vm-100-disk-0@nightly',
+             'dataset': f'{POOL}/vm-100-disk-0',
+             'snapshot_name': 'nightly'},
+        ]
+
+        entry, = self._snapshots(driver)
+
+        self.assertEqual(entry['size'], 11)
+
+    def test_an_already_managed_snapshot_reports_its_cinder_id(self):
+        driver = self._driver()
+        driver.client.get_snapshot_list.return_value = [
+            {'id': f'{POOL}/vm-100-disk-0@snapshot-{self.UUID}',
+             'dataset': f'{POOL}/vm-100-disk-0',
+             'snapshot_name': f'snapshot-{self.UUID}'},
+        ]
+
+        entry, = self._snapshots(driver, managed=[{'id': self.UUID}])
+
+        self.assertEqual(entry['cinder_id'], self.UUID)
+        self.assertFalse(entry['safe_to_manage'])
+
+    def test_an_unreadable_appliance_is_a_backend_error(self):
+        driver = self._driver()
+        driver.client.get_snapshot_list.side_effect = (
+            api_client.TrueNASAPIError('timeout'))
+
+        self.assertRaises(exception.VolumeBackendAPIException,
+                          self._snapshots, driver)
+
+    def test_snapshots_are_read_once_not_once_per_zvol(self):
+        # The same N+1 the volume listing avoids. Asking per dataset costs
+        # a request per zvol, which is worst on exactly the estates this
+        # feature exists for.
+        driver = self._driver()
+        driver.client.list_zvols.return_value = [
+            {'name': f'{POOL}/vm-{n}', 'volsize': {'parsed': 1024 ** 3}}
+            for n in range(25)
+        ]
+
+        self._snapshots(driver)
+
+        self.assertEqual(driver.client.get_snapshot_list.call_count, 1)
+
+    def test_snapshots_outside_the_pools_zvols_are_excluded(self):
+        # The unfiltered read also returns the appliance's own boot-pool
+        # snapshots, and snapshots of filesystem datasets in this pool.
+        # Neither is adoptable, and listing them as such would send an
+        # operator at a reference `manage_existing` refuses.
+        driver = self._driver()
+        driver.client.get_snapshot_list.return_value = [
+            {'id': f'{POOL}/vm-100-disk-0@keep',
+             'dataset': f'{POOL}/vm-100-disk-0', 'snapshot_name': 'keep'},
+            {'id': 'boot-pool/ROOT@auto-2026',
+             'dataset': 'boot-pool/ROOT', 'snapshot_name': 'auto-2026'},
+            {'id': f'{POOL}/a-filesystem@nightly',
+             'dataset': f'{POOL}/a-filesystem', 'snapshot_name': 'nightly'},
+        ]
+
+        entries = self._snapshots(driver)
+
+        self.assertEqual(
+            [e['reference']['source-name'] for e in entries],
+            [f'{POOL}/vm-100-disk-0@keep'])
 
 
 class TestUnmanage(AdoptionTestCase):

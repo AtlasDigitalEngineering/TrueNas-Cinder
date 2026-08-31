@@ -90,16 +90,30 @@ curl -s -X POST "$CINDER_URL/volumes/<id>/action" \
 
 ## Finding candidates
 
-`cinder manageable-list` is the intended way and **this driver does not
-implement it** — it returns a 500. Enumerate on the appliance instead:
-
 ```bash
-curl -sk -H "Authorization: Bearer $TRUENAS_API_KEY" \
-  "https://<appliance>/api/v2.0/pool/dataset?type=VOLUME&name__^=<pool>/" \
-  | jq -r '.[] | "\(.name)\t\(.volsize.value)"'
+cinder manageable-list <host>
+cinder snapshot-manageable-list <host>
 ```
 
-Anything not already named `volume-<uuid>` is a candidate.
+Every zvol in the pool, with whether it can be adopted and why not:
+
+```
+reference                              size  safe_to_manage  reason_not_safe
+{'source-name': 'Dev-Pool/vm-100'}     10    True            -
+{'source-name': 'Dev-Pool/vm-101'}     20    False           exported over iSCSI by target 30, extent 33; remove it, or set truenas_adopt_removes_export
+{'source-name': 'Dev-Pool/vm-102'}     40    False           in use: 1 live iSCSI session(s) from iqn.1994-05.com.redhat:9a2b
+{'source-name': 'Dev-Pool/volume-...'} 2     False           already managed
+```
+
+`safe_to_manage` answers the same question adoption does, through the same
+code, so a volume reported safe is one `cinder manage` will accept. The three
+unsafe reasons map exactly to the three ways adoption is refused.
+
+With `truenas_adopt_removes_export = true`, a zvol with an idle export reports
+**safe**, and `extra_info` says the export will be removed on adopt — because
+that is what will happen.
+
+The `reference` is what you pass to `cinder manage`, verbatim.
 
 ## Adopting a volume
 
