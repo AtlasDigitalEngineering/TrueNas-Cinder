@@ -19,52 +19,6 @@ from truenas_cinder_driver import api_client
 
 
 @pytest.fixture
-def service_restored(client):
-    """Return the iscsitarget service to the state it was found in."""
-    before = client.get_iscsi_service()["state"]
-    yield before
-    after = client.get_iscsi_service()["state"]
-    if after != before:
-        if before == "STOPPED":
-            client._make_request("POST", "/service/stop",
-                                 json={"service": "iscsitarget"})
-        else:
-            client.start_iscsi_service()
-
-
-@pytest.fixture
-def portals(client, cleanup):
-    """Portal ids to export through, reusing what the appliance has.
-
-    Creating a second portal on an address that already has one is
-    refused, so an appliance in use cannot be tested by always creating.
-    Only portals this fixture created are tidied up.
-
-    Multipath needs a portal per address, and a portal can only bind a
-    *statically* configured address -- `listen_ip_choices` omits DHCP ones
-    entirely (#45). A single-homed appliance falls back to the wildcard and
-    simply does not exercise multipath.
-    """
-    existing = client.get_portals()
-    if existing:
-        return [p["id"] for p in existing]
-
-    choices = client._make_request(
-        "GET", "/iscsi/portal/listen_ip_choices") or {}
-    static = [ip for ip in choices if ip not in ("0.0.0.0", "::")]
-    wanted = static[:2] if len(static) >= 2 else [None]
-
-    created = []
-    for ip in wanted:
-        pid = client.create_portal(listen_ips=[ip] if ip else None,
-                                   comment="cinder-func")
-        created.append(pid)
-        cleanup(f"portal {pid}", client._make_request,
-                "DELETE", f"/iscsi/portal/id/{pid}")
-    return created
-
-
-@pytest.fixture
 def export(client, pool, zvol, names, portals, cleanup):
     """A complete export around the throwaway zvol."""
     disk = client.zvol_disk_path(pool, zvol)
@@ -162,8 +116,8 @@ def test_the_target_extent_link_is_found_by_its_ends(client, export):
     assert found["id"] == export["link"]
 
 
-def test_a_reload_does_not_start_a_stopped_service(client, service_restored):
-    if service_restored != "STOPPED":
+def test_a_reload_does_not_start_a_stopped_service(client):
+    if client.get_iscsi_service()["state"] != "STOPPED":
         pytest.skip("service already running; nothing to prove")
 
     reloaded = client.reload_iscsi_service()
@@ -172,7 +126,7 @@ def test_a_reload_does_not_start_a_stopped_service(client, service_restored):
     assert client.get_iscsi_service()["state"] == "STOPPED"
 
 
-def test_starting_the_service_reports_it_running(client, service_restored):
+def test_starting_the_service_reports_it_running(client, iscsi_service):
     client.start_iscsi_service()
 
     assert client.get_iscsi_service()["state"] == "RUNNING"

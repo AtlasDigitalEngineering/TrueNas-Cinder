@@ -26,6 +26,7 @@ cleanup lived in `try/finally` blocks that a bad assertion could skip.
 import os
 import pathlib
 import time
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -149,6 +150,85 @@ def _quietly(fn, *args, **kwargs):
         fn(*args, **kwargs)
     except api_client.TrueNASAPINotFoundError:
         pass
+
+
+@pytest.fixture
+def iscsi_service(client):
+    """Ensure `iscsitarget` is running, and put it back afterwards.
+
+    A fresh appliance has it STOPPED, and the driver's
+    `check_for_setup_error` refuses to proceed without it -- deliberately,
+    since a stopped service lets every export succeed and nothing attach.
+    Tests that need the driver therefore have to start it, and owe the
+    appliance its previous state back.
+    """
+    before = client.get_iscsi_service()["state"]
+    if before != "RUNNING":
+        client.start_iscsi_service()
+    yield before
+
+    if before != "RUNNING":
+        client._make_request("POST", "/service/stop",
+                             json={"service": "iscsitarget"})
+
+
+@pytest.fixture
+def portals(client, cleanup):
+    """Portal ids to export through, reusing whatever the appliance has.
+
+    A clean appliance has **zero** portals, and `create_target` rejects an
+    empty list outright -- so a test that reads `get_portals()` raw fails
+    with an unrelated `ValueError` on exactly the fresh box a new
+    contributor is told to use. An appliance already in service, meanwhile,
+    refuses a second portal on an address that already has one, so always
+    creating does not work either.
+
+    Hence: reuse if present, create if not, and only tidy up what this
+    fixture made.
+
+    Multipath needs a portal bound to more than one address, and a portal
+    can only bind a *statically* configured one -- `listen_ip_choices`
+    omits DHCP addresses entirely (#45). A single-homed appliance falls
+    back to the wildcard and simply does not exercise multipath.
+    """
+    existing = client.get_portals()
+    if existing:
+        return [p["id"] for p in existing]
+
+    choices = client._make_request(
+        "GET", "/iscsi/portal/listen_ip_choices") or {}
+    static = [ip for ip in choices if ip not in ("0.0.0.0", "::")]
+    wanted = static[:2] if len(static) >= 2 else [None]
+
+    created = []
+    for ip in wanted:
+        pid = client.create_portal(listen_ips=[ip] if ip else None,
+                                   comment="cinder-func")
+        created.append(pid)
+        cleanup(f"portal {pid}", client._make_request,
+                "DELETE", f"/iscsi/portal/id/{pid}")
+    return created
+
+
+@pytest.fixture
+def portal_addresses(client, portals):
+    """Addresses a compute node could actually reach the portal on.
+
+    A portal bound to `0.0.0.0` reports an address no initiator can
+    connect to, which `check_for_setup_error` rejects. That is the right
+    behaviour and not something to work around -- so where the appliance
+    offers only the wildcard, this supplies the host the tests are already
+    talking to, which is precisely what an operator would configure.
+    """
+    listens = []
+    for portal in client.get_portals():
+        if portal["id"] in portals:
+            listens += [entry["ip"] for entry in portal["listen"]]
+
+    usable = [ip for ip in listens if ip not in ("0.0.0.0", "::")]
+    if usable:
+        return usable
+    return [urlsplit(client.base_url).hostname]
 
 
 @pytest.fixture

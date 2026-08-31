@@ -44,12 +44,24 @@ class _Volume(object):
 
 
 @pytest.fixture
-def driver(config, pool, request):
-    """A driver whose setup validation has run against the appliance."""
+def driver(config, pool, request, portals, portal_addresses, iscsi_service):
+    """A driver whose setup validation has run against the appliance.
+
+    Depends on `portals` and `iscsi_service` because
+    `check_for_setup_error` requires both -- a fresh appliance has zero
+    portals and a STOPPED service, and without provisioning them this
+    module would error at fixture setup rather than run.
+
+    `truenas_iscsi_portal_id` is set explicitly rather than left to
+    discovery: the driver refuses to guess when an appliance has several
+    portals, and a shared appliance may well have several.
+    """
     url, key, _pool, verify_ssl = config
     adopt_removes = getattr(request, "param", False)
     cfg = _Cfg(truenas_api_url=url, truenas_api_key=key, truenas_pool=pool,
                truenas_verify_ssl=verify_ssl,
+               truenas_iscsi_portal_id=portals[0],
+               truenas_iscsi_portal_addresses=portal_addresses,
                truenas_adopt_removes_export=adopt_removes,
                volume_backend_name="truenas-iscsi", san_is_local=False)
     d = tnd.TrueNASISCSIDriver(configuration=cfg)
@@ -108,7 +120,7 @@ def test_adoption_renames_without_moving_data(
 
 
 def test_an_exported_zvol_is_refused_and_names_only_its_own_export(
-        client, driver, pool, foreign_zvol, names, cleanup):
+        client, driver, pool, foreign_zvol, names, portals, cleanup):
     """The gate that protects production data.
 
     Both halves matter. Refusing is not enough on its own -- the message
@@ -121,7 +133,6 @@ def test_an_exported_zvol_is_refused_and_names_only_its_own_export(
             "DELETE", f"/iscsi/initiator/id/{group}")
     extent = client.create_extent(disk, names.extent)
     cleanup(f"extent {extent}", client.delete_extent, extent)
-    portals = [p["id"] for p in client.get_portals()]
     target = client.create_target(names.target, group, portals)
     cleanup(f"target {target}", client.delete_target, target)
     client.create_target_extent(target, extent)
@@ -143,14 +154,13 @@ def test_an_exported_zvol_is_refused_and_names_only_its_own_export(
 
 @pytest.mark.parametrize("driver", [True], indirect=True)
 def test_the_export_is_removed_when_the_option_allows_it(
-        client, driver, pool, foreign_zvol, names, cleanup):
+        client, driver, pool, foreign_zvol, names, portals, cleanup):
     disk = client.zvol_disk_path(pool, foreign_zvol)
     group = client.get_or_create_initiator_group([names.iqn])
     cleanup(f"initiator group {group}", client._make_request,
             "DELETE", f"/iscsi/initiator/id/{group}")
     extent = client.create_extent(disk, names.extent)
-    target = client.create_target(names.target, group,
-                                  [p["id"] for p in client.get_portals()])
+    target = client.create_target(names.target, group, portals)
     client.create_target_extent(target, extent)
     adopted = _Volume(f"{names.base}-adopted")
 
