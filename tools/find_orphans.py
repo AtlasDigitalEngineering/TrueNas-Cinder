@@ -157,36 +157,41 @@ def delete_exports(client, report):
     explicitly first keeps the outcome the same whichever order the
     appliance applies internally.
 
+    Individual failures are reported and do not stop the run -- one
+    target refusing to go is no reason to leave the rest behind -- but
+    they are counted, because a caller that cannot tell a partial run from
+    a complete one will treat both as success.
+
     Args:
         client: A configured TrueNASAPIClient
         report: A report from :func:`reconcile.find_orphans`
 
     Returns:
-        Number of objects removed
+        ``(removed, failed)`` counts
     """
-    removed = 0
+    removed = failed = 0
+
+    def attempt(what, delete, ident, label):
+        nonlocal removed, failed
+        try:
+            delete(ident)
+        except TrueNASAPIError as exc:
+            print(f"  FAILED {what} {ident}: {exc}")
+            failed += 1
+        else:
+            print(f"  removed {what} {label}")
+            removed += 1
+
     for link in report["dangling_links"]:
-        try:
-            client.delete_target_extent(link["id"])
-            print(f"  removed link {link['id']}")
-            removed += 1
-        except TrueNASAPIError as exc:
-            print(f"  FAILED link {link['id']}: {exc}")
+        attempt("link", client.delete_target_extent, link["id"],
+                str(link["id"]))
     for target in report["leaked_targets"]:
-        try:
-            client.delete_target(target["id"])
-            print(f"  removed target {target['id']} {target['name']!r}")
-            removed += 1
-        except TrueNASAPIError as exc:
-            print(f"  FAILED target {target['id']}: {exc}")
+        attempt("target", client.delete_target, target["id"],
+                f"{target['id']} {target['name']!r}")
     for extent in report["leaked_extents"] + report["unlinked_extents"]:
-        try:
-            client.delete_extent(extent["id"])
-            print(f"  removed extent {extent['id']} {extent['name']!r}")
-            removed += 1
-        except TrueNASAPIError as exc:
-            print(f"  FAILED extent {extent['id']}: {exc}")
-    return removed
+        attempt("extent", client.delete_extent, extent["id"],
+                f"{extent['id']} {extent['name']!r}")
+    return removed, failed
 
 
 def main():
@@ -242,7 +247,21 @@ def main():
             print("Aborted.")
             return 1
     print()
-    print(f"Removed {delete_exports(client, report)} object(s).")
+    removed, failed = delete_exports(client, report)
+    print(f"Removed {removed} object(s).")
+    if failed:
+        print(f"{failed} could not be removed.")
+
+    # Re-read rather than assume. A caller running this on a schedule
+    # needs the exit code to mean "the appliance is clean now", not "the
+    # deletions were attempted" -- and some leak classes, zvols and
+    # duplicate initiator groups, this flag deliberately cannot clear.
+    after = reconcile.find_orphans(client, pool, names)
+    if reconcile.has_leaks(after):
+        print("\nStill outstanding:\n")
+        print(reconcile.describe(after, pool))
+        return 1
+    print("\nNothing outstanding.")
     return 0
 
 
