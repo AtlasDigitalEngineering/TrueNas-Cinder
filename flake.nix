@@ -64,7 +64,7 @@
             echo ""
             echo "  Ready now, no setup (built by nix, pinned by flake.lock):"
             echo "    python3 -m pytest tests/unit"
-            echo "    python3 -m flake8 truenas_cinder_driver tests"
+            echo "    python3 -m flake8 truenas_cinder_driver tests tools"
             echo "    python3 -m pytest tests/functional          # needs a dev appliance"
             echo ""
             echo "  Driver tests need Cinder, which is not in nixpkgs:"

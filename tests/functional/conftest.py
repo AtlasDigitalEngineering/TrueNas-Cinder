@@ -21,6 +21,26 @@ Every fixture that creates something on the appliance removes it in
 teardown, which pytest runs whether the test passed, failed or raised. That
 is the main thing this suite gains over the script it replaces, whose
 cleanup lived in `try/finally` blocks that a bad assertion could skip.
+
+Some calls here go through `client._make_request` rather than a public
+method, in two distinct cases (#44):
+
+**Asserting a wrong form is still wrong.** The leaf-name rename, the
+unforced rename, the empty-body promote. These *must* bypass the client,
+because the client always sends the correct form -- routing them through a
+public method would make them untestable.
+
+**Removing something the driver never removes.** Portals, initiator groups
+and stopping the iSCSI service. The driver creates a portal never, an
+initiator group without ever deleting one, and starts the service without
+stopping it -- so there is no `delete_portal`, `delete_initiator_group` or
+`stop_iscsi_service` to call. Adding them for the tests' benefit would put
+surface in the shipped client that nothing in production exercises, which
+is a worse trade than a documented raw call in a test.
+
+#48's reconciliation confirmed the boundary: everything it can remediate
+(targets, extents, links) already has a client method, because those are
+the things the driver itself creates and destroys.
 """
 
 import os
