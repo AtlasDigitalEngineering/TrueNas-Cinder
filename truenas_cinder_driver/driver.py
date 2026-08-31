@@ -200,9 +200,8 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
             if exc.status_code == 403:
                 reason = _('The TrueNAS account behind truenas_api_key does '
                            'not have the role this driver needs. The key '
-                           'itself is valid, so do not reissue it -- the '
-                           'account needs FULL_ADMIN. See '
-                           'docs/configuration.md. %s') % exc
+                           'itself is valid, so do not reissue it -- grant '
+                           'that account FULL_ADMIN. %s') % exc
             else:
                 reason = _('TrueNAS rejected truenas_api_key: it is wrong, '
                            'revoked or expired. Issue a new key and set '

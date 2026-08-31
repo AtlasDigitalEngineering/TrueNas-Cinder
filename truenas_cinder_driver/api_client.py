@@ -365,11 +365,19 @@ class TrueNASAPIClient:
                 # `except TrueNASAPIAuthError` still catches both.
                 error = TrueNASAPIAuthError
                 if status == 403:
+                    # Names FULL_ADMIN rather than pointing at the docs.
+                    # This message is what most 403s reach an operator as:
+                    # only check_for_setup_error special-cases auth errors,
+                    # so anything failing mid-operation surfaces this text
+                    # verbatim -- possibly inside a container where no repo
+                    # path can be opened. "the roles listed in the docs"
+                    # also reads as the eleven-role table, which is
+                    # documented as *not* working today.
                     message = (
                         f"{message}. The key was accepted, so it is valid -- "
                         f"the account it belongs to lacks the role this "
-                        f"call needs. Grant the roles listed in "
-                        f"docs/configuration.md; do not reissue the key."
+                        f"call needs. Grant that account FULL_ADMIN; do not "
+                        f"reissue the key."
                     )
                 else:
                     message = (

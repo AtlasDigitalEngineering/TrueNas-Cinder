@@ -2165,8 +2165,12 @@ class TestAuthMapping(TrueNASAPIClientTestCase):
             self.client.get_pool_list()
 
         message = str(ctx.exception)
-        self.assertIn("role", message)
         self.assertIn("do not reissue", message)
+        # Names the role that works. "grant the roles in the docs" pointed
+        # at the eleven-role table, which is documented as returning 403 --
+        # and at a repo path an operator inside a container cannot open.
+        self.assertIn("FULL_ADMIN", message)
+        self.assertNotIn("docs/configuration.md", message)
 
     def test_401_says_the_key_itself_was_rejected(self):
         self._set_error(401, text="Invalid API key")
