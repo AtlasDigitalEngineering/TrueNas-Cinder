@@ -135,9 +135,33 @@ def zvol(client, pool, names):
     client.create_zvol(pool, names.zvol, size_gb=1)
     yield names.zvol
 
-    for snapshot in client.get_snapshot_list(f"{pool}/{names.zvol}") or []:
+    _destroy_zvol(client, pool, names.zvol)
+
+
+def _destroy_zvol(client, pool, name):
+    """Remove a zvol and anything ZFS will not let it be removed with.
+
+    Snapshots first: ZFS refuses to destroy a dataset that still has
+    them, and this suite deliberately never passes `recursive=True` -- a
+    cleanup path that cascades is one that can delete something a test did
+    not create.
+    """
+    for snapshot in client.get_snapshot_list(f"{pool}/{name}") or []:
         _quietly(client.delete_snapshot, snapshot["id"])
-    _quietly(client.delete_zvol, pool, names.zvol)
+    _quietly(client.delete_zvol, pool, name)
+
+
+@pytest.fixture
+def destroy_zvol(client):
+    """The teardown a test can register for a zvol it created itself.
+
+    Same logic the `zvol` fixture uses. Registering a bare `delete_zvol`
+    instead leaves a zvol stranded the moment a test snapshots it, which
+    is how this fixture came to exist.
+    """
+    def destroy(pool, name):
+        _destroy_zvol(client, pool, name)
+    return destroy
 
 
 def _quietly(fn, *args, **kwargs):
