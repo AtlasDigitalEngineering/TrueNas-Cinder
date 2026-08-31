@@ -35,7 +35,7 @@ def known_volumes(client):
 
 @pytest.fixture
 def known_with_zvols(client, pool, known_volumes):
-    """As , plus zvols already named like Cinder's."""
+    """As known_volumes, plus zvols already named like Cinder's."""
     names = set(known_volumes)
     names |= {zvol["name"].split("/", 1)[-1]
               for zvol in client.list_zvols(pool)
