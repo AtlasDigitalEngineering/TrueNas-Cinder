@@ -21,7 +21,7 @@ data be adopted matter more than features that create new volumes elegantly.
 In order:
 
 1. **The live appliance** for anything about API behaviour — endpoint paths,
-   payload shapes, response shapes, filter syntax. `tools/verify_endpoints.py`
+   payload shapes, response shapes, filter syntax. the functional suite
    exists so findings can be re-checked rather than taken on trust.
 2. **The issue tracker** for scope, acceptance criteria and ordering.
 3. **`AGENTS.md`** for conventions and standing hazards.

@@ -22,7 +22,7 @@ with zero data copy. That constraint drives most of the priority ordering.
 
 1. **The live appliance** for anything about API behaviour — endpoint paths,
    payload shapes, response shapes, filter syntax. Verify with
-   `tools/verify_endpoints.py`; see "Verifying against real hardware" below.
+   the functional suite; see "Verifying against real hardware" below.
 2. **The issue tracker** for scope, acceptance criteria, and ordering.
 3. **This file** for conventions and hazards.
 
@@ -63,8 +63,10 @@ tests/
   driver/          # driver; needs Cinder installed
     __init__.py
     test_driver.py
-tools/
-  verify_endpoints.py  # live-appliance verification, reads .env
+  functional/      # live appliance; skipped unless .env configures one
+    __init__.py
+    conftest.py    # fixtures, teardown, skip-if-unconfigured
+    test_*.py
 .env.example       # template; .env itself is gitignored
 docs/PLANNING.md   # why the project exists, its shape, milestone outcomes
 docs/configuration.md  # sample cinder.conf backend section + prerequisites
@@ -73,7 +75,7 @@ images/cinder-volume/  # Dockerfile + build-time install check
 flake.nix          # dev shell: python312, uv, gh, LD_LIBRARY_PATH
 pyproject.toml     # packaging + ALL dependencies, via extras
 uv.lock            # pinned resolution of those, for reproducible installs
-tox.ini            # envlist = py312, driver, flake8; also [flake8] config
+tox.ini            # envlist = py312, driver, flake8; functional is opt-in
 ```
 
 `feature/driver-core` carried an earlier draft of `driver.py`. It was
@@ -108,8 +110,8 @@ it is a `python312.withPackages` env — no venv, no PyPI, nothing to install:
 ```bash
 nix develop
 python3 -m pytest tests/unit
-python3 -m flake8 truenas_cinder_driver tests tools
-python3 tools/verify_endpoints.py [--write]
+python3 -m flake8 truenas_cinder_driver tests
+python -m pytest tests/functional
 ```
 
 That env deliberately does **not** contain Cinder. `import cinder` failing in it
@@ -164,7 +166,7 @@ dev machines differ:
   runs through a shell:
   ```bash
   nix-shell -p python3 python3Packages.requests python3Packages.flake8 \
-    --run 'python3 -m flake8 truenas_cinder_driver tools tests'
+    --run 'python3 -m flake8 truenas_cinder_driver tests'
   nix-shell -p python3 python3Packages.requests \
     --run 'python3 -m unittest discover -s tests -t .'
   ```
@@ -284,39 +286,45 @@ JSON object is counted as a second positional argument and rejected with
 
 **Never point tests or exploration at the production TrueNAS.** It holds every
 production VM disk as a zvol, and those are the migration's only copy. Use the
-dev appliance and a scratch pool; `tools/verify_endpoints.py` refuses to run
+dev appliance and a scratch pool; the functional suite refuses to run
 without both configured, but that check is not a substitute for looking.
 
 ## Verifying against real hardware
 
 ```bash
 cp .env.example .env     # fill in URL, API key, scratch pool
-python3 tools/verify_endpoints.py            # read-only
-python3 tools/verify_endpoints.py --write    # + throwaway zvol lifecycle
+python -m pytest tests/functional                 # all probes
+python -m pytest tests/functional/test_zvol.py    # one area
 ```
 
-`.env` is gitignored. Write mode creates exactly one throwaway zvol, takes a
-snapshot of it, exports it through the full iSCSI pipeline (portal → initiator
-group → extent → target → target-extent link, plus a service start), and
-removes every resource in a `finally` block — including returning `iscsitarget`
-to the state it was found in. It asserts the pipeline and snapshot traps listed
-above rather than merely exercising them, so a behaviour change on a future
-TrueNAS release fails loudly instead of silently invalidating the client. Read-only mode also asserts the
-error mapping —
-`expect_raises` checks that each not-found form still produces
-`TrueNASAPINotFoundError` and that an errno-22 validation error still does
-not. That mapping rests on undocumented status codes, so it is the part most
-likely to drift on a TrueNAS upgrade.
+`.env` is gitignored, and **the suite skips entirely without it** — no
+appliance configured means no network touched, which is what lets it live in
+`tests/` without ever running by accident.
+
+Each test creates what it needs and removes it in a fixture, so cleanup runs
+whether the test passed, failed or raised. Nothing is asserted about the
+appliance's *global* state: assertions are scoped to objects the test created,
+because these run against appliances that have other work on them (#69).
+
+It asserts the pipeline, snapshot and rename traps listed above rather than
+merely exercising them — the wrong forms are asserted to still be wrong, so a
+behaviour change on a future TrueNAS release fails loudly instead of silently
+invalidating the client. That includes the error mapping: each not-found form
+must still produce `TrueNASAPINotFoundError`, and an errno-22 validation error
+must still not. That mapping rests on undocumented status codes, so it is the
+part most likely to drift on an upgrade.
+
+A full run takes about five minutes against a local appliance.
 
 **This is a manual, local step — CI does not run it.** No workflow invokes
-`tools/verify_endpoints.py`, and nothing consumes the `DEV_TRUENAS_API_KEY`
-repo secret, which exists only in anticipation of the functional suite in #25.
-Wiring it into CI is not simply a matter of adding a job: GitHub-hosted runners
-have no route to a private-LAN appliance, so it needs a self-hosted runner or a
-reachable test target. Re-verification happens when someone runs the script.
+the functional suite, and nothing consumes the `DEV_TRUENAS_API_KEY` repo
+secret. Wiring it into CI is not simply a matter of adding a job: GitHub-hosted
+runners have no route to a private-LAN appliance, so it needs a self-hosted
+runner or a reachable test target. Until then, re-verification happens when
+somebody runs it.
 
-Extend this script when adding client methods — the point is that findings can
-be re-checked and re-run against a new TrueNAS release, not taken on trust.
+Extend it when adding client methods — the point is that findings can be
+re-checked against a new TrueNAS release, not taken on trust.
 
 **Every client failure is a `TrueNASAPIError` subclass** (#11) — including
 network ones, so a caller never sees a raw `requests` exception and `#14` can
@@ -361,7 +369,7 @@ to ask `get_snapshot` rather than catch `TrueNASAPINotFoundError`.
 
 **A mistyped endpoint also returns 404**, so a caller swallowing
 `TrueNASAPINotFoundError` for idempotency will read a wrong path as a
-successful delete. Run `tools/verify_endpoints.py` against real hardware
+successful delete. Run the functional suite against real hardware
 before trusting any new path.
 
 **Snapshots live under `/pool/snapshot`, and their ids must be percent-encoded.**
@@ -377,7 +385,7 @@ methods had **two** independent bugs — the legacy `/zfs/snapshot` base path
 stacked bugs therefore cancelled into a method that reported success on every
 call while deleting nothing, forever. Neither a green unit suite nor a code
 review catches that; only exercising the path against hardware does.
-`tools/verify_endpoints.py` now asserts both wrong forms are *still* wrong, so
+The functional suite asserts both wrong forms are *still* wrong, so
 reintroducing either fails loudly.
 
 Three more verified snapshot behaviours:

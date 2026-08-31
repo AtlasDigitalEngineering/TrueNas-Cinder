@@ -44,7 +44,48 @@ By participating in this project, you agree to abide by the code of conduct.
 ## Testing
 
 - Write unit tests for new features or bug fixes.
-- Run existing tests before submitting a pull request: `tox -e py310`.
+- Run existing tests before submitting a pull request: `tox` runs
+  `py312`, `driver` and `flake8`. The functional suite is opt-in;
+  see below.
+
+### Functional tests against a real appliance
+
+`tests/functional/` talks to an actual TrueNAS box. It **skips entirely**
+unless one is configured, so it never runs by accident:
+
+```bash
+cp .env.example .env      # then fill it in
+tox -e functional
+# or: python -m pytest tests/functional
+```
+
+These tests create and destroy datasets, snapshots and iSCSI exports. Point
+them at a scratch pool on a development appliance and nothing else. Never at
+a production system — it holds disks whose only copy is on that appliance.
+
+#### Standing up a target
+
+1. **A TrueNAS Scale appliance** you are willing to have datasets created and
+   destroyed on. A VM is fine; the suite creates 1 GiB sparse zvols and
+   removes them.
+2. **A scratch pool.** Any pool works, but give it a name you will recognise
+   as disposable — `Dev-Pool`, `Scratch-Pool`. It goes in `TRUENAS_TEST_POOL`,
+   which is deliberately not the same variable the driver's own config uses,
+   so a stray export cannot aim the suite at a live pool.
+3. **An API key** — *Credentials → Local Users → root → API Keys*. The suite
+   creates and deletes datasets and iSCSI objects, so a read-only key will
+   fail partway through rather than skipping.
+4. **Optionally a second static IP** on the appliance. Multipath assertions
+   need a portal bound to more than one address; with a single-homed box
+   those tests skip and say so.
+
+The suite does not need an initiator, a portal or an iSCSI service configured
+in advance — it creates what it needs and reuses a portal if one already
+exists. It does not require an idle appliance either: every assertion is
+scoped to objects the test created, so it passes on a box with other exports
+on it.
+
+A full run takes about five minutes.
 
 ## Documentation
 
