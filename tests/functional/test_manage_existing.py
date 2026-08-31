@@ -89,13 +89,43 @@ def test_sizing_reads_the_zvol_rather_than_guessing(
     assert driver.manage_existing_get_size(_Volume("unused"), ref) == 1
 
 
-def test_a_reference_to_a_filesystem_is_refused(driver, pool):
-    # A GET on a filesystem answers 200, so this arrives looking exactly
-    # like a successful zvol lookup and must be caught on `type`.
-    ref = {"source-name": pool}
+@pytest.fixture
+def filesystem(client, pool, names, cleanup):
+    """A child *filesystem* dataset, which is not adoptable."""
+    dataset = f"{pool}/{names.base}-fs"
+    client._make_request("POST", "/pool/dataset",
+                         json={"name": dataset, "type": "FILESYSTEM"})
+    cleanup(f"filesystem {dataset}", client.delete_zvol, pool,
+            f"{names.base}-fs")
+    return f"{names.base}-fs"
 
-    with pytest.raises(exception.ManageExistingInvalidReference):
+
+def test_a_reference_to_a_filesystem_is_refused(driver, pool, filesystem):
+    """The `GET` on a filesystem answers 200 hazard (AGENTS.md).
+
+    It has to be a real `pool/<name>` path resolving to a non-VOLUME
+    dataset. A bare pool name would be rejected by the pool-prefix check
+    long before `_adoptable_zvol` ever looked at `type`, and would pass
+    this test while exercising nothing -- same exception, wrong branch.
+    """
+    ref = {"source-name": f"{pool}/{filesystem}"}
+
+    with pytest.raises(exception.ManageExistingInvalidReference) as caught:
         driver.manage_existing_get_size(_Volume("unused"), ref)
+
+    # Assert the reason, not just the type. Every rejection here raises
+    # the same exception, so only the message distinguishes which check
+    # actually fired.
+    assert "FILESYSTEM" in str(caught.value)
+
+
+def test_a_reference_outside_the_pool_is_refused(driver, pool):
+    ref = {"source-name": "cinder-func-other-pool/some-zvol"}
+
+    with pytest.raises(exception.ManageExistingInvalidReference) as caught:
+        driver.manage_existing_get_size(_Volume("unused"), ref)
+
+    assert "cinder-func-other-pool" in str(caught.value)
 
 
 def test_a_reference_to_a_missing_zvol_is_refused(driver, pool):
@@ -160,7 +190,13 @@ def test_the_export_is_removed_when_the_option_allows_it(
     cleanup(f"initiator group {group}", client._make_request,
             "DELETE", f"/iscsi/initiator/id/{group}")
     extent = client.create_extent(disk, names.extent)
+    # Registered even though manage_existing is expected to remove these:
+    # if it raises partway through, or an assertion below fails, nothing
+    # else would. The cleanup fixture swallows "already gone", so this is
+    # a no-op once the driver has legitimately removed them.
+    cleanup(f"extent {extent}", client.delete_extent, extent)
     target = client.create_target(names.target, group, portals)
+    cleanup(f"target {target}", client.delete_target, target)
     client.create_target_extent(target, extent)
     adopted = _Volume(f"{names.base}-adopted")
 
