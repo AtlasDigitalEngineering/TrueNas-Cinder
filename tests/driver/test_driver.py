@@ -2340,6 +2340,41 @@ class TestManageableSnapshots(ManageableTestCase):
         self.assertRaises(exception.VolumeBackendAPIException,
                           self._snapshots, driver)
 
+    def test_snapshots_are_read_once_not_once_per_zvol(self):
+        # The same N+1 the volume listing avoids. Asking per dataset costs
+        # a request per zvol, which is worst on exactly the estates this
+        # feature exists for.
+        driver = self._driver()
+        driver.client.list_zvols.return_value = [
+            {'name': f'{POOL}/vm-{n}', 'volsize': {'parsed': 1024 ** 3}}
+            for n in range(25)
+        ]
+
+        self._snapshots(driver)
+
+        self.assertEqual(driver.client.get_snapshot_list.call_count, 1)
+
+    def test_snapshots_outside_the_pools_zvols_are_excluded(self):
+        # The unfiltered read also returns the appliance's own boot-pool
+        # snapshots, and snapshots of filesystem datasets in this pool.
+        # Neither is adoptable, and listing them as such would send an
+        # operator at a reference `manage_existing` refuses.
+        driver = self._driver()
+        driver.client.get_snapshot_list.return_value = [
+            {'id': f'{POOL}/vm-100-disk-0@keep',
+             'dataset': f'{POOL}/vm-100-disk-0', 'snapshot_name': 'keep'},
+            {'id': 'boot-pool/ROOT@auto-2026',
+             'dataset': 'boot-pool/ROOT', 'snapshot_name': 'auto-2026'},
+            {'id': f'{POOL}/a-filesystem@nightly',
+             'dataset': f'{POOL}/a-filesystem', 'snapshot_name': 'nightly'},
+        ]
+
+        entries = self._snapshots(driver)
+
+        self.assertEqual(
+            [e['reference']['source-name'] for e in entries],
+            [f'{POOL}/vm-100-disk-0@keep'])
+
 
 class TestUnmanage(AdoptionTestCase):
     """unmanage must release the volume and destroy nothing."""

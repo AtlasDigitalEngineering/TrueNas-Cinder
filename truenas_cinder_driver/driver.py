@@ -1431,9 +1431,21 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
 
         try:
             zvols = self.client.list_zvols(pool)
-            snapshots = []
-            for zvol in zvols:
-                snapshots += self.client.get_snapshot_list(zvol['name']) or []
+            # One unfiltered read, then scoped here. Asking per dataset
+            # would be a request per zvol -- the same N+1 the volume
+            # listing exists to avoid, and worse on the estates this
+            # feature is for.
+            #
+            # `get_snapshot_list()` warns against the unfiltered form
+            # because it returns the appliance's own boot-pool snapshots
+            # too, which is easy to misread as "ours". Scoping to the
+            # zvols just listed is exact -- stricter than a name prefix,
+            # since it also excludes snapshots of filesystem datasets
+            # sharing the pool.
+            datasets = {zvol['name'] for zvol in zvols}
+            snapshots = [snapshot
+                         for snapshot in self.client.get_snapshot_list() or []
+                         if snapshot.get('dataset') in datasets]
         except api_client.TrueNASAPIError as exc:
             raise exception.VolumeBackendAPIException(
                 data=_('Could not list manageable snapshots in pool '
