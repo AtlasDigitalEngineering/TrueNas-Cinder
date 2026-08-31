@@ -288,7 +288,9 @@ JSON object is counted as a second positional argument and rejected with
 denied for API-key authentication on TrueNAS-25.10.5 — `READONLY_ADMIN` cannot
 even `GET /pool`. Measured in #60 by granting one role set at a time to a
 throwaway account and replaying the same requests, with an A-B-A control to
-rule out ordering or caching. Least privilege is therefore not available to
+rule out ordering or caching. Only the **read** roles were measured; that the
+write roles also fail is inference from `READONLY_ADMIN` being unable to read
+at all. Least privilege is therefore not available to
 this driver, and the key is effectively root on the appliance: say so rather
 than implying a scoped key is possible. The set to retry on a future release
 is in `docs/configuration.md`.

@@ -87,6 +87,13 @@ replayed with its key.
 Run as `FULL_ADMIN → others → FULL_ADMIN`, so the result is not an artefact of
 ordering or caching.
 
+**Only the read roles were measured.** The write and delete roles in the retry
+list below were not granted or exercised — the conclusion that they would also
+fail is inference, not measurement. It is a short inference, since an account
+that cannot complete `GET /pool` under `READONLY_ADMIN` is not going to
+complete a write under `DATASET_WRITE`, but it is worth labelling so nobody
+later reads the table as covering more than it does.
+
 Worth knowing before you plan around least privilege: **a scoped key for this
 driver is not currently possible.** Treat the key as equivalent to root on the
 appliance, and protect `cinder.conf` accordingly.
