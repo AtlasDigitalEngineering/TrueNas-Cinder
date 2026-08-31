@@ -336,7 +336,11 @@ class TrueNASAPIClient:
         Raises:
             TrueNASAPINotFoundError: On HTTP 404, or on a 422 whose body
                 reports ENOENT -- see the ``ENOENT`` note above
-            TrueNASAPIAuthError: On HTTP 401 or 403
+            TrueNASAPIAuthError: On HTTP 401 or 403, with different
+                messages. 401 means the key itself was rejected; 403 means
+                it was accepted and the account lacks a role. The remedies
+                are opposite, so a shared message sends half of all
+                readers to fix the wrong thing.
             TrueNASAPIError: On any other error status
         """
         try:
@@ -355,11 +359,24 @@ class TrueNASAPIClient:
             if status == 404 or (status == 422 and self._is_enoent(response)):
                 error = TrueNASAPINotFoundError
             elif status in (401, 403):
+                # 401 and 403 need opposite actions, and reporting them
+                # identically sends an operator to reissue a key that was
+                # never the problem. Same exception class either way, so
+                # `except TrueNASAPIAuthError` still catches both.
                 error = TrueNASAPIAuthError
-                message = (
-                    f"{message}. Check that truenas_api_key is a valid, "
-                    f"unrevoked key with sufficient privileges."
-                )
+                if status == 403:
+                    message = (
+                        f"{message}. The key was accepted, so it is valid -- "
+                        f"the account it belongs to lacks the role this "
+                        f"call needs. Grant the roles listed in "
+                        f"docs/configuration.md; do not reissue the key."
+                    )
+                else:
+                    message = (
+                        f"{message}. The key was rejected outright: it is "
+                        f"wrong, revoked or expired. Issue a new one and set "
+                        f"truenas_api_key. This is not a role problem."
+                    )
             else:
                 error = TrueNASAPIError
             raise error(
