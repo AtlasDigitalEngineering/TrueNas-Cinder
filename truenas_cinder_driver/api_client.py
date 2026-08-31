@@ -118,7 +118,7 @@ class TrueNASAPINotFoundError(TrueNASAPIError):
     successful delete. The two are distinguishable by body -- a missing
     object returns JSON, a bad route returns text -- but that is a thin
     reed to lean on. The real guard is exercising every path against real
-    hardware with ``tools/verify_endpoints.py`` before relying on it.
+    hardware with the functional suite before relying on it.
     """
 
 
