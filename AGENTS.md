@@ -67,6 +67,8 @@ tests/
     __init__.py
     conftest.py    # fixtures, teardown, skip-if-unconfigured
     test_*.py
+tools/
+  find_orphans.py  # reconciliation CLI; reads .env and OS_* for Cinder
 .env.example       # template; .env itself is gitignored
 docs/PLANNING.md   # why the project exists, its shape, milestone outcomes
 docs/configuration.md  # sample cinder.conf backend section + prerequisites
@@ -110,7 +112,7 @@ it is a `python312.withPackages` env — no venv, no PyPI, nothing to install:
 ```bash
 nix develop
 python3 -m pytest tests/unit
-python3 -m flake8 truenas_cinder_driver tests
+python3 -m flake8 truenas_cinder_driver tests tools
 python -m pytest tests/functional
 ```
 
@@ -166,7 +168,7 @@ dev machines differ:
   runs through a shell:
   ```bash
   nix-shell -p python3 python3Packages.requests python3Packages.flake8 \
-    --run 'python3 -m flake8 truenas_cinder_driver tests'
+    --run 'python3 -m flake8 truenas_cinder_driver tests tools'
   nix-shell -p python3 python3Packages.requests \
     --run 'python3 -m unittest discover -s tests -t .'
   ```
@@ -308,6 +310,27 @@ operator to check their key when the key is fine sends them to reissue it and
 hit the same error — which is what happened on the M1 acceptance run (#59).
 Both still raise `TrueNASAPIAuthError`, so `except` clauses are unaffected;
 only the message differs.
+
+**Reconciliation reports; it does not repair.** `truenas_cinder_driver/
+reconcile.py` compares the appliance against Cinder's volume list and names
+what is unaccounted for. It imports nothing from Cinder, so it is testable in
+`tests/unit`, and `tools/find_orphans.py` drives it from the command line.
+
+Two rules in it are load-bearing and easy to break by accident:
+
+*A leak and an adoption candidate look identical from the appliance side* --
+both are objects with no Cinder volume behind them. They are told apart by
+name: `volume-<uuid>` was created by this driver, anything else was not.
+Conflating them would invite an operator to delete the very disks they are
+migrating, so `adoptable_zvols` is deliberately excluded from `has_leaks`.
+
+*Objects this driver did not create are never reported*, even when they look
+wrong. A hand-provisioned extent with no target is somebody part way through
+wiring up a disk, and naming it would put it in front of `--delete-exports`.
+
+`--delete-exports` removes targets, extents and links. It **never** removes a
+zvol at any flag: those are wrappers, a zvol is the disk, and a zvol with no
+Cinder volume may equally be a volume whose Cinder record was lost.
 
 **Never point tests or exploration at the production TrueNAS.** It holds every
 production VM disk as a zvol, and those are the migration's only copy. Use the
