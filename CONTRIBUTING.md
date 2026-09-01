@@ -83,6 +83,12 @@ The suite does not need an initiator, a portal or an iSCSI service configured
 in advance. It reuses a portal if one exists and creates one otherwise, and it
 starts `iscsitarget` if it is stopped, putting both back as it found them.
 
+That includes the tests that log in. Some of them establish a genuine iSCSI
+session against the target the driver built, but they do it by speaking the
+login exchange over a socket rather than through the kernel — so **no `root`,
+no `open-iscsi` and no `iscsi_tcp` module**, and nothing persistent: a session
+is a TCP connection, and there is no node database to leave stale entries in.
+
 It does not require an *idle* appliance either: every assertion is scoped to
 objects the test created, so it passes on a box that already has exports on it.
 That half is verified — it is run routinely against a development appliance
