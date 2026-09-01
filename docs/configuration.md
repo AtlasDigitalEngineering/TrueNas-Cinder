@@ -254,6 +254,37 @@ moves the snapshot onto the clone, where this driver could no longer resolve
 it. Trading a rare annoyance for a constant one is a bad deal, so the
 dependency is left pointing the way that keeps the common operations working.
 
+## Concurrency
+
+`cinder-volume` handles attaches in parallel, and booting a batch of
+migrated VMs is exactly that pattern. Two things are serialised per
+appliance:
+
+- **initiator-group creation**, because TrueNAS enforces no uniqueness and
+  the lookup-then-create is a read-modify-write. Without the lock, six
+  simultaneous attaches from one host created six duplicate groups.
+- **the iSCSI service reload**, which reconfigures the appliance globally.
+
+Everything else — creating extents, targets and links — runs concurrently,
+which is what keeps batch attach fast.
+
+Locking uses Cinder's coordination layer. With the default file backend it
+covers the `cinder-volume` workers on **one host**. If you run
+`cinder-volume` on several hosts against the same appliance, configure a
+distributed coordination backend:
+
+```ini
+[coordination]
+backend_url = etcd3+http://etcd.example.com:2379
+```
+
+Without that, two hosts can still race each other into duplicate initiator
+groups. `tools/find_orphans.py` reports duplicates if it happens.
+
+Note that active/active `cinder-volume` is **not** supported by this driver
+regardless — it inherits `SUPPORTS_ACTIVE_ACTIVE = False`, and nothing here
+has been tested in that configuration.
+
 ## Volume naming
 
 Cinder's `volume_name_template` becomes the iSCSI target name. TrueNAS accepts

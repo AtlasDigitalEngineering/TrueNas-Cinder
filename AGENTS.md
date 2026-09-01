@@ -332,6 +332,37 @@ wiring up a disk, and naming it would put it in front of `--delete-exports`.
 zvol at any flag: those are wrappers, a zvol is the disk, and a zvol with no
 Cinder volume may equally be a volume whose Cinder record was lost.
 
+**Two operations are serialised, and the rest deliberately are not.**
+`get_or_create_initiator_group` is a read-modify-write and TrueNAS enforces
+no uniqueness, so concurrent callers all read "absent" and all create. This
+is not a narrow window: measured in #18, **six concurrent calls produced six
+groups**. With the lock, the same six return one id.
+
+The export pipeline around it is **not** locked. Five concurrent
+extent/target/link builds were measured succeeding with consistent state,
+and serialising them costs real time on exactly the batch attach this
+matters for — 12.5s concurrent against 20.2s serial for five. Only the
+`reload` is serialised, because it reconfigures the appliance globally and
+costs nothing to hold. A reload landing while another volume's pipeline is
+half-built is harmless: that export is not usable either way, and its
+builder reloads when it finishes.
+
+Locks are keyed per appliance (`truenas-<host>-initiator`,
+`truenas-<host>-reload`), not globally: two backends pointing at different
+boxes have no reason to serialise against each other.
+
+They use `cinder.coordination.synchronized`, which is tooz-backed. With the
+default file backend that is one host; configure a distributed backend and
+it spans hosts. The driver still inherits `SUPPORTS_ACTIVE_ACTIVE = False`
+and active/active is untested — the locking does not by itself make it
+supported.
+
+**The driver now needs a started coordinator.** `COORDINATOR.get_lock`
+raises `LockCreationFailed` otherwise. Cinder starts one in the service;
+anything driving the driver outside a service must too, which is why the
+functional suite has a session-scoped `coordinator` fixture and the driver
+unit tests stub `get_lock`.
+
 **Never point tests or exploration at the production TrueNAS.** It holds every
 production VM disk as a zvol, and those are the migration's only copy. Use the
 dev appliance and a scratch pool; the functional suite refuses to run

@@ -301,3 +301,90 @@ def cleanup(client):
             failures.append("%s: %s: %s"
                             % (label, type(exc).__name__, exc))
     assert not failures, "teardown could not remove: %s" % "; ".join(failures)
+
+
+# --- driver-level fixtures ------------------------------------------------
+#
+# Skipped wholesale when Cinder is absent, so the client-level suite still
+# runs in the dependency-free environment.
+
+class _Cfg(object):
+    def __init__(self, **kw):
+        self._v = dict(kw)
+
+    def append_config_values(self, opts):
+        for opt in opts:
+            self._v.setdefault(opt.name, opt.default)
+
+    def safe_get(self, name):
+        return self._v.get(name)
+
+    def __getattr__(self, name):
+        try:
+            return self.__dict__["_v"][name]
+        except KeyError:
+            raise AttributeError(name)
+
+
+class _Volume(object):
+    def __init__(self, name, size=1):
+        self.name = name
+        self.size = size
+
+
+@pytest.fixture(scope="session")
+def coordinator():
+    """A started tooz coordinator, on a throwaway file backend.
+
+    The driver takes locks (#18), and `COORDINATOR.get_lock` raises
+    `LockCreationFailed` when the coordinator has not been started. Cinder
+    starts one in the service, so anything driving the driver outside a
+    service has to as well -- including this suite. Session-scoped because
+    it is process-global state either way.
+    """
+    import tempfile
+
+    from cinder import coordination
+    from oslo_config import cfg
+
+    state = tempfile.mkdtemp(prefix="cinder-func-lock-")
+    cfg.CONF.set_override("backend_url", "file://%s" % state,
+                          group="coordination")
+    coordination.COORDINATOR.start()
+    yield
+    coordination.COORDINATOR.stop()
+
+
+@pytest.fixture
+def driver(config, pool, request, portals, portal_addresses, iscsi_service,
+           coordinator):
+    """A driver whose setup validation has run against the appliance.
+
+    Depends on `portals` and `iscsi_service` because
+    `check_for_setup_error` requires both -- a fresh appliance has zero
+    portals and a STOPPED service, and without provisioning them this
+    module would error at fixture setup rather than run.
+
+    `truenas_iscsi_portal_id` is set explicitly rather than left to
+    discovery: the driver refuses to guess when an appliance has several
+    portals, and a shared appliance may well have several.
+    """
+    # Imported here, not at module scope: conftest is loaded for the
+    # client-level suite too, which runs without Cinder installed.
+    from truenas_cinder_driver import driver as tnd
+
+    url, key, _pool, verify_ssl = config
+    adopt_removes = getattr(request, "param", False)
+    cfg = _Cfg(truenas_api_url=url, truenas_api_key=key, truenas_pool=pool,
+               truenas_verify_ssl=verify_ssl,
+               truenas_iscsi_portal_id=portals[0],
+               truenas_iscsi_portal_addresses=portal_addresses,
+               truenas_adopt_removes_export=adopt_removes,
+               volume_backend_name="truenas-iscsi", san_is_local=False)
+    d = tnd.TrueNASISCSIDriver(configuration=cfg)
+    d.do_setup(None)
+    # Not merely setup: this is the check that fails loudly when the
+    # appliance is misconfigured, and it has to pass before anything below
+    # means anything.
+    d.check_for_setup_error()
+    return d

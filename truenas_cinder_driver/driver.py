@@ -9,10 +9,14 @@ Setup validates the appliance and never changes it: it does not create a
 portal or start the iSCSI service. See AGENTS.md for the reasoning.
 """
 
+import re
+from urllib.parse import urlsplit
+
 from oslo_config import cfg
 from oslo_log import log as logging
 
 from cinder.common import constants
+from cinder import coordination
 from cinder import exception
 from cinder.i18n import _
 from cinder.volume import configuration
@@ -108,6 +112,11 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         self.portal_addresses = []
         self.iscsi_basename = None
         self.iscsi_port = None
+        # Replaced in do_setup with an appliance-specific value. Present
+        # here so the lock name renders even if something calls a locked
+        # method before setup -- a missing attribute there would fail
+        # inside the decorator, where the cause is far from obvious.
+        self.lock_id = 'unconfigured'
 
     @staticmethod
     def get_driver_options():
@@ -153,6 +162,31 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
             # The client rejects a base_url carrying inline credentials.
             raise exception.InvalidInput(
                 reason=_('truenas_api_url is not usable: %s') % exc)
+
+        self.lock_id = self._appliance_lock_id(
+            self.configuration.truenas_api_url)
+
+    @staticmethod
+    def _appliance_lock_id(url):
+        """Derive a lock name component identifying one appliance.
+
+        Locks are per **appliance**, not global: two backends pointing at
+        different TrueNAS boxes have no reason to serialise against each
+        other, and one slow appliance should not stall attaches on
+        another.
+
+        The host is reduced to characters that are safe in a lock name --
+        tooz's file driver puts these in a path -- so `https://nas:443/`
+        and `https://nas/` both yield `nas`.
+
+        Args:
+            url: The configured ``truenas_api_url``
+
+        Returns:
+            A short, stable identifier
+        """
+        host = urlsplit(url).hostname or url
+        return re.sub(r'[^a-z0-9.-]', '-', host.lower()) or 'truenas'
 
     def check_for_setup_error(self):
         """Verify every precondition the driver depends on.
@@ -446,6 +480,54 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
             volume: The Cinder volume, unused
         """
 
+    @coordination.synchronized('truenas-{self.lock_id}-initiator')
+    def _initiator_group_for(self, initiator):
+        """Find or create the initiator group for one IQN, one at a time.
+
+        `get_or_create_initiator_group` is a read-modify-write: it lists
+        the groups, looks for a match, and creates one if absent. TrueNAS
+        enforces no uniqueness, so concurrent callers all read "absent"
+        and all create.
+
+        This is not a narrow window. Measured on the appliance in #18,
+        **six concurrent calls produced six groups** -- every one missed.
+        Duplicates then make later matching ambiguous and accumulate for
+        the life of the deployment, and `reconcile.py` reports them
+        because of this.
+
+        Args:
+            initiator: The connector's IQN
+
+        Returns:
+            The initiator group's id
+        """
+        return self.client.get_or_create_initiator_group([initiator])
+
+    @coordination.synchronized('truenas-{self.lock_id}-reload')
+    def _reload_exports(self):
+        """Reload the iSCSI service, one caller at a time.
+
+        A reload reconfigures the appliance's iSCSI stack globally, so
+        concurrent reloads are the one part of the export pipeline where
+        two callers touch the same thing at the same time.
+
+        **Only the reload is serialised, not the pipeline around it.**
+        Building extents, targets and links concurrently was measured in
+        #18 and did not fail: five parallel builds all succeeded and left
+        consistent state. Serialising the whole pipeline would have cost
+        real time on exactly the batch attach this matters for -- five
+        builds took 12.5s concurrently against 20.2s serially -- for a
+        race that did not reproduce.
+
+        A reload landing while another volume's pipeline is half-built is
+        harmless: that export is not usable yet either way, and its
+        builder reloads when it finishes.
+
+        Returns:
+            Whatever the appliance reported
+        """
+        return self.client.reload_iscsi_service()
+
     def create_export(self, context, volume, connector):
         """Export the volume over iSCSI and return what Cinder must persist.
 
@@ -476,7 +558,7 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         rollback = []
 
         try:
-            group_id = self.client.get_or_create_initiator_group([initiator])
+            group_id = self._initiator_group_for(initiator)
             extent_id = self._ensure_extent(pool, name, rollback)
             target_id = self._ensure_target(name, group_id, rollback)
             self._ensure_target_extent(target_id, extent_id)
@@ -484,7 +566,7 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
             # Until the service reloads, everything above is inert: the
             # appliance accepts the configuration and no initiator can see
             # it.
-            self.client.reload_iscsi_service()
+            self._reload_exports()
         except api_client.TrueNASAPIError as exc:
             for what, delete, resource_id in reversed(rollback):
                 self.client.best_effort_delete(delete, resource_id, what=what)
@@ -681,7 +763,7 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
             return
 
         try:
-            self.client.reload_iscsi_service()
+            self._reload_exports()
         except api_client.TrueNASAPIError as exc:
             LOG.warning('Removed %(removed)s for volume %(name)s but could '
                         'not reload the iSCSI service: %(err)s',
@@ -1986,7 +2068,7 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
                 removed.append('%s %s' % (what, row['id']))
 
         try:
-            self.client.reload_iscsi_service()
+            self._reload_exports()
         except api_client.TrueNASAPIError as exc:
             LOG.warning('Removed %(removed)s for %(disk)s but could not '
                         'reload the iSCSI service: %(err)s',

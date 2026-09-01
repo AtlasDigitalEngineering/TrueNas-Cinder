@@ -16,61 +16,7 @@ pytest.importorskip("cinder", reason="driver tests need Cinder installed")
 
 from cinder import exception                                    # noqa: E402
 
-from truenas_cinder_driver import driver as tnd                 # noqa: E402
-
-
-class _Cfg(object):
-    def __init__(self, **kw):
-        self._v = dict(kw)
-
-    def append_config_values(self, opts):
-        for opt in opts:
-            self._v.setdefault(opt.name, opt.default)
-
-    def safe_get(self, name):
-        return self._v.get(name)
-
-    def __getattr__(self, name):
-        try:
-            return self.__dict__["_v"][name]
-        except KeyError:
-            raise AttributeError(name)
-
-
-class _Volume(object):
-    def __init__(self, name, size=1):
-        self.name = name
-        self.size = size
-
-
-@pytest.fixture
-def driver(config, pool, request, portals, portal_addresses, iscsi_service):
-    """A driver whose setup validation has run against the appliance.
-
-    Depends on `portals` and `iscsi_service` because
-    `check_for_setup_error` requires both -- a fresh appliance has zero
-    portals and a STOPPED service, and without provisioning them this
-    module would error at fixture setup rather than run.
-
-    `truenas_iscsi_portal_id` is set explicitly rather than left to
-    discovery: the driver refuses to guess when an appliance has several
-    portals, and a shared appliance may well have several.
-    """
-    url, key, _pool, verify_ssl = config
-    adopt_removes = getattr(request, "param", False)
-    cfg = _Cfg(truenas_api_url=url, truenas_api_key=key, truenas_pool=pool,
-               truenas_verify_ssl=verify_ssl,
-               truenas_iscsi_portal_id=portals[0],
-               truenas_iscsi_portal_addresses=portal_addresses,
-               truenas_adopt_removes_export=adopt_removes,
-               volume_backend_name="truenas-iscsi", san_is_local=False)
-    d = tnd.TrueNASISCSIDriver(configuration=cfg)
-    d.do_setup(None)
-    # Not merely setup: this is the check that fails loudly when the
-    # appliance is misconfigured, and it has to pass before anything below
-    # means anything.
-    d.check_for_setup_error()
-    return d
+from tests.functional.conftest import _Volume                   # noqa: E402
 
 
 @pytest.fixture
