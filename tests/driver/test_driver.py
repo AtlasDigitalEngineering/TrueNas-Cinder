@@ -19,6 +19,7 @@ config option has regressed even if it still raises.
 import unittest
 from unittest import mock
 
+from cinder import coordination
 from cinder import exception
 
 import truenas_cinder_driver
@@ -53,6 +54,27 @@ class FakeConfiguration(object):
 
 class DriverTestCase(unittest.TestCase):
     """Base fixture: a driver with a mocked API client."""
+
+    def setUp(self):
+        """Stand in for the coordinator Cinder starts in the service.
+
+        `coordination.COORDINATOR.get_lock` returns None when the
+        coordinator has not been started, and the decorator then fails
+        inside a `with`. Tests are not the place to discover that.
+
+        The stub is deliberately *observable* -- `self.locks` records the
+        names requested -- so a test can assert a lock was actually taken.
+        A stub that silently swallowed every acquisition would make the
+        decorators invisible, and removing one would break nothing.
+        """
+        patcher = mock.patch.object(coordination.COORDINATOR, 'get_lock')
+        self.locks = patcher.start()
+        self.locks.return_value = mock.MagicMock()
+        self.addCleanup(patcher.stop)
+
+    def lock_names(self):
+        """Return the lock names acquired so far, as strings."""
+        return [call.args[0] for call in self.locks.call_args_list]
 
     def _configuration(self, **over):
         values = dict(
@@ -418,6 +440,36 @@ class FakeVolume(object):
                  size=10):
         self.name = name
         self.size = size
+
+
+class TestApplianceLockId(DriverTestCase):
+    """The lock name component identifying one appliance."""
+
+    def test_the_host_is_used(self):
+        self.assertEqual(
+            tnd.TrueNASISCSIDriver._appliance_lock_id('https://nas.example'),
+            'nas.example')
+
+    def test_a_port_does_not_change_it(self):
+        # https://nas/ and https://nas:443/ are the same appliance.
+        self.assertEqual(
+            tnd.TrueNASISCSIDriver._appliance_lock_id('https://nas:443/'),
+            tnd.TrueNASISCSIDriver._appliance_lock_id('https://nas/'))
+
+    def test_characters_unsafe_in_a_path_are_replaced(self):
+        # tooz's file driver puts the lock name in a path.
+        got = tnd.TrueNASISCSIDriver._appliance_lock_id('https://NAS_one/')
+
+        self.assertEqual(got, 'nas-one')
+
+    def test_a_bare_host_still_yields_something(self):
+        self.assertTrue(
+            tnd.TrueNASISCSIDriver._appliance_lock_id('nas.example'))
+
+    def test_two_appliances_do_not_share_a_lock(self):
+        self.assertNotEqual(
+            tnd.TrueNASISCSIDriver._appliance_lock_id('https://a.example'),
+            tnd.TrueNASISCSIDriver._appliance_lock_id('https://b.example'))
 
 
 class TestCreateVolume(DriverTestCase):
@@ -856,6 +908,71 @@ class TestCreateExportIsIdempotent(ExportTestCase):
         self.assertEqual(update['provider_id'], '27:27')
         # Still reloaded -- the export must be live even if nothing changed.
         driver.client.reload_iscsi_service.assert_called_once_with()
+
+
+class TestLocking(ExportTestCase):
+    """Serialisation of the two operations that are not concurrency-safe.
+
+    Measured on the appliance in #18: six concurrent
+    `get_or_create_initiator_group` calls produced **six** groups. The
+    pipeline build, by contrast, ran five ways concurrently without
+    failing, so it is deliberately not serialised -- see
+    `_reload_exports`.
+    """
+
+    def test_the_initiator_group_lookup_takes_a_lock(self):
+        driver = self._driver()
+        driver.lock_id = 'nas.example.com'
+
+        driver.create_export(None, FakeVolume(), {'initiator': 'iqn.a'})
+
+        self.assertIn('truenas-nas.example.com-initiator',
+                      self.lock_names())
+
+    def test_the_reload_takes_a_lock(self):
+        driver = self._driver()
+        driver.lock_id = 'nas.example.com'
+
+        driver.create_export(None, FakeVolume(), {'initiator': 'iqn.a'})
+
+        self.assertIn('truenas-nas.example.com-reload', self.lock_names())
+
+    def test_the_pipeline_build_itself_is_not_serialised(self):
+        # Deliberate. Five concurrent builds were measured succeeding, and
+        # serialising them cost 20.2s against 12.5s on exactly the batch
+        # attach this matters for. If a pipeline lock is ever added, this
+        # test should fail and be reconsidered, not deleted quietly.
+        driver = self._driver()
+        driver.lock_id = 'nas.example.com'
+
+        driver.create_export(None, FakeVolume(), {'initiator': 'iqn.a'})
+
+        self.assertNotIn('truenas-nas.example.com-pipeline',
+                         self.lock_names())
+
+    def test_locks_are_per_appliance_not_global(self):
+        # Two backends pointing at different boxes must not serialise
+        # against each other: one slow appliance would stall the other.
+        first = self._driver()
+        first.lock_id = 'nas-one'
+        second = self._driver()
+        second.lock_id = 'nas-two'
+
+        first.create_export(None, FakeVolume(), {'initiator': 'iqn.a'})
+        second.create_export(None, FakeVolume(), {'initiator': 'iqn.a'})
+
+        self.assertIn('truenas-nas-one-initiator', self.lock_names())
+        self.assertIn('truenas-nas-two-initiator', self.lock_names())
+
+    def test_remove_export_reload_is_also_serialised(self):
+        driver = self._driver()
+        driver.lock_id = 'nas.example.com'
+        driver.client.get_target_by_name.return_value = {'id': 9}
+        driver.client.get_extent_by_name.return_value = {'id': 8}
+
+        driver.remove_export(None, FakeVolume())
+
+        self.assertIn('truenas-nas.example.com-reload', self.lock_names())
 
 
 class TestRemoveExport(ExportTestCase):
