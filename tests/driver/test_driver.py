@@ -1525,6 +1525,27 @@ class TestManageExistingSnapshot(SnapshotTestCase):
         driver.client.rename_snapshot.assert_called_once_with(
             f'{POOL}/{snapshot.volume_name}@old-snap', snapshot.name)
 
+    def test_the_success_log_names_the_full_snapshot_path(self):
+        """#86: the bare name is ambiguous across datasets.
+
+        This is the line somebody greps for after an adoption, and its
+        own error path a few lines above logs the full
+        `pool/dataset@snapshot`. Logging less here than on the failure
+        path is backwards.
+        """
+        driver = self._driver()
+        snapshot = FakeSnapshot()
+
+        with mock.patch.object(tnd, 'LOG') as logger:
+            driver.manage_existing_snapshot(snapshot, self._ref(snapshot))
+
+        logged = ' '.join(str(call) for call in logger.info.call_args_list)
+        self.assertIn(f'{POOL}/{snapshot.volume_name}@old-snap', logged)
+        # Deliberately untagged: a lifecycle line already names the
+        # volume, and volume names are unique cloud-wide, so the backend
+        # is recoverable without a prefix (#61).
+        self.assertNotIn('[truenas-iscsi]', logged)
+
     def test_adoption_creates_and_deletes_nothing(self):
         driver = self._driver()
         snapshot = FakeSnapshot()

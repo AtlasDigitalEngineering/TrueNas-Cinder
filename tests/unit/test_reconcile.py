@@ -181,11 +181,39 @@ class TestInitiatorGroups(unittest.TestCase):
 
         report = reconcile.find_orphans(client, POOL, set())
 
-        self.assertEqual(len(report["duplicate_initiator_groups"]), 1)
-        self.assertEqual(
-            sorted(g["id"] for g in report["duplicate_initiator_groups"][0]),
-            [1, 2])
+        # One row per cluster, shaped like every other class in the report
+        # so that `describe`'s renderers all take a row (#97).
+        self.assertEqual(report["duplicate_initiator_groups"],
+                         [{"ids": [1, 2], "initiators": ["iqn.a"]}])
         self.assertTrue(reconcile.has_leaks(report))
+
+    def test_a_duplicate_cluster_renders_like_its_siblings(self):
+        # The renderer used to take the cluster while every other renderer
+        # took a row, so `describe` had one entry that could not be called
+        # the same way as the rest.
+        client = _client(groups=[
+            {"id": 1, "initiators": ["iqn.a"]},
+            {"id": 2, "initiators": ["iqn.a"]},
+        ])
+        report = reconcile.find_orphans(client, POOL, set())
+
+        rendered = reconcile.describe(report, POOL)
+
+        self.assertIn("groups 1, 2 all hold ['iqn.a']", rendered)
+
+    def test_three_groups_holding_one_iqn_are_one_cluster(self):
+        # Not three rows: being a duplicate is a property of the set, and
+        # there is no basis for calling any one of them the original.
+        client = _client(groups=[
+            {"id": 1, "initiators": ["iqn.a"]},
+            {"id": 2, "initiators": ["iqn.a"]},
+            {"id": 3, "initiators": ["iqn.a"]},
+        ])
+
+        report = reconcile.find_orphans(client, POOL, set())
+
+        self.assertEqual(report["duplicate_initiator_groups"],
+                         [{"ids": [1, 2, 3], "initiators": ["iqn.a"]}])
 
     def test_distinct_groups_are_not_duplicates(self):
         client = _client(groups=[
