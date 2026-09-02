@@ -136,7 +136,13 @@ mixed-case org name here gets `invalid reference format` from the pull.
 
 Multipath needs `enable_multipathd: "yes"` here, and
 `volume_use_multipath = true` under `[libvirt]` in `nova.conf`, and the compute
-nodes must be able to reach every portal address advertised. See
+nodes must be able to reach every portal address advertised.
+
+That last one is not advisory. An address a compute node cannot reach adds
+~130s to every attach on that node and leaves the volume on a single path with
+no device-mapper node — while the volume still reports `in-use` and nothing
+outside `nova-compute.log` mentions it (#64). Check reachability from each
+compute node, not just from the controller. See
 [configuration.md](configuration.md).
 
 ## 5. Give it the backend configuration
