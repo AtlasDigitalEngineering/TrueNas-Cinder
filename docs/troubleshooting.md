@@ -217,6 +217,14 @@ remove them. The zvol and its data are untouched either way.
 
 The refusal names **only** the objects blocking this adoption.
 
+### Every adoption is refused as "in use", even with the machine stopped
+
+The disks share one iSCSI target, and the appliance reports sessions per target
+with no LUN — so the driver cannot tell which disk a session belongs to and
+refuses while *any* of them is attached. Remove that disk's extent by hand and
+adopt the zvol with no export at all; see
+[migration.md](migration.md).
+
 ### `in use: N live iSCSI session(s) from ...`
 
 Refused, and this one is **not** configurable at any setting. Renaming a disk

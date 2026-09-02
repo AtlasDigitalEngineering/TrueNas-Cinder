@@ -167,6 +167,59 @@ The refusal names **only** the objects blocking this adoption. If it mentions
 `target 11` and `extent 8`, those are the two to remove; anything else on the
 appliance belongs to something different.
 
+## When several disks share one iSCSI target
+
+Hand-provisioned estates are often built with **one target serving many
+extents**, a LUN per disk, rather than a target per disk. That shape changes
+the migration in two ways, and it is worth checking which one you have before
+starting:
+
+```bash
+curl -sk -H "Authorization: Bearer $TRUENAS_API_KEY" \
+  "https://<appliance>/api/v2.0/iscsi/targetextent" \
+  | jq -r '.[] | .target' | sort | uniq -c | sort -rn | head
+```
+
+A count greater than one against a single target id means that target is
+shared.
+
+### Adoption is refused while any disk on the target is attached
+
+The driver refuses to adopt a zvol whose target has live iSCSI sessions, and it
+cannot tell *which* disk a session belongs to — the appliance reports sessions
+per target, and a session carries no LUN. On a shared target, one running
+machine therefore blocks adoption of every disk on it, not just its own.
+
+Stopping the whole estate to migrate it one disk at a time defeats the point.
+Use the path below instead.
+
+### Remove the disk's extent by hand, then adopt
+
+Removing an **extent** frees the zvol and touches nothing else. The target
+stays up, the other disks keep serving, and the driver — finding a zvol with no
+extent at all — adopts it without consulting the target or its sessions.
+
+1. Stop the machine using the disk.
+2. On the appliance, delete **that disk's extent**. Its target-extent
+   association is removed with it.
+3. `cinder manage` the zvol as usual.
+
+**Delete the extent, never the target.** Deleting a target removes the
+association for every extent on it, so on a shared target that unexports every
+machine still using it. The driver will not do this, and its refusal message
+says so when it detects a shared target — but the appliance UI will let you.
+
+### What the driver does with `truenas_adopt_removes_export = true`
+
+It removes the extent, and removes the target **only if nothing else is left on
+it**. On a target-per-disk estate the target is cleaned up as before; on a
+shared one it is left in place and the reason is logged:
+
+```
+Left iSCSI target 4 in place while adopting zvol/<pool>/<disk>:
+it still serves 12 other extent(s). Deleting it would have unexported them.
+```
+
 ## When an adoption fails
 
 **Cinder tells you almost nothing through the API.** A refused adoption leaves

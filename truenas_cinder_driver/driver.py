@@ -2137,22 +2137,70 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
                 % {'pool': pool, 'name': name, 'count': len(sessions),
                    'initiators': self._describe_sessions(sessions)})
 
-        described = ', '.join(
-            ['target %s' % target['id'] for target in targets]
-            + ['extent %s' % extent['id'] for extent in extents])
-
         if not self.configuration.truenas_adopt_removes_export:
+            # Name the **extent** as the thing to remove. The extent is
+            # what pins the zvol, and it belongs to this disk alone; the
+            # target may be serving many others, and telling an operator
+            # that removing it "is safe" would be true of the zvol and
+            # false of everything else on that target (#113).
             raise self._bad_reference(
                 existing_ref,
-                _("'%(pool)s/%(name)s' is already exported over "
-                  "iSCSI by %(described)s. Nothing is connected to "
-                  "it, so removing that export is safe and leaves "
-                  "the zvol untouched -- do it on the appliance and "
-                  "retry, or set truenas_adopt_removes_export = "
-                  "true to have the driver do it.")
-                % {'pool': pool, 'name': name, 'described': described})
+                _("'%(pool)s/%(name)s' is already exported over iSCSI "
+                  "by %(extents)s%(shared)s. Remove %(those)s on the "
+                  "appliance and retry, or set "
+                  "truenas_adopt_removes_export = true to have the "
+                  "driver do it. Removing an extent frees the zvol and "
+                  "leaves its data untouched.")
+                % {'pool': pool, 'name': name,
+                   'extents': ', '.join('extent %s' % extent['id']
+                                        for extent in extents),
+                   'shared': self._describe_target_sharing(targets),
+                   'those': 'them' if len(extents) > 1 else 'it'})
 
         self._remove_conflicting_export(disk, targets, extents)
+
+    def _describe_target_sharing(self, targets):
+        """Say whether the targets involved serve anything else.
+
+        An operator reading a refusal reaches for the appliance UI, and
+        the dangerous move there is deleting the target rather than the
+        extent. On a one-target-per-disk estate that is harmless; on a
+        shared one it unexports every other disk. Saying which shape they
+        are looking at costs one sentence (#113).
+
+        Args:
+            targets: Target rows serving this zvol
+
+        Returns:
+            A clause to append to the refusal, or empty when there is
+            nothing worth warning about
+        """
+        if not targets:
+            return ''
+        try:
+            links = self.client.get_target_extents()
+        except api_client.TrueNASAPIError:
+            # The refusal is more useful than this sentence. Losing it is
+            # better than turning a clear "already exported" into an
+            # appliance error.
+            return ''
+
+        ids = {target['id'] for target in targets}
+        shared = sorted(
+            {link['target'] for link in links if link['target'] in ids}
+            & ids)
+        counts = {target_id: len([link for link in links
+                                  if link['target'] == target_id])
+                  for target_id in shared}
+        crowded = {target_id: count for target_id, count in counts.items()
+                   if count > len(ids)}
+        if not crowded:
+            return ''
+        return _(
+            '. Its target (%(targets)s) also serves other extents, so '
+            'do not delete the target -- that would unexport every disk '
+            'on it') % {
+                'targets': ', '.join(str(t) for t in sorted(crowded))}
 
     @staticmethod
     def _extents_for_disk(extents, disk):
@@ -2265,39 +2313,75 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
                 if session.get('target') in iqns]
 
     def _remove_conflicting_export(self, disk, targets, extents):
-        """Delete an idle export standing in the way of an adoption.
+        """Free a zvol from the export standing in the way of adoption.
 
-        Targets before extents, matching :meth:`remove_export`: deleting
-        either end cascades the association, and the extent is what pins
-        the zvol.
+        **Extents first, and a target only once nothing else is on it.**
+        The extent is what pins the zvol, and deleting it cascades its own
+        association. The target is a wrapper, and it is not necessarily
+        this volume's alone: one target serving many extents is the normal
+        shape of a hand-provisioned estate, and deleting it would cascade
+        every *other* disk's association with it -- unexporting machines
+        that have nothing to do with the adoption (#113).
+
+        So the target is deleted only when the appliance reports no links
+        left on it. Re-read rather than inferred: the driver knows which
+        links it removed, not which ones existed.
 
         Args:
             disk: Zvol disk path, for logging
-            targets: Target rows to delete
-            extents: Extent rows to delete
+            targets: Target rows serving this zvol
+            extents: Extent rows pinning this zvol
 
         Raises:
             VolumeBackendAPIException: If anything could not be removed,
                 before the zvol has been renamed
         """
         removed = []
-        for what, rows, delete in (
-            ('target', targets, self.client.delete_target),
-            ('extent', extents, self.client.delete_extent),
-        ):
-            for row in rows:
-                try:
-                    delete(row['id'])
-                except api_client.TrueNASAPINotFoundError:
-                    continue
-                except api_client.TrueNASAPIError as exc:
-                    raise self._backend_error(
-                        _('Could not remove iSCSI %(what)s %(id)s '
-                          'while adopting %(disk)s, so the zvol has '
-                          'not been renamed: %(err)s')
-                        % {'what': what, 'id': row['id'],
-                           'disk': disk, 'err': exc})
-                removed.append('%s %s' % (what, row['id']))
+
+        def drop(what, resource_id):
+            try:
+                if what == 'extent':
+                    self.client.delete_extent(resource_id)
+                else:
+                    self.client.delete_target(resource_id)
+            except api_client.TrueNASAPINotFoundError:
+                return
+            except api_client.TrueNASAPIError as exc:
+                raise self._backend_error(
+                    _('Could not remove iSCSI %(what)s %(id)s '
+                      'while adopting %(disk)s, so the zvol has '
+                      'not been renamed: %(err)s')
+                    % {'what': what, 'id': resource_id,
+                       'disk': disk, 'err': exc})
+            removed.append('%s %s' % (what, resource_id))
+
+        for extent in extents:
+            drop('extent', extent['id'])
+
+        # Now that this zvol's extents are gone, anything still linked to
+        # one of these targets belongs to something else.
+        try:
+            remaining = self.client.get_target_extents()
+        except api_client.TrueNASAPIError as exc:
+            raise self._backend_error(
+                _('Removed %(removed)s for %(disk)s but could not read '
+                  'the remaining iSCSI associations, so it is not safe '
+                  'to say whether any target is now empty: %(err)s')
+                % {'removed': ', '.join(removed) or 'nothing',
+                   'disk': disk, 'err': exc})
+        still_serving = {link['target'] for link in remaining}
+
+        for target in targets:
+            if target['id'] in still_serving:
+                others = len([link for link in remaining
+                              if link['target'] == target['id']])
+                LOG.info(
+                    'Left iSCSI target %(id)s in place while adopting '
+                    '%(disk)s: it still serves %(count)d other extent(s). '
+                    'Deleting it would have unexported them.',
+                    {'id': target['id'], 'disk': disk, 'count': others})
+                continue
+            drop('target', target['id'])
 
         try:
             self._reload_exports()
@@ -2307,10 +2391,10 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
                 'the iSCSI service: %(err)s'),
                 {'removed': ', '.join(removed), 'disk': disk,
                  'err': exc})
-        LOG.info('Removed %(removed)s that were exporting %(disk)s, as '
+        LOG.info('Removed %(removed)s, which was exporting %(disk)s, as '
                  'truenas_adopt_removes_export is set. The zvol itself was '
                  'not touched.',
-                 {'removed': ', '.join(removed), 'disk': disk})
+                 {'removed': ', '.join(removed) or 'nothing', 'disk': disk})
 
     def _update_volume_stats(self):
         """Report real capacity so the scheduler will place volumes here.

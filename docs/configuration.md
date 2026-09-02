@@ -60,7 +60,8 @@ truenas_verify_ssl = true
 # Only consulted by `cinder manage`. Off means the driver refuses to adopt a
 # zvol that already has an iSCSI export and tells you what to remove; on means
 # it removes that export itself. Either way it refuses a zvol with a live
-# session. See "Adopting existing zvols" below.
+# session, and either way it removes the *extent* -- a target is deleted only
+# once nothing else is left on it. See "Adopting existing zvols" below.
 #truenas_adopt_removes_export = false
 ```
 

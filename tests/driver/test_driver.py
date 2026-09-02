@@ -2204,17 +2204,56 @@ class AdoptionTestCase(ExportTestCase):
     def _ref(self, source=None):
         return {'source-name': f'{POOL}/{source or self.SOURCE}'}
 
-    def _export_the_source(self, driver, with_session=False):
-        """Point the mocks at a zvol that already has an export."""
+    @staticmethod
+    def _cascade(driver, links):
+        """Make `get_target_extents` reflect deleted extents.
+
+        Deleting an extent removes its association on a real appliance
+        (#12). A static list would have the driver believe a target it
+        just emptied is still occupied, which is the opposite of what
+        the adoption path re-reads the links to find out (#113).
+        """
+        all_links = list(links)
+        gone = set()
+        driver.client.delete_extent.side_effect = gone.add
+        driver.client.get_target_extents.side_effect = (
+            lambda: [link for link in all_links
+                     if link['extent'] not in gone])
+
+    def _export_the_source(self, driver, with_session=False, links=None,
+                           extents=None):
+        """Point the mocks at a zvol that already has an export.
+
+        `get_target_extents` **models the cascade**: deleting an extent
+        removes its association on a real appliance (#12), so a static
+        list would leave the driver believing a target it has just
+        emptied is still occupied. The adoption path re-reads the links
+        precisely to find that out, so a fixture that does not reflect
+        the deletion tests the opposite of the intended behaviour (#113).
+
+        Args:
+            driver: The driver whose client mocks to arrange
+            with_session: Give the source zvol a live iSCSI session
+            links: Override the target-extent rows, for a shared target
+            extents: Override the extent rows
+        """
         disk = f'zvol/{POOL}/{self.SOURCE}'
-        driver.client.get_extents.return_value = [
+        driver.client.get_extents.return_value = extents or [
             {'id': 8, 'name': self.SOURCE, 'disk': disk},
             {'id': 9, 'name': 'unrelated', 'disk': f'zvol/{POOL}/other'},
         ]
-        driver.client.get_target_extents.return_value = [
+        all_links = list(links or [
             {'id': 10, 'target': 11, 'extent': 8},
             {'id': 12, 'target': 13, 'extent': 9},
-        ]
+        ])
+        gone = set()
+
+        def remaining_links():
+            return [link for link in all_links
+                    if link['extent'] not in gone]
+
+        driver.client.delete_extent.side_effect = gone.add
+        driver.client.get_target_extents.side_effect = remaining_links
         driver.client.get_targets.return_value = [
             {'id': 11, 'name': self.SOURCE},
             {'id': 13, 'name': 'unrelated'},
@@ -2467,8 +2506,12 @@ class TestAdoptionSafetyGate(AdoptionTestCase):
             driver.manage_existing(FakeVolume(), self._ref())
 
         driver.client.rename_zvol.assert_not_called()
-        self.assertIn('target 11', str(caught.exception))
+        # The extent, not the target: the extent pins the zvol and
+        # belongs to this disk alone, while the target may serve others.
+        # Telling an operator to remove the target is how a shared target
+        # gets deleted (#113).
         self.assertIn('extent 8', str(caught.exception))
+        self.assertNotIn('target 11', str(caught.exception))
 
     def test_the_refusal_names_only_the_conflicting_objects(self):
         # An export belonging to a different zvol must not be named, or
@@ -2508,6 +2551,105 @@ class TestAdoptionSafetyGate(AdoptionTestCase):
 
         self.assertIn('truenas-nas.example.com-reload', self.lock_names())
 
+    def _share_one_target(self, driver):
+        """One target serving this zvol and two others (#113).
+
+        The shape of a hand-provisioned estate, and the one dev cannot
+        produce: every disk hangs off a single target at its own LUN.
+        """
+        disk = f'zvol/{POOL}/{self.SOURCE}'
+        return self._export_the_source(
+            driver,
+            extents=[
+                {'id': 8, 'name': self.SOURCE, 'disk': disk},
+                {'id': 9, 'name': 'neighbour-a',
+                 'disk': f'zvol/{POOL}/neighbour-a'},
+                {'id': 14, 'name': 'neighbour-b',
+                 'disk': f'zvol/{POOL}/neighbour-b'},
+            ],
+            links=[
+                {'id': 10, 'target': 11, 'extent': 8},
+                {'id': 12, 'target': 11, 'extent': 9},
+                {'id': 15, 'target': 11, 'extent': 14},
+            ])
+
+    def test_a_shared_target_survives_the_adoption(self):
+        """The outage this exists to prevent (#113).
+
+        Deleting a target cascades every association on it. Where one
+        target serves a whole estate, adopting a single disk would
+        unexport all of its neighbours — in one call, with no warning.
+        """
+        driver = self._share_one_target(
+            self._driver(truenas_adopt_removes_export=True))
+
+        driver.manage_existing(FakeVolume(), self._ref())
+
+        driver.client.delete_target.assert_not_called()
+        # Only this zvol's extent goes; the neighbours' are untouched.
+        driver.client.delete_extent.assert_called_once_with(8)
+        driver.client.rename_zvol.assert_called_once()
+
+    def test_a_shared_targets_neighbours_keep_their_links(self):
+        # The consequence that matters, asserted on the links rather than
+        # on which calls were made: a neighbour with no association is
+        # unexported whether or not its extent still exists.
+        driver = self._share_one_target(
+            self._driver(truenas_adopt_removes_export=True))
+
+        driver.manage_existing(FakeVolume(), self._ref())
+
+        survivors = {link['extent']
+                     for link in driver.client.get_target_extents()}
+        self.assertEqual(survivors, {9, 14})
+
+    def test_a_target_left_in_place_says_why(self):
+        # An operator seeing a target survive an adoption should not have
+        # to guess whether that was deliberate.
+        driver = self._share_one_target(
+            self._driver(truenas_adopt_removes_export=True))
+
+        with mock.patch.object(tnd, 'LOG') as logger:
+            driver.manage_existing(FakeVolume(), self._ref())
+
+        logged = ' '.join(str(call) for call in logger.info.call_args_list)
+        self.assertIn('still serves', logged)
+
+    def test_a_target_serving_only_this_zvol_is_still_removed(self):
+        # The fix must not turn into "never delete a target", which would
+        # leave one orphan per disk across a whole migration.
+        driver = self._export_the_source(
+            self._driver(truenas_adopt_removes_export=True))
+
+        driver.manage_existing(FakeVolume(), self._ref())
+
+        driver.client.delete_target.assert_called_once_with(11)
+
+    def test_the_refusal_warns_when_the_target_is_shared(self):
+        # Default configuration: the driver refuses and the operator goes
+        # to the appliance. The dangerous move there is deleting the
+        # target, so the message has to say not to.
+        driver = self._share_one_target(self._driver())
+
+        with self.assertRaises(
+                exception.ManageExistingInvalidReference) as caught:
+            driver.manage_existing(FakeVolume(), self._ref())
+
+        message = str(caught.exception)
+        self.assertIn('extent 8', message)
+        self.assertIn('do not delete the target', message)
+
+    def test_the_refusal_stays_quiet_when_the_target_is_not_shared(self):
+        # The warning has to mean something. If every refusal carried it,
+        # it would be ignored on the estate where it matters.
+        driver = self._export_the_source(self._driver())
+
+        with self.assertRaises(
+                exception.ManageExistingInvalidReference) as caught:
+            driver.manage_existing(FakeVolume(), self._ref())
+
+        self.assertNotIn('do not delete the target', str(caught.exception))
+
     def test_a_live_session_is_refused_even_with_removal_enabled(self):
         # The one case no configuration may authorise: renaming a zvol out
         # from under a connected initiator breaks it mid-write.
@@ -2537,20 +2679,27 @@ class TestAdoptionSafetyGate(AdoptionTestCase):
 
         driver.client.rename_zvol.assert_called_once()
 
-    def test_removal_when_enabled_takes_the_target_before_the_extent(self):
-        # Same order as remove_export: deleting either end cascades the
-        # association, and the extent is what pins the zvol.
+    def test_removal_takes_the_extent_first_then_the_emptied_target(self):
+        """Extent first, so the target's emptiness can be observed (#113).
+
+        The old order deleted the target first, which cascaded every
+        association on it — fine when a target serves one disk, and an
+        outage when it serves twenty. Removing the extent first frees the
+        zvol; the target is then deleted only because nothing else is on
+        it.
+        """
         driver = self._export_the_source(
             self._driver(truenas_adopt_removes_export=True))
         order = []
         driver.client.delete_target.side_effect = (
             lambda i: order.append(('target', i)))
+        original = driver.client.delete_extent.side_effect
         driver.client.delete_extent.side_effect = (
-            lambda i: order.append(('extent', i)))
+            lambda i: (original(i), order.append(('extent', i)))[-1])
 
         driver.manage_existing(FakeVolume(), self._ref())
 
-        self.assertEqual(order, [('target', 11), ('extent', 8)])
+        self.assertEqual(order, [('extent', 8), ('target', 11)])
 
     def test_removal_leaves_unrelated_exports_alone(self):
         driver = self._export_the_source(
@@ -2637,10 +2786,10 @@ class TestAdoptionSafetyGate(AdoptionTestCase):
             {'id': 21, 'name': 'nested', 'disk': disk},
             {'id': 22, 'name': 'flat', 'disk': f'zvol/{POOL}/vm-100-disk-0'},
         ]
-        driver.client.get_target_extents.return_value = [
+        self._cascade(driver, [
             {'id': 23, 'target': 24, 'extent': 21},
             {'id': 25, 'target': 26, 'extent': 22},
-        ]
+        ])
         driver.client.get_targets.return_value = [
             {'id': 24, 'name': 'nested'}, {'id': 26, 'name': 'flat'},
         ]
@@ -2650,7 +2799,9 @@ class TestAdoptionSafetyGate(AdoptionTestCase):
             driver.manage_existing(FakeVolume(), self._ref(nested))
 
         message = str(caught.exception)
-        self.assertIn('target 24', message)
+        # The extent for the nested zvol, not the flat one's, and not
+        # the target -- see test_an_idle_export_is_refused_by_default.
+        self.assertNotIn('target 24', message)
         self.assertIn('extent 21', message)
         # The flat zvol whose name is a suffix of the nested one must not
         # be caught up in it.
@@ -2669,10 +2820,10 @@ class TestAdoptionSafetyGate(AdoptionTestCase):
             {'id': 21, 'name': 'nested', 'disk': disk},
             {'id': 22, 'name': 'flat', 'disk': f'zvol/{POOL}/vm-100-disk-0'},
         ]
-        driver.client.get_target_extents.return_value = [
+        self._cascade(driver, [
             {'id': 23, 'target': 24, 'extent': 21},
             {'id': 25, 'target': 26, 'extent': 22},
-        ]
+        ])
         driver.client.get_targets.return_value = [
             {'id': 24, 'name': 'nested'}, {'id': 26, 'name': 'flat'},
         ]
