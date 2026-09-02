@@ -188,6 +188,14 @@ docker logs cinder_volume 2>&1 | grep -i "invalid backend reference"
 grep -i "invalid backend reference" /var/log/kolla/cinder/cinder-volume.log
 ```
 
+The reason is prefixed with the backend that refused it, so with several
+backends configured you can narrow to one:
+
+```
+... invalid backend reference {'source-name': 'Dev-Pool/vm-101'}:
+[truenas-iscsi] Dev-Pool/vm-101 is exported over iSCSI by target 30, ...
+```
+
 Delete the errored volume record before retrying. It is safe: the record's
 name never existed on the appliance, and `delete_volume` resolves by name, so
 it finds nothing and treats the delete as complete. The zvol you were trying

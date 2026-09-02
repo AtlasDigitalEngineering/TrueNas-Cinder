@@ -16,6 +16,7 @@ the problem from the message alone, so a message that stops naming the
 config option has regressed even if it still raises.
 """
 
+import pathlib
 import unittest
 from unittest import mock
 
@@ -470,6 +471,259 @@ class TestApplianceLockId(DriverTestCase):
         self.assertNotEqual(
             tnd.TrueNASISCSIDriver._appliance_lock_id('https://a.example'),
             tnd.TrueNASISCSIDriver._appliance_lock_id('https://b.example'))
+
+
+class TestBackendIdentity(DriverTestCase):
+    """Every message an operator acts on names the backend it came from.
+
+    With one backend this is redundant. Cinder multi-backend is routine
+    and this migration may span more than one appliance, and then a
+    message saying the iSCSI service is stopped *somewhere* costs the
+    operator the time it takes to check each one. The traceback does not
+    help: it names the driver class, which is identical across every
+    instance of it.
+    """
+
+    def test_the_backend_is_named_as_the_operator_wrote_it(self):
+        # volume_backend_name, not the URL: it is what is in their
+        # cinder.conf and what `openstack volume service list` prints.
+        self.assertEqual(self._driver().backend_name, 'truenas-iscsi')
+
+    def test_without_a_backend_name_the_host_identifies_it(self):
+        driver = self._driver(volume_backend_name=None)
+
+        # The host, not the URL: see the credential test below.
+        self.assertEqual(driver.backend_name, 'truenas.example.com')
+
+    def test_the_tag_never_carries_inline_credentials(self):
+        """The message that rejects them must not print them (#61).
+
+        `do_setup` refuses a `truenas_api_url` with a userinfo component,
+        because requests turns it into a Basic header that overwrites the
+        Bearer key and keeps it in `response.url` (#11). Tagging that
+        refusal with the raw URL printed the password immediately before
+        the sentence explaining that inline credentials leak.
+
+        Asserted on the password rather than on the whole URL, so that
+        any future identifier that happens to include the userinfo fails
+        here however it is formatted.
+        """
+        driver = self._driver(
+            volume_backend_name=None,
+            truenas_api_url='https://admin:sup3rs3cret@truenas.example.com')
+
+        with self.assertRaises(exception.InvalidInput) as caught:
+            driver.do_setup(None)
+
+        message = str(caught.exception)
+        self.assertNotIn('sup3rs3cret', message)
+        self.assertNotIn('admin:', message)
+        # Still identifies the appliance, or the tag is worthless.
+        self.assertIn('[truenas.example.com]', message)
+
+    def test_a_malformed_url_does_not_replace_the_real_error(self):
+        """`backend_name` runs while a failure is being reported.
+
+        Raising here would swap the operator's actual problem for a
+        parse error inside the driver's own logging.
+        """
+        driver = self._driver(volume_backend_name=None,
+                              truenas_api_url='https://[not-an-ipv6/')
+
+        self.assertEqual(driver.backend_name, 'TrueNASISCSIDriver')
+
+    def test_with_neither_it_still_names_something(self):
+        # Never empty: `[] The iSCSI service is STOPPED` would be worse
+        # than no tag at all, because it looks like a bug in the driver
+        # rather than a gap in the configuration.
+        driver = self._driver(volume_backend_name=None, truenas_api_url=None)
+
+        self.assertEqual(driver.backend_name, 'TrueNASISCSIDriver')
+
+    def test_the_identifier_resolves_when_the_message_is_built(self):
+        """Not cached at setup -- setup is what raises most of these.
+
+        `check_for_setup_error` fails before any state a `do_setup` could
+        have resolved, so an identifier captured there would be captured
+        too late to name the failure setup itself produced.
+        """
+        driver = self._driver()
+        driver.configuration._values['volume_backend_name'] = 'renamed'
+
+        self.assertIn('[renamed]', driver._tagged('anything'))
+
+    def test_a_configuration_error_names_the_backend(self):
+        driver = self._driver()
+        driver.client.get_pool_list.return_value = [{'name': 'Other-Pool'}]
+
+        with self.assertRaises(exception.InvalidInput) as caught:
+            driver.check_for_setup_error()
+
+        self.assertIn('[truenas-iscsi]', str(caught.exception))
+        # The tag is an addition, not a replacement: the message still
+        # has to be actionable on its own.
+        self.assertIn('truenas_pool', str(caught.exception))
+
+    def test_an_appliance_error_names_the_backend(self):
+        driver = self._driver()
+        driver.client.get_pool_list.side_effect = api_client.TrueNASAPIError(
+            'connection refused')
+
+        with self.assertRaises(exception.VolumeBackendAPIException) as caught:
+            driver.check_for_setup_error()
+
+        self.assertIn('[truenas-iscsi]', str(caught.exception))
+
+    def test_a_refused_adoption_names_the_backend(self):
+        driver = self._driver()
+
+        with self.assertRaises(
+                exception.ManageExistingInvalidReference) as caught:
+            driver.manage_existing_get_size(FakeVolume('volume-x'), {})
+
+        self.assertIn('[truenas-iscsi]', str(caught.exception))
+
+    def test_a_warning_names_the_backend(self):
+        driver = self._driver()
+        driver.client.get_iscsi_service.return_value = {
+            'service': 'iscsitarget', 'state': 'RUNNING', 'enable': False,
+        }
+
+        with mock.patch.object(tnd, 'LOG') as logger:
+            driver.check_for_setup_error()
+
+        warned = ' '.join(str(call) for call in logger.warning.call_args_list)
+        self.assertIn('[truenas-iscsi]', warned)
+        self.assertIn('enabled at boot', warned)
+
+
+class TestEveryMessageNamesItsBackend(unittest.TestCase):
+    """Structural guard, so a message added later cannot skip the tag.
+
+    The tests above assert the tag on the messages that exist today. The
+    case worth protecting against is the one added next month, and no
+    number of per-message assertions catches that -- they only ever
+    cover what someone already remembered to cover.
+
+    So this reads `driver.py` itself and fails on an untagged message,
+    which is a thing that can be *written* rather than a thing that must
+    be *thought of*.
+    """
+
+    # Where an operator reads a log line that names no volume. A
+    # lifecycle line always names the volume or snapshot it acted on, and
+    # those names are globally unique, so the backend is already
+    # recoverable from them. A setup line names only appliance-side
+    # objects -- portal 26, pool Dev-Pool -- which are not.
+    SETUP_PATH = frozenset({
+        'do_setup',
+        'check_for_setup_error',
+        '_require_reachable_appliance',
+        '_require_pool_exists',
+        '_require_iscsi_service_running',
+        '_resolve_portal',
+        '_resolve_portal_addresses',
+        '_resolve_iscsi_global',
+        '_require_usable_volume_name_template',
+    })
+
+    # Exceptions whose message this driver composes, each with the
+    # factory that tags it. Cinder composes the rest from keyword
+    # arguments -- `VolumeIsBusy(volume_name=...)` and its siblings --
+    # and there is no message of ours to prefix.
+    FACTORIES = {
+        'InvalidInput': '_config_error',
+        'VolumeBackendAPIException': '_backend_error',
+        'ManageExistingInvalidReference': '_bad_reference',
+    }
+
+    def setUp(self):
+        import ast
+
+        self.ast = ast
+        self.tree = ast.parse(
+            pathlib.Path(tnd.__file__).read_text())
+
+    def _is_tagged(self, node):
+        return (isinstance(node, self.ast.Call)
+                and isinstance(node.func, self.ast.Attribute)
+                and node.func.attr == '_tagged'
+                and isinstance(node.func.value, self.ast.Name)
+                and node.func.value.id == 'self')
+
+    def _functions(self):
+        for node in self.ast.walk(self.tree):
+            if isinstance(node, self.ast.FunctionDef):
+                yield node
+
+    def test_composed_exceptions_are_built_by_their_factory(self):
+        """`exception.X(...)` direct is what skips the tag."""
+        direct = []
+        for function in self._functions():
+            if function.name in self.FACTORIES.values():
+                continue                      # the factories themselves
+            for node in self.ast.walk(function):
+                if (isinstance(node, self.ast.Call)
+                        and isinstance(node.func, self.ast.Attribute)
+                        and isinstance(node.func.value, self.ast.Name)
+                        and node.func.value.id == 'exception'
+                        and node.func.attr in self.FACTORIES):
+                    direct.append('driver.py:%d in %s(): use self.%s()'
+                                  % (node.lineno, function.name,
+                                     self.FACTORIES[node.func.attr]))
+
+        self.assertEqual(direct, [], 'untagged exception(s):\n  %s'
+                         % '\n  '.join(direct))
+
+    def test_operator_facing_log_lines_are_tagged(self):
+        untagged = []
+        for function in self._functions():
+            for node in self.ast.walk(function):
+                if not (isinstance(node, self.ast.Call)
+                        and isinstance(node.func, self.ast.Attribute)
+                        and isinstance(node.func.value, self.ast.Name)
+                        and node.func.value.id == 'LOG'
+                        and node.args):
+                    continue
+                operator_facing = (function.name in self.SETUP_PATH
+                                   or node.func.attr in ('error', 'warning'))
+                if operator_facing and not self._is_tagged(node.args[0]):
+                    untagged.append(
+                        'driver.py:%d in %s(): LOG.%s needs self._tagged()'
+                        % (node.lineno, function.name, node.func.attr))
+
+        self.assertEqual(untagged, [], 'untagged log line(s):\n  %s'
+                         % '\n  '.join(untagged))
+
+    def test_the_guard_can_see_the_messages_it_is_guarding(self):
+        """A guard that matched nothing would pass for the wrong reason.
+
+        Both tests above are satisfied by an empty search as readily as
+        by a clean one, so the counts are asserted separately. If a
+        refactor moves these messages somewhere this cannot see, that is
+        a finding rather than a pass.
+        """
+        factory_calls = sum(
+            1 for node in self.ast.walk(self.tree)
+            if isinstance(node, self.ast.Call)
+            and isinstance(node.func, self.ast.Attribute)
+            and node.func.attr in self.FACTORIES.values())
+        tagged_logs = sum(
+            1 for node in self.ast.walk(self.tree)
+            if isinstance(node, self.ast.Call)
+            and isinstance(node.func, self.ast.Attribute)
+            and isinstance(node.func.value, self.ast.Name)
+            and node.func.value.id == 'LOG'
+            and node.args and self._is_tagged(node.args[0]))
+
+        self.assertGreater(factory_calls, 40)
+        self.assertGreater(tagged_logs, 5)
+
+        # And the setup path names real functions. Renaming one would
+        # otherwise drop it out of the set silently, which empties the
+        # log guard without failing anything.
+        defined = {node.name for node in self._functions()}
+        self.assertEqual(sorted(self.SETUP_PATH - defined), [])
 
 
 class TestCreateVolume(DriverTestCase):
