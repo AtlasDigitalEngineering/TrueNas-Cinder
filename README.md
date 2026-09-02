@@ -36,7 +36,9 @@ TrueNas-Cinder/
 │   ├── PLANNING.md         # Why the project exists and what each milestone means
 │   ├── configuration.md    # cinder.conf backend section + prerequisites
 │   ├── deployment.md       # Building the image and deploying under Kolla
-│   └── migration.md        # Adopting existing zvols into Cinder
+│   ├── migration.md        # Adopting existing zvols into Cinder
+│   ├── troubleshooting.md  # Symptoms this driver has actually produced
+│   └── api-reference.md    # TrueNAS endpoints used, and their surprises
 ├── images/
 │   └── cinder-volume/      # Dockerfile for the Kolla cinder-volume image
 ├── truenas_cinder_driver/
@@ -62,9 +64,15 @@ Status — what is merged, in progress or blocked — lives in the GitHub issues
 and their milestones, not here, so that this file cannot go quietly out of
 date.
 
-See [docs/configuration.md](docs/configuration.md) for a sample `cinder.conf`
-backend section and the appliance prerequisites the driver validates at
-startup.
+## Documentation
+
+| | |
+|---|---|
+| [configuration.md](docs/configuration.md) | Sample `cinder.conf`, every option, and the prerequisites the driver checks at startup |
+| [deployment.md](docs/deployment.md) | Building the image and deploying under Kolla-Ansible |
+| [migration.md](docs/migration.md) | Adopting existing zvols into Cinder, one disk at a time |
+| [troubleshooting.md](docs/troubleshooting.md) | **Start here when something breaks** — symptoms, causes and remedies |
+| [api-reference.md](docs/api-reference.md) | The TrueNAS endpoints used, and the behaviours that are not what the API docs imply |
 
 ## Development
 

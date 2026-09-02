@@ -82,6 +82,8 @@ tools/
 docs/PLANNING.md   # why the project exists, its shape, milestone outcomes
 docs/configuration.md  # sample cinder.conf backend section + prerequisites
 docs/deployment.md     # building the image and deploying under Kolla
+docs/troubleshooting.md # symptoms, causes, remedies — all observed, not guessed
+docs/api-reference.md  # endpoints used + the verified behavioural traps
 images/cinder-volume/  # Dockerfile + build-time install check
 flake.nix          # dev shell: python312, uv, gh, LD_LIBRARY_PATH
 pyproject.toml     # packaging + ALL dependencies, via extras
