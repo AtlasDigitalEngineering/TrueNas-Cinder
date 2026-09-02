@@ -817,14 +817,21 @@ directly — follows this flow:
    the job has succeeded every time so far. Do not weaken that step to a
    warning — a warning restores exactly the ambiguity it exists to remove.
 
-   **A PR that edits `claude-code-review.yml` gets no review at all.** The
-   action validates that the workflow file matches the copy on the default
-   branch and declines to run when it does not, so a PR cannot rewrite its own
-   review. It skips in seconds and posts nothing. That is correct, so the guard
-   above detects this case and passes rather than reporting it as a silent
-   review. **Practical consequence: change the review prompt in its own small
-   PR, merged on human review, and everything after it is reviewed against the
-   new prompt.** Do not bundle a prompt change with work you want reviewed.
+   **A PR that edits `claude-code-review.yml` gets no review at all**, and is
+   failed for it. The action validates that the workflow file matches the copy
+   on the default branch and declines to run when it does not, so a PR cannot
+   rewrite its own review. It skips in seconds and posts nothing.
+
+   That is correct of the action and it leaves a hole: any PR could dodge
+   review by including a one-character edit to that file. The guard therefore
+   **fails** such a PR rather than excusing it. Nothing in it was reviewed, and
+   the property worth having is that the review cannot be made to disappear
+   quietly — a notice would be quiet.
+
+   A genuine prompt change goes red too, and needs a deliberate merge. Prompt
+   changes are rare; a silent bypass would not be. **Change the review prompt
+   in its own small PR and never bundle it with work you want reviewed** — the
+   bundled work would go unreviewed and the PR would be red either way.
 
    It **cannot** approve, merge, or push commits — but it is *not* purely
    advisory: because the ruleset sets `required_review_thread_resolution: true`,

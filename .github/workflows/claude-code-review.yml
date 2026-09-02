@@ -111,16 +111,23 @@ jobs:
           REPO: ${{ github.repository }}
           BEFORE: ${{ steps.before.outputs.count }}
         run: |
-          # One legitimate reason for silence, and it is not #38.
-          # claude-code-action refuses to run when this workflow file differs
-          # from the copy on the default branch -- it will not let a PR
-          # rewrite its own review. The action skips in seconds and posts
-          # nothing, which is correct behaviour, so there is no review to
-          # assert on. Observed on the PR that added this very step.
+          # claude-code-action refuses to run when this workflow file
+          # differs from the copy on the default branch -- it will not let a
+          # PR rewrite its own review. It skips in seconds and posts nothing.
+          #
+          # That is correct of the action, and it leaves a hole: any PR could
+          # dodge review entirely by including a one-character edit to this
+          # file. So such a PR is failed, not excused. It genuinely received
+          # no review, and the property worth having is that the review
+          # cannot be made to disappear quietly.
+          #
+          # A real prompt change therefore also goes red and needs a
+          # deliberate human merge. Prompt changes are rare; a silent bypass
+          # would not be.
           if gh pr diff "${PR}" --name-only \
               | grep -qx '.github/workflows/claude-code-review.yml'; then
-            echo "::notice::This PR changes the review workflow, so the action declines to run and there is no review to check for. Merge on human review; the next PR is reviewed against the updated workflow."
-            exit 0
+            echo "::error::This PR edits the review workflow, so claude-code-action declines to run and NOTHING in this PR was reviewed. That is by design -- a PR may not rewrite its own review -- and it is failed rather than excused so the gap cannot be used to skip review. If the workflow change is intended, merge deliberately; everything after it is reviewed against the new workflow."
+            exit 1
           fi
 
           after=$(bash .github/scripts/count-review-posts.sh)
