@@ -111,6 +111,18 @@ jobs:
           REPO: ${{ github.repository }}
           BEFORE: ${{ steps.before.outputs.count }}
         run: |
+          # One legitimate reason for silence, and it is not #38.
+          # claude-code-action refuses to run when this workflow file differs
+          # from the copy on the default branch -- it will not let a PR
+          # rewrite its own review. The action skips in seconds and posts
+          # nothing, which is correct behaviour, so there is no review to
+          # assert on. Observed on the PR that added this very step.
+          if gh pr diff "${PR}" --name-only \
+              | grep -qx '.github/workflows/claude-code-review.yml'; then
+            echo "::notice::This PR changes the review workflow, so the action declines to run and there is no review to check for. Merge on human review; the next PR is reviewed against the updated workflow."
+            exit 0
+          fi
+
           after=$(bash .github/scripts/count-review-posts.sh)
           echo "reviewer posts: ${BEFORE} before, ${after} after"
           if [ "${after}" -gt "${BEFORE}" ]; then

@@ -817,6 +817,15 @@ directly — follows this flow:
    the job has succeeded every time so far. Do not weaken that step to a
    warning — a warning restores exactly the ambiguity it exists to remove.
 
+   **A PR that edits `claude-code-review.yml` gets no review at all.** The
+   action validates that the workflow file matches the copy on the default
+   branch and declines to run when it does not, so a PR cannot rewrite its own
+   review. It skips in seconds and posts nothing. That is correct, so the guard
+   above detects this case and passes rather than reporting it as a silent
+   review. **Practical consequence: change the review prompt in its own small
+   PR, merged on human review, and everything after it is reviewed against the
+   new prompt.** Do not bundle a prompt change with work you want reviewed.
+
    It **cannot** approve, merge, or push commits — but it is *not* purely
    advisory: because the ruleset sets `required_review_thread_resolution: true`,
    **any inline comment it leaves blocks the merge** until a human resolves the
