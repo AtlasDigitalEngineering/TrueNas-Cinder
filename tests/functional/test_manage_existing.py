@@ -280,3 +280,57 @@ def test_the_snapshot_listing_points_at_its_volume(
     assert entry["source_reference"]["source-name"] == foreign_zvol
     # A ZFS snapshot has no size of its own; Cinder wants the volume's.
     assert entry["size"] == 1
+
+
+@pytest.mark.parametrize("driver", [True], indirect=True)
+def test_a_shared_target_survives_adopting_one_of_its_zvols(
+        client, driver, pool, names, cleanup, destroy_zvol):
+    """One target, several extents — the shape dev does not have (#113).
+
+    Every zvol here gets its own target, so the estate this driver was
+    written for is a shape the suite never exercises: one target serving
+    every disk, each at its own LUN. Adopting one disk used to delete
+    that target, cascading every other disk's association with it.
+
+    Built rather than found, because the only appliance with this
+    topology is a production one that must never be tested against.
+    """
+    victim = f'{names.base}-adopt'
+    bystander = f'{names.base}-keep'
+    for zvol in (victim, bystander):
+        client.create_zvol(pool, zvol, size_gb=1)
+        cleanup(f'zvol {zvol}', destroy_zvol, pool, zvol)
+
+    group = client.get_or_create_initiator_group([names.iqn])
+    cleanup(f'initiator group {group}', client._make_request,
+            'DELETE', f'/iscsi/initiator/id/{group}')
+    target_id = client.create_target(names.target, group, driver.portal_id)
+    cleanup(f'target {target_id}', client.delete_target, target_id)
+
+    extents = {}
+    for index, zvol in enumerate((victim, bystander)):
+        extent_id = client.create_extent(
+            client.zvol_disk_path(pool, zvol), f'{names.extent}-{index}')
+        cleanup(f'extent {extent_id}', client.delete_extent, extent_id)
+        client.create_target_extent(target_id, extent_id, lun_id=index)
+        extents[zvol] = extent_id
+
+    adopted = _Volume(f'{names.base}-adopted')
+    cleanup(f'zvol {adopted.name}', destroy_zvol, pool, adopted.name)
+
+    driver.manage_existing(adopted, {'source-name': f'{pool}/{victim}'})
+
+    # The target is still there, because it still serves the bystander.
+    assert client.get_target_by_name(names.target), (
+        'the shared target was deleted; every other disk on it is now '
+        'unexported')
+
+    # And the bystander's association survived the cascade it would have
+    # been caught in.
+    links = [link for link in client.get_target_extents()
+             if link['target'] == target_id]
+    assert [link['extent'] for link in links] == [extents[bystander]]
+
+    # The adopted zvol's own extent is gone, which is what frees it.
+    assert client.get_extent_by_name(f'{names.extent}-0') is None
+    assert client.get_zvol(pool, adopted.name)['type'] == 'VOLUME'

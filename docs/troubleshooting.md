@@ -209,13 +209,32 @@ Delete the errored volume record before retrying. It is safe: the record's name
 never existed on the appliance, so `delete_volume` finds nothing and treats the
 delete as complete. The zvol is untouched.
 
-### `... is already exported over iSCSI by target N, extent M`
+### `... is already exported over iSCSI by extent N`
 
 A hand-provisioned disk usually has an export made by hand. Either delete the
-named objects, or set `truenas_adopt_removes_export = true` and let the driver
-remove them. The zvol and its data are untouched either way.
+named **extent**, or set `truenas_adopt_removes_export = true` and let the
+driver do it. The zvol and its data are untouched either way.
+
+Delete the extent, not the target. The extent is what pins the zvol and belongs
+to this disk alone; a target may be serving others, and deleting one that is
+unexports them all. Where the driver detects a shared target the message says
+so:
+
+```
+... is already exported over iSCSI by extent 12. Its target (4) also serves
+other extents, so do not delete the target -- that would unexport every disk
+on it.
+```
 
 The refusal names **only** the objects blocking this adoption.
+
+### Every adoption is refused as "in use", even with the machine stopped
+
+The disks share one iSCSI target, and the appliance reports sessions per target
+with no LUN — so the driver cannot tell which disk a session belongs to and
+refuses while *any* of them is attached. Remove that disk's extent by hand and
+adopt the zvol with no export at all; see
+[migration.md](migration.md).
 
 ### `in use: N live iSCSI session(s) from ...`
 
