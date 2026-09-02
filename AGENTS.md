@@ -57,7 +57,7 @@ truenas_cinder_driver/
   driver.py        # TrueNASISCSIDriver — config, setup validation, stats
 tests/
   __init__.py
-  unit/            # no Cinder and no network; runs on `requests` alone
+  unit/            # no Cinder, no appliance; runs on `requests` alone
     __init__.py
     test_api_client.py
     test_reconcile.py

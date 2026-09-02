@@ -257,6 +257,28 @@ class TestRefusal(unittest.TestCase):
                                        port=target.port):
                     pass
 
+    def test_a_security_stage_that_does_not_transit_stops_there(self):
+        """The security phase is one round trip, and says so.
+
+        A target wanting a second one answers the first PDU with status 0
+        and the transit bit clear. Reading only the status would send the
+        operational PDU into a target still in the security stage, and the
+        refusal that came back would name a stage mismatch rather than the
+        authentication this side cannot do.
+        """
+        with _FakeTarget([_response(flags=0, tsih=0)]) as target:
+            with self.assertRaises(iscsi_probe.LoginRefused) as caught:
+                with iscsi_probe.login(target.address, INITIATOR, TARGET,
+                                       port=target.port):
+                    pass
+
+        # Reported as an authentication failure, which is what it is: the
+        # target wants credentials, and CHAP is #27.
+        self.assertEqual(caught.exception.status_class, 2)
+        self.assertEqual(caught.exception.status_detail, 1)
+        self.assertEqual(len(target.received), 1,
+                         "sent a second PDU to a target still negotiating")
+
     def test_an_unexpected_opcode_is_not_treated_as_a_login(self):
         reply = bytearray(_response())
         reply[0] = 0x21                      # not a Login Response

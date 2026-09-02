@@ -93,6 +93,14 @@ class LoginRefused(Exception):
     """
 
     def __init__(self, status_class, status_detail, target, address):
+        """Record what was refused, and by whom.
+
+        Args:
+            status_class: Status-Class from the Login Response
+            status_detail: Status-Detail from the same
+            target: Target IQN the login named, or None for discovery
+            address: Portal address the refusal came from
+        """
         self.status_class = status_class
         self.status_detail = status_detail
         self.target = target
@@ -281,6 +289,14 @@ def login(address, initiator, target=None, port=DEFAULT_PORT, timeout=10):
             isid, 0, 0, 0, keys))
         security = _read_response(sock)
         _check(security, target, address)
+        if not security['flags'] & TRANSIT:
+            # Status 0 with the transit bit clear means the target wants
+            # another security round trip. Nothing here offers anything
+            # but `AuthMethod=None`, so there is nothing to answer with,
+            # and sending the operational PDU regardless would be refused
+            # for a reason harder to read than this one. Unreachable
+            # against ctld today; CHAP (#27) is what would reach it.
+            raise LoginRefused(2, 1, target, address)
 
         operational = list(_OPERATIONAL_KEYS)
         if target:
