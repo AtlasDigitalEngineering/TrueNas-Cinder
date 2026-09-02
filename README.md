@@ -4,13 +4,28 @@ A modern, OpenStack-compliant Cinder driver for TrueNAS Scale.
 
 ## Overview
 
-This project provides a Cinder volume driver that enables OpenStack to use TrueNAS Scale as a backend storage system. The driver supports both iSCSI and NFS protocols, with primary focus on iSCSI for VM block storage.
+A Cinder volume driver that lets OpenStack use TrueNAS Scale as block storage
+**over iSCSI**. Each Cinder volume is a zvol; the iSCSI export is built and torn
+down around each attach.
+
+It exists to migrate an estate of Proxmox-created zvols to OpenStack without
+copying them — `cinder manage` renames a zvol in place, so a 10 TiB disk is
+adopted as fast as a 1 GiB one.
 
 ## Features
 
-- **OpenStack Compliance**: Fully compatible with the Cinder API for seamless integration.
-- **TrueNAS Scale Integration**: Leverages the modern REST API for robust management of zvols and iSCSI targets.
-- **Flexible Backend Support**: Supports both iSCSI (primary) and NFS storage protocols.
+- **The full volume lifecycle** — create, delete, attach, detach, extend,
+  snapshot, clone, and clone-from-snapshot.
+- **Adoption of existing zvols** — `manage_existing` and its snapshot
+  equivalent, with a safety gate that refuses a zvol holding a live iSCSI
+  session and explains what to remove.
+- **Multipath** — one target bound to every configured portal address,
+  presented to Cinder as `target_portals` / `target_iqns` / `target_luns`.
+- **Verified against real hardware** — a functional suite runs the client and
+  the driver against a live appliance, including a real iSCSI login.
+
+**iSCSI only.** There is no NFS support and none is planned for v1. Multi-attach
+and CHAP are deferred (#27).
 
 ## Repository Structure
 
@@ -18,29 +33,34 @@ This project provides a Cinder volume driver that enables OpenStack to use TrueN
 TrueNas-Cinder/
 ├── .github/                # CI workflows and CODEOWNERS
 ├── docs/
-│   ├── PLANNING.md         # Project roadmap and milestones
+│   ├── PLANNING.md         # Why the project exists and what each milestone means
 │   ├── configuration.md    # cinder.conf backend section + prerequisites
 │   ├── deployment.md       # Building the image and deploying under Kolla
 │   └── migration.md        # Adopting existing zvols into Cinder
 ├── images/
 │   └── cinder-volume/      # Dockerfile for the Kolla cinder-volume image
 ├── truenas_cinder_driver/
-│   ├── __init__.py         # Package initialization
+│   ├── __init__.py         # Exports the client, the exceptions and __version__
 │   ├── api_client.py       # TrueNAS REST API client wrapper
-│   └── driver.py           # Cinder volume driver
+│   ├── driver.py           # Cinder volume driver
+│   └── reconcile.py        # Finds appliance objects with no Cinder volume
+├── tools/
+│   ├── find_orphans.py     # Reconciliation CLI (reads .env and OS_*)
+│   └── check_workflows.py  # Refuses `${{ }}` inside a workflow `run:` body
 ├── tests/
-│   ├── unit/               # API client tests (no Cinder needed)
-│   └── driver/             # Driver tests (Cinder required)
+│   ├── unit/               # No Cinder, no appliance; runs on `requests` alone
+│   ├── driver/             # Driver tests (Cinder required)
+│   ├── functional/         # Live appliance; skipped unless .env configures one
+│   └── fixtures/           # Inputs the CI jobs lint against
 ├── pyproject.toml          # Packaging and dependencies (extras)
 ├── flake.nix               # Nix dev shell (Python, uv, gh)
 ├── AGENTS.md               # Conventions and workflow for contributors
 └── CONTRIBUTING.md         # Contribution guidelines
 ```
 
-`driver.py` provides configuration, setup validation, capacity reporting, the
-volume lifecycle and the iSCSI export/connection path. Snapshots, clones,
-extend and the `manage_existing` family are still in progress — see the open
-issues.
+Status — what is merged, in progress or blocked — lives in the GitHub issues
+and their milestones, not here, so that this file cannot go quietly out of
+date.
 
 See [docs/configuration.md](docs/configuration.md) for a sample `cinder.conf`
 backend section and the appliance prerequisites the driver validates at
@@ -80,10 +100,15 @@ python -m pytest tests/unit             # API client — runs on `requests` alon
 .venv/bin/python -m pytest tests/driver # Driver — needs Cinder installed
 ```
 
-The two suites are split so the API client tests stay fast and dependency-free;
-Cinder pulls in around 58 packages. The package is not installable yet, so use
-`python -m pytest` rather than bare `pytest` — see [AGENTS.md](AGENTS.md) for
-the detail, including the extra step needed on NixOS.
+There is a third suite, `tests/functional`, which talks to a real appliance. It
+**skips entirely** unless one is configured in `.env`, so it never runs by
+accident — see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+The suites are split so the API client tests stay fast and dependency-free;
+Cinder pulls in around 58 packages. Use `python -m pytest` rather than bare
+`pytest`, so the working tree is tested ahead of any installed copy — see
+[AGENTS.md](AGENTS.md) for the detail, including the extra step needed on
+NixOS.
 
 ## Roadmap
 
