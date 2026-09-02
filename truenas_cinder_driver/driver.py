@@ -118,6 +118,98 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         # inside the decorator, where the cause is far from obvious.
         self.lock_id = 'unconfigured'
 
+    @property
+    def backend_name(self):
+        """Name this backend the way the operator wrote it down.
+
+        `volume_backend_name` in preference to the appliance URL: it is
+        the name in their `cinder.conf`, it is what
+        `openstack volume service list` shows, and it keeps hostnames out
+        of log lines that may be shipped somewhere less private than the
+        controller.
+
+        Read from configuration on each use rather than resolved in
+        `do_setup`. Several of the messages that need it are raised *by*
+        setup, so anything resolved there is resolved too late to name
+        the failure setup produced.
+
+        Returns:
+            The backend identifier, never empty
+        """
+        return (self.configuration.safe_get('volume_backend_name')
+                or self.configuration.safe_get('truenas_api_url')
+                or self.__class__.__name__)
+
+    def _tagged(self, message):
+        """Prefix a message with the backend it came from.
+
+        Cinder multi-backend is routine and this migration may well span
+        more than one appliance. Without this a stopped iSCSI service is
+        reported as stopped *somewhere*: the traceback names the driver
+        class, which is identical across every instance of it.
+
+        Applied to everything this driver composes -- errors, warnings
+        and info alike -- so that the rule is "if we wrote the words, we
+        name the backend" and there is no boundary for a later message to
+        fall the wrong side of. `test_every_message_names_its_backend`
+        enforces it.
+
+        Args:
+            message: The message, before any `%` interpolation
+
+        Returns:
+            The message prefixed with `[<backend>] `
+        """
+        return '[%s] %s' % (self.backend_name, message)
+
+    def _config_error(self, message):
+        """Build an `InvalidInput` naming this backend.
+
+        For configuration the operator must fix. Raised rather than
+        returned by the caller, so that the `raise` stays visible at the
+        site and the traceback points there.
+
+        Args:
+            message: The message, already interpolated
+
+        Returns:
+            The exception to raise
+        """
+        return exception.InvalidInput(reason=self._tagged(message))
+
+    def _backend_error(self, message):
+        """Build a `VolumeBackendAPIException` naming this backend.
+
+        For the appliance being unreachable or answering unexpectedly --
+        not something the operator's configuration can fix.
+
+        Args:
+            message: The message, already interpolated
+
+        Returns:
+            The exception to raise
+        """
+        return exception.VolumeBackendAPIException(
+            data=self._tagged(message))
+
+    def _bad_reference(self, existing_ref, message):
+        """Build a `ManageExistingInvalidReference` naming this backend.
+
+        For an adoption this driver refuses. `existing_ref` is passed
+        through untouched: Cinder puts it in its own wrapper text, and
+        rewriting it here would make the refusal disagree with the
+        reference the operator typed.
+
+        Args:
+            existing_ref: The reference exactly as Cinder passed it
+            message: The reason, already interpolated
+
+        Returns:
+            The exception to raise
+        """
+        return exception.ManageExistingInvalidReference(
+            existing_ref=existing_ref, reason=self._tagged(message))
+
     @staticmethod
     def get_driver_options():
         """Return the options this driver adds, for the config generator.
@@ -146,10 +238,10 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
             if not self.configuration.safe_get(name)
         ]
         if missing:
-            raise exception.InvalidInput(
-                reason=_('Missing required TrueNAS driver options in '
-                         'cinder.conf: %(missing)s. See the sample backend '
-                         'section in the driver documentation.')
+            raise self._config_error(
+                _('Missing required TrueNAS driver options in '
+                  'cinder.conf: %(missing)s. See the sample backend '
+                  'section in the driver documentation.')
                 % {'missing': ', '.join(sorted(missing))})
 
         try:
@@ -160,8 +252,8 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
             )
         except ValueError as exc:
             # The client rejects a base_url carrying inline credentials.
-            raise exception.InvalidInput(
-                reason=_('truenas_api_url is not usable: %s') % exc)
+            raise self._config_error(
+                _('truenas_api_url is not usable: %s') % exc)
 
         self.lock_id = self._appliance_lock_id(
             self.configuration.truenas_api_url)
@@ -208,8 +300,9 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         self._resolve_portal()
         self._resolve_iscsi_global()
         self._require_usable_volume_name_template()
-        LOG.info('TrueNAS driver setup validated: pool %(pool)s, portal '
-                 '%(portal)s, addresses %(addresses)s.',
+        LOG.info(self._tagged(
+            'TrueNAS driver setup validated: pool %(pool)s, portal '
+            '%(portal)s, addresses %(addresses)s.'),
                  {'pool': self.configuration.truenas_pool,
                   'portal': self.portal_id,
                   'addresses': self.portal_addresses})
@@ -242,11 +335,12 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
                            'revoked or expired. Issue a new key and set '
                            'truenas_api_key. This is not a role '
                            'problem. %s') % exc
-            raise exception.InvalidInput(reason=reason)
+            raise self._config_error(
+                reason)
         except api_client.TrueNASAPIError as exc:
-            raise exception.VolumeBackendAPIException(
-                data=_('Cannot reach the TrueNAS appliance at '
-                       '%(url)s: %(err)s')
+            raise self._backend_error(
+                _('Cannot reach the TrueNAS appliance at '
+                  '%(url)s: %(err)s')
                 % {'url': self.configuration.truenas_api_url, 'err': exc})
 
     def _require_pool_exists(self, pools):
@@ -261,12 +355,13 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         wanted = self.configuration.truenas_pool
         names = [pool.get('name') for pool in pools]
         if wanted not in names:
-            raise exception.InvalidInput(
-                reason=_('truenas_pool = %(wanted)r does not exist on the '
-                         'appliance. Available pools: %(names)s. Set '
-                         'truenas_pool in cinder.conf to one of these.')
-                % {'wanted': wanted, 'names': ', '.join(sorted(
-                    name for name in names if name)) or 'none'})
+            raise self._config_error(
+                _('truenas_pool = %(wanted)r does not exist on the '
+                  'appliance. Available pools: %(names)s. Set '
+                  'truenas_pool in cinder.conf to one of these.')
+                % {'wanted': wanted,
+                   'names': ', '.join(
+                       sorted(name for name in names if name)) or 'none'})
 
     def _require_iscsi_service_running(self):
         """Confirm the appliance's iSCSI service is running.
@@ -282,27 +377,27 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         try:
             service = self.client.get_iscsi_service()
         except api_client.TrueNASAPIError as exc:
-            raise exception.VolumeBackendAPIException(
-                data=_('Could not read the iSCSI service state from the '
-                       'TrueNAS appliance: %s') % exc)
+            raise self._backend_error(
+                _('Could not read the iSCSI service state from the '
+                  'TrueNAS appliance: %s') % exc)
 
         if service.get('state') != 'RUNNING':
-            raise exception.InvalidInput(
-                reason=_('The iSCSI service on the TrueNAS appliance is '
-                         '%(state)s. This driver does not start it. Enable '
-                         'it in the TrueNAS UI under System Settings -> '
-                         'Services -> iSCSI and set it to start '
-                         'automatically, or POST /service/update '
-                         '{"service": "iscsitarget", "options": {"enable": '
-                         'true}} followed by POST /service/start.')
+            raise self._config_error(
+                _('The iSCSI service on the TrueNAS appliance is '
+                  '%(state)s. This driver does not start it. Enable '
+                  'it in the TrueNAS UI under System Settings -> '
+                  'Services -> iSCSI and set it to start '
+                  'automatically, or POST /service/update '
+                  '{"service": "iscsitarget", "options": {"enable": '
+                  'true}} followed by POST /service/start.')
                 % {'state': service.get('state')})
 
         if not service.get('enable'):
-            LOG.warning('The TrueNAS iSCSI service is running but is not '
-                        'enabled at boot, so every volume will become '
-                        'unreachable after the appliance restarts. Set it '
-                        'to start automatically in System Settings -> '
-                        'Services -> iSCSI.')
+            LOG.warning(self._tagged(
+                'The TrueNAS iSCSI service is running but is not enabled '
+                'at boot, so every volume will become unreachable after '
+                'the appliance restarts. Set it to start automatically '
+                'in System Settings -> Services -> iSCSI.'))
 
     def _resolve_portal(self):
         """Work out which portal to export through, and at what address.
@@ -316,19 +411,19 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         try:
             portals = self.client.get_portals()
         except api_client.TrueNASAPIError as exc:
-            raise exception.VolumeBackendAPIException(
-                data=_('Could not list iSCSI portals on the TrueNAS '
-                       'appliance: %s') % exc)
+            raise self._backend_error(
+                _('Could not list iSCSI portals on the TrueNAS '
+                  'appliance: %s') % exc)
 
         if not portals:
-            raise exception.InvalidInput(
-                reason=_('No iSCSI portal is configured on the TrueNAS '
-                         'appliance. This driver does not create one. Add '
-                         'a portal in the TrueNAS UI under Shares -> Block '
-                         'Shares (iSCSI) -> Portals, bound to a statically '
-                         'configured address, then set '
-                         'truenas_iscsi_portal_id in cinder.conf if the '
-                         'appliance has more than one.'))
+            raise self._config_error(
+                _('No iSCSI portal is configured on the TrueNAS '
+                  'appliance. This driver does not create one. Add '
+                  'a portal in the TrueNAS UI under Shares -> Block '
+                  'Shares (iSCSI) -> Portals, bound to a statically '
+                  'configured address, then set '
+                  'truenas_iscsi_portal_id in cinder.conf if the '
+                  'appliance has more than one.'))
 
         configured = self.configuration.safe_get('truenas_iscsi_portal_id')
         available = [portal.get('id') for portal in portals]
@@ -336,23 +431,24 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
             selected = [portal for portal in portals
                         if portal.get('id') == configured]
             if not selected:
-                raise exception.InvalidInput(
-                    reason=_('truenas_iscsi_portal_id = %(configured)s does '
-                             'not exist on the appliance. Portals present: '
-                             '%(available)s.')
+                raise self._config_error(
+                    _('truenas_iscsi_portal_id = %(configured)s does '
+                      'not exist on the appliance. Portals present: '
+                      '%(available)s.')
                     % {'configured': configured,
                        'available': ', '.join(str(i) for i in available)})
             portal = selected[0]
         elif len(portals) == 1:
             portal = portals[0]
-            LOG.info('Using the only iSCSI portal on the appliance, id '
-                     '%s.', portal.get('id'))
+            LOG.info(self._tagged(
+                'Using the only iSCSI portal on the appliance, id %s.'),
+                portal.get('id'))
         else:
-            raise exception.InvalidInput(
-                reason=_('The appliance has %(count)d iSCSI portals '
-                         '(%(available)s) and truenas_iscsi_portal_id is '
-                         'not set, so there is no way to know which to '
-                         'export through. Set it in cinder.conf.')
+            raise self._config_error(
+                _('The appliance has %(count)d iSCSI portals '
+                  '(%(available)s) and truenas_iscsi_portal_id is '
+                  'not set, so there is no way to know which to '
+                  'export through. Set it in cinder.conf.')
                 % {'count': len(portals),
                    'available': ', '.join(str(i) for i in available)})
 
@@ -387,16 +483,16 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         if usable:
             return usable
 
-        raise exception.InvalidInput(
-            reason=_('iSCSI portal %(portal)s is bound to %(listening)s, '
-                     'which is not an address a compute node can connect '
-                     'to. Either rebind the portal to a statically '
-                     'configured address, or set '
-                     'truenas_iscsi_portal_addresses in cinder.conf to the '
-                     'addresses initiators should use.')
+        raise self._config_error(
+            _('iSCSI portal %(portal)s is bound to %(listening)s, '
+              'which is not an address a compute node can connect '
+              'to. Either rebind the portal to a statically '
+              'configured address, or set '
+              'truenas_iscsi_portal_addresses in cinder.conf to the '
+              'addresses initiators should use.')
             % {'portal': portal.get('id'),
                'listening': ', '.join(ip for ip in listening if ip)
-                            or 'nothing'})
+               or 'nothing'})
 
     def _resolve_iscsi_global(self):
         """Read the IQN prefix and port the appliance serves iSCSI on.
@@ -411,16 +507,16 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         try:
             config = self.client.get_iscsi_global_config()
         except api_client.TrueNASAPIError as exc:
-            raise exception.VolumeBackendAPIException(
-                data=_('Could not read the iSCSI configuration from the '
-                       'TrueNAS appliance: %s') % exc)
+            raise self._backend_error(
+                _('Could not read the iSCSI configuration from the '
+                  'TrueNAS appliance: %s') % exc)
 
         self.iscsi_basename = config.get('basename')
         self.iscsi_port = config.get('listen_port')
         if not self.iscsi_basename:
-            raise exception.VolumeBackendAPIException(
-                data=_('The TrueNAS appliance reported no iSCSI basename, '
-                       'so target IQNs cannot be built.'))
+            raise self._backend_error(
+                _('The TrueNAS appliance reported no iSCSI basename, '
+                  'so target IQNs cannot be built.'))
 
     def _require_usable_volume_name_template(self):
         """Confirm rendered volume names are valid iSCSI target names.
@@ -443,27 +539,27 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
             # covers a stray percent sign ('volume-%s-100%' -> "incomplete
             # format") or an unknown conversion ('%q'). Both are plausible
             # typos, and neither should escape as a raw formatting error.
-            raise exception.InvalidInput(
-                reason=_('volume_name_template = %(template)r cannot be '
-                         'rendered with a volume id: %(err)s. It needs '
-                         'exactly one %%s placeholder, and any literal '
-                         'percent sign must be written as %%%%.')
+            raise self._config_error(
+                _('volume_name_template = %(template)r cannot be '
+                  'rendered with a volume id: %(err)s. It needs '
+                  'exactly one %%s placeholder, and any literal '
+                  'percent sign must be written as %%%%.')
                 % {'template': template, 'err': exc})
 
         try:
             reason = self.client.validate_target_name(sample)
         except api_client.TrueNASAPIError as exc:
-            raise exception.VolumeBackendAPIException(
-                data=_('Could not validate the volume name template '
-                       'against the appliance: %s') % exc)
+            raise self._backend_error(
+                _('Could not validate the volume name template '
+                  'against the appliance: %s') % exc)
 
         if reason:
-            raise exception.InvalidInput(
-                reason=_('volume_name_template = %(template)r produces '
-                         'iSCSI target names the appliance rejects: '
-                         '%(reason)s Set volume_name_template in '
-                         'cinder.conf to a lowercase form such as '
-                         '%(suggestion)r.')
+            raise self._config_error(
+                _('volume_name_template = %(template)r produces '
+                  'iSCSI target names the appliance rejects: '
+                  '%(reason)s Set volume_name_template in '
+                  'cinder.conf to a lowercase form such as '
+                  '%(suggestion)r.')
                 % {'template': template, 'reason': reason,
                    'suggestion': DEFAULT_VOLUME_NAME_TEMPLATE})
 
@@ -570,9 +666,9 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         except api_client.TrueNASAPIError as exc:
             for what, delete, resource_id in reversed(rollback):
                 self.client.best_effort_delete(delete, resource_id, what=what)
-            raise exception.VolumeBackendAPIException(
-                data=_('Could not export volume %(name)s over iSCSI: '
-                       '%(err)s') % {'name': name, 'err': exc})
+            raise self._backend_error(
+                _('Could not export volume %(name)s over iSCSI: '
+                  '%(err)s') % {'name': name, 'err': exc})
 
         location = self._provider_location(name)
         LOG.info('Exported %(name)s as %(location)s.',
@@ -620,12 +716,12 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
             return extent_id
 
         if existing.get('disk') != disk:
-            raise exception.VolumeBackendAPIException(
-                data=_('An iSCSI extent named %(name)s already exists on '
-                       'the appliance but is backed by %(actual)s, not '
-                       '%(expected)s. Refusing to export it: it belongs to '
-                       'something else. Remove or rename it on the '
-                       'appliance before attaching this volume.')
+            raise self._backend_error(
+                _('An iSCSI extent named %(name)s already exists on '
+                  'the appliance but is backed by %(actual)s, not '
+                  '%(expected)s. Refusing to export it: it belongs to '
+                  'something else. Remove or rename it on the '
+                  'appliance before attaching this volume.')
                 % {'name': name, 'actual': existing.get('disk'),
                    'expected': disk})
 
@@ -741,9 +837,9 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
             try:
                 found = find(name)
             except api_client.TrueNASAPIError as exc:
-                raise exception.VolumeBackendAPIException(
-                    data=_('Could not look up the iSCSI %(what)s for volume '
-                           '%(name)s: %(err)s')
+                raise self._backend_error(
+                    _('Could not look up the iSCSI %(what)s for volume '
+                      '%(name)s: %(err)s')
                     % {'what': what, 'name': name, 'err': exc})
             if not found:
                 continue
@@ -752,9 +848,9 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
             except api_client.TrueNASAPINotFoundError:
                 pass
             except api_client.TrueNASAPIError as exc:
-                raise exception.VolumeBackendAPIException(
-                    data=_('Could not remove the iSCSI %(what)s for volume '
-                           '%(name)s: %(err)s')
+                raise self._backend_error(
+                    _('Could not remove the iSCSI %(what)s for volume '
+                      '%(name)s: %(err)s')
                     % {'what': what, 'name': name, 'err': exc})
             removed.append('%s %s' % (what, found['id']))
 
@@ -765,10 +861,11 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         try:
             self._reload_exports()
         except api_client.TrueNASAPIError as exc:
-            LOG.warning('Removed %(removed)s for volume %(name)s but could '
-                        'not reload the iSCSI service: %(err)s',
-                        {'removed': ', '.join(removed), 'name': name,
-                         'err': exc})
+            LOG.warning(self._tagged(
+                'Removed %(removed)s for volume %(name)s but could not '
+                'reload the iSCSI service: %(err)s'),
+                {'removed': ', '.join(removed), 'name': name,
+                 'err': exc})
         LOG.info('Removed %(removed)s for volume %(name)s.',
                  {'removed': ', '.join(removed), 'name': name})
 
@@ -791,9 +888,9 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         try:
             self.client.create_zvol(pool, volume.name, volume.size)
         except api_client.TrueNASAPIError as exc:
-            raise exception.VolumeBackendAPIException(
-                data=_('Could not create volume %(name)s in TrueNAS pool '
-                       '%(pool)s: %(err)s')
+            raise self._backend_error(
+                _('Could not create volume %(name)s in TrueNAS pool '
+                  '%(pool)s: %(err)s')
                 % {'name': volume.name, 'pool': pool, 'err': exc})
 
         LOG.info('Created zvol %(pool)s/%(name)s, %(size)s GiB, sparse.',
@@ -885,9 +982,9 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
             self._log_blocking_snapshots(dataset, snapshots)
             raise exception.VolumeIsBusy(volume_name=volume.name)
 
-        raise exception.VolumeBackendAPIException(
-            data=_('Could not delete volume %(name)s from TrueNAS pool '
-                   '%(pool)s: %(err)s')
+        raise self._backend_error(
+            _('Could not delete volume %(name)s from TrueNAS pool '
+              '%(pool)s: %(err)s')
             % {'name': volume.name, 'pool': pool, 'err': exc})
 
     def _log_blocking_snapshots(self, dataset, snapshots):
@@ -911,20 +1008,23 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
 
         if foreign:
             LOG.error(
-                'Cannot delete %(dataset)s: %(count)d snapshot(s) still '
-                'depend on it, and %(n)d of them were not created by Cinder '
-                '(%(foreign)s). Something else on the appliance is '
-                'snapshotting a Cinder-managed volume -- check for a '
-                'periodic snapshot or replication task covering this pool. '
-                'The driver will not delete snapshots it does not own.',
+                self._tagged(
+                    'Cannot delete %(dataset)s: %(count)d snapshot(s) '
+                    'still depend on it, and %(n)d of them were not '
+                    'created by Cinder (%(foreign)s). Something else on '
+                    'the appliance is snapshotting a Cinder-managed '
+                    'volume -- check for a periodic snapshot or '
+                    'replication task covering this pool. The driver '
+                    'will not delete snapshots it does not own.'),
                 {'dataset': dataset, 'count': len(names), 'n': len(foreign),
                  'foreign': ', '.join(foreign)})
         else:
             LOG.error(
-                'Cannot delete %(dataset)s: %(count)d Cinder snapshot(s) '
-                'still exist (%(names)s). Cinder deletes snapshots before '
-                'volumes, so reaching this state means the volume was '
-                'deleted out of order.',
+                self._tagged(
+                    'Cannot delete %(dataset)s: %(count)d Cinder '
+                    'snapshot(s) still exist (%(names)s). Cinder deletes '
+                    'snapshots before volumes, so reaching this state '
+                    'means the volume was deleted out of order.'),
                 {'dataset': dataset, 'count': len(names),
                  'names': ', '.join(names)})
 
@@ -987,9 +1087,9 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         try:
             self.client.create_snapshot(dataset, snapshot.name)
         except api_client.TrueNASAPIError as exc:
-            raise exception.VolumeBackendAPIException(
-                data=_('Could not snapshot %(dataset)s as %(name)s: '
-                       '%(err)s')
+            raise self._backend_error(
+                _('Could not snapshot %(dataset)s as %(name)s: '
+                  '%(err)s')
                 % {'dataset': dataset, 'name': snapshot.name, 'err': exc})
 
         LOG.info('Created snapshot %(dataset)s@%(name)s.',
@@ -1056,16 +1156,16 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
             clones = ''
 
         if clones:
-            LOG.error('Cannot delete snapshot %(id)s: %(clones)s still '
-                      'depend on it. Delete the volumes cloned from this '
-                      'snapshot first; the driver will not defer the '
-                      'destroy, because that reports success now and '
-                      'destroys data later.',
-                      {'id': snapshot_id, 'clones': clones})
+            LOG.error(self._tagged(
+                'Cannot delete snapshot %(id)s: %(clones)s still depend '
+                'on it. Delete the volumes cloned from this snapshot '
+                'first; the driver will not defer the destroy, because '
+                'that reports success now and destroys data later.'),
+                {'id': snapshot_id, 'clones': clones})
             raise exception.SnapshotIsBusy(snapshot_name=snapshot.name)
 
-        raise exception.VolumeBackendAPIException(
-            data=_('Could not delete snapshot %(id)s: %(err)s')
+        raise self._backend_error(
+            _('Could not delete snapshot %(id)s: %(err)s')
             % {'id': snapshot_id, 'err': exc})
 
     def manage_existing_snapshot(self, snapshot, existing_ref):
@@ -1090,9 +1190,9 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         try:
             self.client.rename_snapshot(source_id, snapshot.name)
         except api_client.TrueNASAPIError as exc:
-            raise exception.VolumeBackendAPIException(
-                data=_('Could not adopt snapshot %(source)s as %(name)s: '
-                       '%(err)s')
+            raise self._backend_error(
+                _('Could not adopt snapshot %(source)s as %(name)s: '
+                  '%(err)s')
                 % {'source': source_id, 'name': snapshot.name, 'err': exc})
 
         LOG.info('Adopted snapshot %(source)s as %(name)s on volume '
@@ -1167,22 +1267,22 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
                     "'%(dataset)s/<zvol>@<snapshot>'}.") % {'dataset': pool}
 
         if not isinstance(existing_ref, dict):
-            raise exception.ManageExistingInvalidReference(
-                existing_ref=existing_ref,
-                reason=_('The reference is not a mapping. %s') % example)
+            raise self._bad_reference(
+                existing_ref,
+                _('The reference is not a mapping. %s') % example)
 
         source = existing_ref.get('source-name')
         if not isinstance(source, str) or not source.strip():
-            raise exception.ManageExistingInvalidReference(
-                existing_ref=existing_ref,
-                reason=_("No 'source-name' was given. %s") % example)
+            raise self._bad_reference(
+                existing_ref,
+                _("No 'source-name' was given. %s") % example)
         source = source.strip()
 
         dataset, sep, name = source.rpartition('@')
         if not sep or not name:
-            raise exception.ManageExistingInvalidReference(
-                existing_ref=existing_ref,
-                reason=_("'%(source)s' does not name a snapshot. %(example)s")
+            raise self._bad_reference(
+                existing_ref,
+                _("'%(source)s' does not name a snapshot. %(example)s")
                 % {'source': source, 'example': example})
 
         # The snapshot must sit on the zvol backing the volume Cinder
@@ -1191,12 +1291,12 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         # `snapshot.volume_name` and so resolves to something that does not
         # exist -- undeletable through Cinder from the moment it is made.
         if dataset != expected_dataset:
-            raise exception.ManageExistingInvalidReference(
-                existing_ref=existing_ref,
-                reason=_("'%(source)s' is a snapshot of '%(dataset)s', but "
-                         "this snapshot belongs to volume '%(volume)s', "
-                         "whose zvol is '%(expected)s'. A snapshot can only "
-                         "be adopted onto its own volume.")
+            raise self._bad_reference(
+                existing_ref,
+                _("'%(source)s' is a snapshot of '%(dataset)s', but "
+                  "this snapshot belongs to volume '%(volume)s', "
+                  "whose zvol is '%(expected)s'. A snapshot can only "
+                  "be adopted onto its own volume.")
                 % {'source': source, 'dataset': dataset,
                    'volume': snapshot.volume_name,
                    'expected': expected_dataset})
@@ -1204,14 +1304,14 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         try:
             self.client.get_snapshot(source)
         except api_client.TrueNASAPINotFoundError:
-            raise exception.ManageExistingInvalidReference(
-                existing_ref=existing_ref,
-                reason=_("No snapshot '%(source)s' exists on the appliance.")
+            raise self._bad_reference(
+                existing_ref,
+                _("No snapshot '%(source)s' exists on the appliance.")
                 % {'source': source})
         except api_client.TrueNASAPIError as exc:
-            raise exception.VolumeBackendAPIException(
-                data=_('Could not read snapshot %(source)s from the '
-                       'appliance: %(err)s')
+            raise self._backend_error(
+                _('Could not read snapshot %(source)s from the '
+                  'appliance: %(err)s')
                 % {'source': source, 'err': exc})
 
         return source, dataset, name
@@ -1237,9 +1337,9 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         try:
             self.client.resize_zvol(pool, volume.name, new_size)
         except api_client.TrueNASAPIError as exc:
-            raise exception.VolumeBackendAPIException(
-                data=_('Could not extend volume %(name)s to %(size)s GiB: '
-                       '%(err)s')
+            raise self._backend_error(
+                _('Could not extend volume %(name)s to %(size)s GiB: '
+                  '%(err)s')
                 % {'name': volume.name, 'size': new_size, 'err': exc})
 
         LOG.info('Extended %(pool)s/%(name)s to %(size)s GiB.',
@@ -1276,9 +1376,9 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         try:
             self.client.clone_snapshot(snapshot_id, pool, volume.name)
         except api_client.TrueNASAPIError as exc:
-            raise exception.VolumeBackendAPIException(
-                data=_('Could not create volume %(name)s from snapshot '
-                       '%(snapshot)s: %(err)s')
+            raise self._backend_error(
+                _('Could not create volume %(name)s from snapshot '
+                  '%(snapshot)s: %(err)s')
                 % {'name': volume.name, 'snapshot': snapshot_id,
                    'err': exc})
 
@@ -1320,9 +1420,9 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         try:
             self.client.create_snapshot(dataset, snap_name)
         except api_client.TrueNASAPIError as exc:
-            raise exception.VolumeBackendAPIException(
-                data=_('Could not snapshot %(source)s in order to clone it '
-                       'as %(name)s: %(err)s')
+            raise self._backend_error(
+                _('Could not snapshot %(source)s in order to clone it '
+                  'as %(name)s: %(err)s')
                 % {'source': dataset, 'name': volume.name, 'err': exc})
 
         try:
@@ -1334,8 +1434,8 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
             self.client.best_effort_delete(
                 self.client.delete_snapshot, snapshot_id,
                 what=f'clone-source snapshot {snapshot_id}')
-            raise exception.VolumeBackendAPIException(
-                data=_('Could not clone %(source)s as %(name)s: %(err)s')
+            raise self._backend_error(
+                _('Could not clone %(source)s as %(name)s: %(err)s')
                 % {'source': dataset, 'name': volume.name, 'err': exc})
 
         LOG.info('Cloned %(source)s as %(pool)s/%(name)s via %(snapshot)s. '
@@ -1466,9 +1566,9 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
             targets = self.client.get_targets()
             sessions = self.client.get_iscsi_sessions()
         except api_client.TrueNASAPIError as exc:
-            raise exception.VolumeBackendAPIException(
-                data=_('Could not list manageable volumes in pool '
-                       '%(pool)s: %(err)s') % {'pool': pool, 'err': exc})
+            raise self._backend_error(
+                _('Could not list manageable volumes in pool '
+                  '%(pool)s: %(err)s') % {'pool': pool, 'err': exc})
 
         entries = []
         for zvol in zvols:
@@ -1529,9 +1629,9 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
                          for snapshot in self.client.get_snapshot_list() or []
                          if snapshot.get('dataset') in datasets]
         except api_client.TrueNASAPIError as exc:
-            raise exception.VolumeBackendAPIException(
-                data=_('Could not list manageable snapshots in pool '
-                       '%(pool)s: %(err)s') % {'pool': pool, 'err': exc})
+            raise self._backend_error(
+                _('Could not list manageable snapshots in pool '
+                  '%(pool)s: %(err)s') % {'pool': pool, 'err': exc})
 
         sizes = {zvol['name']: self._zvol_size_gb(zvol) for zvol in zvols}
 
@@ -1693,9 +1793,9 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         try:
             self.client.rename_zvol(pool, name, volume.name)
         except api_client.TrueNASAPIError as exc:
-            raise exception.VolumeBackendAPIException(
-                data=_('Could not adopt %(pool)s/%(name)s as volume '
-                       '%(volume)s: %(err)s')
+            raise self._backend_error(
+                _('Could not adopt %(pool)s/%(name)s as volume '
+                  '%(volume)s: %(err)s')
                 % {'pool': pool, 'name': name, 'volume': volume.name,
                    'err': exc})
 
@@ -1743,40 +1843,40 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
                     "example '%(pool)s/vm-100-disk-0'.") % {'pool': pool}
 
         if not isinstance(existing_ref, dict):
-            raise exception.ManageExistingInvalidReference(
-                existing_ref=existing_ref,
-                reason=_('The reference is not a mapping. %s') % example)
+            raise self._bad_reference(
+                existing_ref,
+                _('The reference is not a mapping. %s') % example)
 
         source = existing_ref.get('source-name')
         if not isinstance(source, str) or not source.strip():
-            raise exception.ManageExistingInvalidReference(
-                existing_ref=existing_ref,
-                reason=_("No 'source-name' was given. %s") % example)
+            raise self._bad_reference(
+                existing_ref,
+                _("No 'source-name' was given. %s") % example)
         source = source.strip()
 
         # Checked before the pool prefix, so naming a snapshot gets the
         # answer that helps rather than "wrong pool".
         if '@' in source:
-            raise exception.ManageExistingInvalidReference(
-                existing_ref=existing_ref,
-                reason=_("'%(source)s' names a snapshot. Adopt a snapshot "
-                         "with 'cinder snapshot-manage', not this call.")
+            raise self._bad_reference(
+                existing_ref,
+                _("'%(source)s' names a snapshot. Adopt a snapshot "
+                  "with 'cinder snapshot-manage', not this call.")
                 % {'source': source})
 
         prefix = '%s/' % pool
         if not source.startswith(prefix):
-            raise exception.ManageExistingInvalidReference(
-                existing_ref=existing_ref,
-                reason=_("'%(source)s' is not in pool '%(pool)s', which is "
-                         "the only pool this backend manages. %(example)s")
+            raise self._bad_reference(
+                existing_ref,
+                _("'%(source)s' is not in pool '%(pool)s', which is "
+                  "the only pool this backend manages. %(example)s")
                 % {'source': source, 'pool': pool, 'example': example})
 
         name = source[len(prefix):]
         if not name:
-            raise exception.ManageExistingInvalidReference(
-                existing_ref=existing_ref,
-                reason=_("'%(source)s' names the pool itself rather than a "
-                         "zvol in it. %(example)s")
+            raise self._bad_reference(
+                existing_ref,
+                _("'%(source)s' names the pool itself rather than a "
+                  "zvol in it. %(example)s")
                 % {'source': source, 'example': example})
         return name
 
@@ -1803,22 +1903,22 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         try:
             zvol = self.client.get_zvol(pool, name)
         except api_client.TrueNASAPINotFoundError:
-            raise exception.ManageExistingInvalidReference(
-                existing_ref=existing_ref,
-                reason=_("No dataset '%(pool)s/%(name)s' exists on the "
-                         "appliance.") % {'pool': pool, 'name': name})
+            raise self._bad_reference(
+                existing_ref,
+                _("No dataset '%(pool)s/%(name)s' exists on the "
+                  "appliance.") % {'pool': pool, 'name': name})
         except api_client.TrueNASAPIError as exc:
-            raise exception.VolumeBackendAPIException(
-                data=_('Could not read %(pool)s/%(name)s from the '
-                       'appliance: %(err)s')
+            raise self._backend_error(
+                _('Could not read %(pool)s/%(name)s from the '
+                  'appliance: %(err)s')
                 % {'pool': pool, 'name': name, 'err': exc})
 
         kind = zvol.get('type')
         if kind != 'VOLUME':
-            raise exception.ManageExistingInvalidReference(
-                existing_ref=existing_ref,
-                reason=_("'%(pool)s/%(name)s' is a %(kind)s, not a zvol. "
-                         "Only zvols can back a Cinder volume.")
+            raise self._bad_reference(
+                existing_ref,
+                _("'%(pool)s/%(name)s' is a %(kind)s, not a zvol. "
+                  "Only zvols can back a Cinder volume.")
                 % {'pool': pool, 'name': name, 'kind': kind or _('unknown')})
         return zvol
 
@@ -1853,14 +1953,14 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         try:
             size_bytes = int(raw)
         except (TypeError, ValueError):
-            raise exception.VolumeBackendAPIException(
-                data=_('The appliance reported no usable volsize for '
-                       '%(name)s: %(raw)r')
+            raise self._backend_error(
+                _('The appliance reported no usable volsize for '
+                  '%(name)s: %(raw)r')
                 % {'name': zvol.get('name'), 'raw': zvol.get('volsize')})
         if size_bytes <= 0:
-            raise exception.VolumeBackendAPIException(
-                data=_('The appliance reported %(name)s as %(size)s bytes, '
-                       'which cannot be adopted.')
+            raise self._backend_error(
+                _('The appliance reported %(name)s as %(size)s bytes, '
+                  'which cannot be adopted.')
                 % {'name': zvol.get('name'), 'size': size_bytes})
         return (size_bytes + GIB - 1) // GIB
 
@@ -1917,19 +2017,19 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
                 self.client.get_targets())
             sessions = self._sessions_for(targets)
         except api_client.TrueNASAPIError as exc:
-            raise exception.VolumeBackendAPIException(
-                data=_('Could not determine whether %(disk)s is already '
-                       'exported, so it will not be adopted: %(err)s')
+            raise self._backend_error(
+                _('Could not determine whether %(disk)s is already '
+                  'exported, so it will not be adopted: %(err)s')
                 % {'disk': disk, 'err': exc})
 
         if sessions:
-            raise exception.ManageExistingInvalidReference(
-                existing_ref=existing_ref,
-                reason=_("'%(pool)s/%(name)s' has %(count)d live iSCSI "
-                         "session(s), from %(initiators)s. Renaming it now "
-                         "would break whatever is using it. Detach it "
-                         "first; this is refused whatever "
-                         "truenas_adopt_removes_export is set to.")
+            raise self._bad_reference(
+                existing_ref,
+                _("'%(pool)s/%(name)s' has %(count)d live iSCSI "
+                  "session(s), from %(initiators)s. Renaming it now "
+                  "would break whatever is using it. Detach it "
+                  "first; this is refused whatever "
+                  "truenas_adopt_removes_export is set to.")
                 % {'pool': pool, 'name': name, 'count': len(sessions),
                    'initiators': ', '.join(sorted(
                        {'%s (%s)' % (session.get('initiator'),
@@ -1941,14 +2041,14 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
             + ['extent %s' % extent['id'] for extent in extents])
 
         if not self.configuration.truenas_adopt_removes_export:
-            raise exception.ManageExistingInvalidReference(
-                existing_ref=existing_ref,
-                reason=_("'%(pool)s/%(name)s' is already exported over "
-                         "iSCSI by %(described)s. Nothing is connected to "
-                         "it, so removing that export is safe and leaves "
-                         "the zvol untouched -- do it on the appliance and "
-                         "retry, or set truenas_adopt_removes_export = "
-                         "true to have the driver do it.")
+            raise self._bad_reference(
+                existing_ref,
+                _("'%(pool)s/%(name)s' is already exported over "
+                  "iSCSI by %(described)s. Nothing is connected to "
+                  "it, so removing that export is safe and leaves "
+                  "the zvol untouched -- do it on the appliance and "
+                  "retry, or set truenas_adopt_removes_export = "
+                  "true to have the driver do it.")
                 % {'pool': pool, 'name': name, 'described': described})
 
         self._remove_conflicting_export(disk, targets, extents)
@@ -2059,21 +2159,22 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
                 except api_client.TrueNASAPINotFoundError:
                     continue
                 except api_client.TrueNASAPIError as exc:
-                    raise exception.VolumeBackendAPIException(
-                        data=_('Could not remove iSCSI %(what)s %(id)s '
-                               'while adopting %(disk)s, so the zvol has '
-                               'not been renamed: %(err)s')
-                        % {'what': what, 'id': row['id'], 'disk': disk,
-                           'err': exc})
+                    raise self._backend_error(
+                        _('Could not remove iSCSI %(what)s %(id)s '
+                          'while adopting %(disk)s, so the zvol has '
+                          'not been renamed: %(err)s')
+                        % {'what': what, 'id': row['id'],
+                           'disk': disk, 'err': exc})
                 removed.append('%s %s' % (what, row['id']))
 
         try:
             self._reload_exports()
         except api_client.TrueNASAPIError as exc:
-            LOG.warning('Removed %(removed)s for %(disk)s but could not '
-                        'reload the iSCSI service: %(err)s',
-                        {'removed': ', '.join(removed), 'disk': disk,
-                         'err': exc})
+            LOG.warning(self._tagged(
+                'Removed %(removed)s for %(disk)s but could not reload '
+                'the iSCSI service: %(err)s'),
+                {'removed': ', '.join(removed), 'disk': disk,
+                 'err': exc})
         LOG.info('Removed %(removed)s that were exporting %(disk)s, as '
                  'truenas_adopt_removes_export is set. The zvol itself was '
                  'not touched.',
@@ -2097,16 +2198,16 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         try:
             pools = self.client.get_pool_list()
         except api_client.TrueNASAPIError as exc:
-            raise exception.VolumeBackendAPIException(
-                data=_('Could not read pool capacity from the TrueNAS '
-                       'appliance: %s') % exc)
+            raise self._backend_error(
+                _('Could not read pool capacity from the TrueNAS '
+                  'appliance: %s') % exc)
 
         pool = next((entry for entry in pools
                      if entry.get('name') == pool_name), None)
         if pool is None:
-            raise exception.VolumeBackendAPIException(
-                data=_('Pool %(pool)r has disappeared from the appliance. '
-                       'It existed when the driver started.')
+            raise self._backend_error(
+                _('Pool %(pool)r has disappeared from the appliance. '
+                  'It existed when the driver started.')
                 % {'pool': pool_name})
 
         # Bytes. `free` accounts for reservations; `allocated` does not.

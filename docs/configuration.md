@@ -117,6 +117,35 @@ A `403` at startup now reads `The key was accepted, so it is valid -- the
 account it belongs to lacks the role this call needs.` That is the case an
 operator is most likely to hit, and reissuing the key will not fix it.
 
+## Reading the log with more than one backend
+
+Every message this driver writes that an operator has to act on is prefixed
+with the backend it came from:
+
+```
+[truenas-iscsi] The iSCSI service on the TrueNAS appliance is STOPPED. ...
+```
+
+The name is `volume_backend_name` from your `cinder.conf` — the same string
+`openstack volume service list` shows as `host@backend`. Without it set the
+prefix falls back to `truenas_api_url`.
+
+With one backend this is redundant. With two it is the difference between
+knowing which appliance to go and look at and checking both, because the
+traceback names the driver class, which is identical for every instance of it.
+
+So the tag is what to grep for:
+
+```bash
+grep '\[truenas-iscsi\]' /var/log/kolla/cinder/cinder-volume.log
+```
+
+Per-volume lines are deliberately **not** tagged — `Created zvol
+Dev-Pool/volume-<uuid>` already names a volume, and a volume name is unique
+across the whole cloud, so the backend is recoverable from it. Setup and
+discovery lines name only appliance-side objects (`portal 26`, `pool
+Dev-Pool`), which are not unique, so those carry the tag.
+
 ## Options
 
 | Option | Type | Default | Required |

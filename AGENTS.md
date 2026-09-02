@@ -427,6 +427,23 @@ somebody runs it.
 Extend it when adding client methods — the point is that findings can be
 re-checked against a new TrueNAS release, not taken on trust.
 
+**Never construct an operator-facing exception directly.** `driver.py` builds
+`InvalidInput`, `VolumeBackendAPIException` and `ManageExistingInvalidReference`
+through `_config_error`, `_backend_error` and `_bad_reference`, which prefix
+`[<volume_backend_name>]` so a message from a multi-backend deployment says
+which appliance it is about. Log lines an operator acts on — every `LOG.error`
+and `LOG.warning`, and every `LOG` call in the setup path — wrap their message
+in `self._tagged(...)` for the same reason.
+
+Per-volume lifecycle lines are deliberately untagged: they already name a
+volume, and volume names are unique cloud-wide, so the backend is recoverable.
+Setup lines name only appliance-side objects (`portal 26`), which are not.
+
+`TestEveryMessageNamesItsBackend` parses `driver.py` and fails on a message
+that skips this, so a new one cannot quietly go untagged. `VolumeIsBusy` and
+its siblings are exempt and must stay so — Cinder composes those from keyword
+arguments and there is no message of ours to prefix (#61).
+
 **Every client failure is a `TrueNASAPIError` subclass** (#11) — including
 network ones, so a caller never sees a raw `requests` exception and `#14` can
 translate to `VolumeBackendAPIException` with one `except`. Requests carry a
