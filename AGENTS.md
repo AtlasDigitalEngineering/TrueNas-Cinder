@@ -52,6 +52,7 @@ an earlier version of this file said Jammy, which put the driver tests on
                            #   + workflow lint (actionlint, shellcheck)
   workflows/image.yml      # build + publish the cinder-volume image on tag
   workflows/claude-code-review.yml
+  scripts/count-review-posts.sh  # proves the review actually reached the PR
 truenas_cinder_driver/
   __init__.py      # exports TrueNASAPIClient, the exception hierarchy, __version__
   api_client.py    # TrueNASAPIClient + TrueNASAPIError hierarchy — REST wrapper
@@ -806,6 +807,15 @@ directly — follows this flow:
    file. Set up as of 2026-07-26 via `/install-github-app`, which added the
    Claude GitHub App and the repo secret `CLAUDE_CODE_OAUTH_TOKEN` (not a raw
    `ANTHROPIC_API_KEY`).
+
+   **A green review check does not mean a review happened.** The action can
+   run to completion, exit 0, and publish nothing — measured at roughly one
+   run in eleven (#38). Nothing distinguishes that from a clean review: the
+   check is green, `mergeStateStatus` is `CLEAN`, and there are no unresolved
+   threads. The workflow therefore counts what the reviewer has published
+   before and after, and fails the job when the count has not moved. Re-running
+   the job has succeeded every time so far. Do not weaken that step to a
+   warning — a warning restores exactly the ambiguity it exists to remove.
 
    It **cannot** approve, merge, or push commits — but it is *not* purely
    advisory: because the ruleset sets `required_review_thread_resolution: true`,

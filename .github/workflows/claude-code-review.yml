@@ -26,6 +26,26 @@ jobs:
         with:
           fetch-depth: 1
 
+      # The action can run a full review, exit 0, and publish nothing (#38).
+      # Observed: eleven runs in one session, ten posted, one silent after
+      # 3m03s -- inside the duration range of the runs that did post, so it
+      # was not exiting early. Nothing distinguishes that from a clean review
+      # at any surface: the check is green, mergeStateStatus is CLEAN, and
+      # there are no unresolved threads. A PR with no review at all looks
+      # exactly like a PR that passed one.
+      #
+      # So count what the reviewer has published before and after. Anything
+      # it posts -- summary, inline comment or formal review -- counts.
+      - name: Count what the reviewer has already posted
+        id: before
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "count=$(bash .github/scripts/count-review-posts.sh)" \
+            >> "$GITHUB_OUTPUT"
+
       - uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -76,3 +96,26 @@ jobs:
             good PR, not a sign you missed something.
           claude_args: |
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
+
+      # Fail rather than report a green check nobody can distinguish from a
+      # real review. The prompt above requires a summary comment even when
+      # there is nothing blocking, so "posted nothing" is never a legitimate
+      # outcome -- it always means the review did not reach the PR.
+      #
+      # Re-running the job is the remedy; it succeeded on every re-run
+      # observed so far.
+      - name: Fail if the review posted nothing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          BEFORE: ${{ steps.before.outputs.count }}
+        run: |
+          after=$(bash .github/scripts/count-review-posts.sh)
+          echo "reviewer posts: ${BEFORE} before, ${after} after"
+          if [ "${after}" -gt "${BEFORE}" ]; then
+            echo "The review reached the PR."
+            exit 0
+          fi
+          echo "::error::The review job completed but published nothing to PR #${PR} (issue #38). A green check here would be indistinguishable from a reviewed PR. Re-run this job."
+          exit 1
