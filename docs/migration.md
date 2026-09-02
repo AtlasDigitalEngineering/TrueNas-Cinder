@@ -157,15 +157,21 @@ happens depends on `truenas_adopt_removes_export`:
 
 | Setting | Behaviour |
 |---|---|
-| `false` (default) | Refused, naming the exact target and extent to delete. Delete them on the appliance and retry. |
-| `true` | The driver removes them itself, then adopts. |
+| `false` (default) | Refused, naming the **extent** to delete. Delete it on the appliance and retry. |
+| `true` | The driver deletes the extent itself, then adopts. |
 
 Either way the zvol and its data are untouched — only the iSCSI objects
 pointing at it are removed, and Cinder builds its own on first attach.
 
-The refusal names **only** the objects blocking this adoption. If it mentions
-`target 11` and `extent 8`, those are the two to remove; anything else on the
-appliance belongs to something different.
+**The extent is the thing to remove, not the target.** The extent belongs to
+this disk alone and is what pins the zvol; deleting it also removes its
+target-extent association. A target may be serving other disks, and deleting
+one that is removes *their* associations too — see
+[When several disks share one iSCSI target](#when-several-disks-share-one-iscsi-target).
+
+The refusal names **only** the objects blocking this adoption; anything else on
+the appliance belongs to something different. If the target is shared, the
+refusal says so and tells you not to delete it.
 
 ## When several disks share one iSCSI target
 
