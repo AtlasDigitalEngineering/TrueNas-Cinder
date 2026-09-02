@@ -1229,9 +1229,13 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
                   '%(err)s')
                 % {'source': source_id, 'name': snapshot.name, 'err': exc})
 
+        # The full `pool/dataset@snapshot`, matching the error path above
+        # and the volume equivalent in `manage_existing`. The bare name is
+        # ambiguous across datasets, and this is the line somebody greps
+        # for after an adoption (#86).
         LOG.info('Adopted snapshot %(source)s as %(name)s on volume '
                  '%(volume)s.',
-                 {'source': source_name, 'name': snapshot.name,
+                 {'source': source_id, 'name': snapshot.name,
                   'volume': snapshot.volume_name})
 
     def manage_existing_snapshot_get_size(self, snapshot, existing_ref):

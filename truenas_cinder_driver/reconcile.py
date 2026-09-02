@@ -140,7 +140,16 @@ def find_orphans(
             # `get_or_create_initiator_group` deduplicates on this side
             # because TrueNAS enforces no uniqueness, and it races under
             # concurrent attach (#18). Duplicates are that race, observed.
-            report["duplicate_initiator_groups"].append(list(members))
+            #
+            # One row per *cluster*, not per group: being a duplicate is a
+            # property of the set, not of any one member, and there is no
+            # basis for calling one of them the original. Shaped as a
+            # mapping so that every class in the report is a list of rows
+            # and every renderer takes one (#97).
+            report["duplicate_initiator_groups"].append({
+                "ids": [member["id"] for member in members],
+                "initiators": sorted(iqns),
+            })
         if connector_iqns is not None and iqns and not (iqns & connector_iqns):
             report["unused_initiator_groups"] += members
 
@@ -187,10 +196,10 @@ def describe(report: Dict[str, List[Any]], pool: str) -> str:
                                                 row["extent"])),
         "leaked_zvols": lambda row: "zvol %s" % row["name"],
         "adoptable_zvols": lambda row: "zvol %s" % row["name"],
-        "duplicate_initiator_groups": lambda rows: (
+        "duplicate_initiator_groups": lambda row: (
             "groups %s all hold %s" % (
-                ", ".join(str(row["id"]) for row in rows),
-                sorted(rows[0].get("initiators") or ()))),
+                ", ".join(str(group_id) for group_id in row["ids"]),
+                row["initiators"])),
         "unused_initiator_groups": lambda row: "group %s %s" % (
             row["id"], row.get("initiators")),
     }
@@ -201,7 +210,8 @@ def describe(report: Dict[str, List[Any]], pool: str) -> str:
         "dangling_links": "Target-extent links pointing at nothing",
         "leaked_zvols": "Zvols this driver created with no Cinder volume",
         "duplicate_initiator_groups": (
-            "Duplicate initiator groups (the #18 race, observed)"),
+            "Sets of initiator groups holding the same IQNs "
+            "(the #18 race, observed)"),
         "unused_initiator_groups": "Initiator groups no known host will use",
         "adoptable_zvols": (
             "Zvols nothing else made -- NOT leaks, these are "

@@ -48,6 +48,17 @@ MAX_RETRY_AFTER = 30.0
 # 500 may well have applied a partial change.
 RETRY_STATUS_CODES = frozenset({429, 503})
 
+# Payload keys `create_zvol` sets itself that a caller could still reach:
+# `**kwargs` is spread after them, so either would win silently (#36).
+#
+# Only these two. `name` is a named parameter, so Python rejects a second
+# value for it before the body runs, and `volmode` left the payload in
+# #35. `create_snapshot` needs no equivalent at all -- both of its
+# structural keys, `dataset` and `name`, are named parameters, so nothing
+# structural can reach its `**kwargs`. Verified rather than assumed; see
+# `test_create_snapshot_structural_keys_cannot_reach_kwargs`.
+ZVOL_RESERVED_KEYS: Tuple[str, ...] = ("type", "volsize")
+
 # TrueNAS reports "no such object" two different ways, verified against
 # TrueNAS-25.10.5 in #11:
 #
@@ -146,6 +157,38 @@ class TrueNASAPITimeoutError(TrueNASAPIConnectionError):
     read timeout means the appliance stopped answering, not that it stopped
     working on the request.
     """
+
+
+def _reject_reserved(method: str, reserved: Tuple[str, ...],
+                     kwargs: Dict[str, Any]) -> None:
+    """Refuse a pass-through key that would rewrite the request's shape.
+
+    The create methods spread `**kwargs` into the payload *after* the
+    fields they set themselves, so a caller passing `type=` or `volsize=`
+    silently replaces one. The mistake is invisible where it is made and
+    loud somewhere unrelated: a FILESYSTEM created where a VOLUME was
+    meant produces no `/dev/zvol` node, and the failure surfaces later as
+    an iSCSI extent error pointing at the extent (#36).
+
+    Raising says so at the call site instead. A caller passing one of
+    these has misunderstood the method, which is worth reporting rather
+    than quietly honouring or quietly ignoring.
+
+    Args:
+        method: Name of the calling method, for the message
+        reserved: Keys that method sets itself
+        kwargs: The caller's pass-through arguments
+
+    Raises:
+        ValueError: If any reserved key is present
+    """
+    clashing = sorted(set(kwargs) & set(reserved))
+    if clashing:
+        raise ValueError(
+            "%s sets %s itself; passing %s through **kwargs would "
+            "silently replace it. Remove %s from the call."
+            % (method, ", ".join(reserved), ", ".join(clashing),
+               " and ".join(clashing)))
 
 
 class TrueNASAPIClient:
@@ -585,6 +628,7 @@ class TrueNASAPIClient:
         # schema variant, so the request falls through to the FILESYSTEM
         # schema and every volume-only field is reported as unexpected --
         # a 422 that points at `type` rather than the real culprit. See #35.
+        _reject_reserved("create_zvol", ZVOL_RESERVED_KEYS, kwargs)
         payload = {
             "name": f"{pool}/{name}",
             "type": "VOLUME",

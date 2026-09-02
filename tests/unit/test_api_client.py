@@ -576,6 +576,54 @@ class TestZvolOperations(TrueNASAPIClientTestCase):
         self.assertEqual(payload["comments"], "managed by cinder")
         self.assertEqual(payload["type"], "VOLUME")
 
+    def test_create_zvol_refuses_to_let_kwargs_rewrite_the_payload(self):
+        """#36: `**kwargs` spreads last, so a structural key would win.
+
+        Silent at the call site and loud somewhere unrelated: a
+        FILESYSTEM where a VOLUME was meant produces no `/dev/zvol` node,
+        and the failure surfaces later as an iSCSI extent error naming
+        the extent rather than the dataset type.
+        """
+        for key, value in (("type", "FILESYSTEM"), ("volsize", 1)):
+            with self.subTest(key=key):
+                with self.assertRaises(ValueError) as caught:
+                    self.client.create_zvol(
+                        pool="tank", name="v", size_gb=1, **{key: value})
+
+                # The message has to name the offending key, or the caller
+                # is told only that they did something wrong.
+                self.assertIn(key, str(caught.exception))
+                self.assertIn("create_zvol", str(caught.exception))
+
+    def test_create_zvol_name_is_protected_by_python_not_by_the_guard(self):
+        # `name` is a named parameter, so a second value is a TypeError
+        # before the body runs. Recorded so the reserved set stays as
+        # small as the exposure actually is (#36).
+        with self.assertRaises(TypeError):
+            self.client.create_zvol(pool="tank", name="v", size_gb=1,
+                                    **{"name": "somewhere/else"})
+
+    def test_create_zvol_refuses_before_making_a_request(self):
+        # Rejecting after the POST would leave a dataset created from the
+        # very payload being refused.
+        with self.assertRaises(ValueError):
+            self.client.create_zvol(pool="tank", name="v", size_gb=1,
+                                    type="FILESYSTEM")
+
+        self.session.request.assert_not_called()
+
+    def test_create_zvol_still_accepts_genuine_pass_through(self):
+        # The guard must not close the door it was built beside: a
+        # property the method does not set itself is still welcome.
+        self._set_response({})
+
+        self.client.create_zvol(pool="tank", name="v", size_gb=1,
+                                comments="managed by cinder", readonly="OFF")
+
+        payload = self.session.request.call_args.kwargs["json"]
+        self.assertEqual(payload["comments"], "managed by cinder")
+        self.assertEqual(payload["readonly"], "OFF")
+
     def test_get_zvol_uses_encoded_id(self):
         self._set_response({"name": "tank/volume1"})
 
@@ -1767,6 +1815,21 @@ class TestSnapshotOperations(IscsiTestCase):
             timeout=DEFAULT_TIMEOUT,
         )
 
+    def test_create_snapshot_structural_keys_cannot_reach_kwargs(self):
+        """Why `create_snapshot` needs no guard of its own (#36).
+
+        `dataset` and `name` are named parameters, so Python refuses a
+        second value for either before the body runs. The audit that
+        issue asked for found no exposure here, and this records the
+        reason — if someone later folds them into `**kwargs`, this fails
+        and the guard becomes necessary.
+        """
+        for key in ("dataset", "name"):
+            with self.subTest(key=key):
+                with self.assertRaises(TypeError):
+                    self.client.create_snapshot(DATASET, SNAP,
+                                                **{key: "elsewhere"})
+
     def test_delete_snapshot_defers_when_asked(self):
         self._set_response({})
 
@@ -1822,7 +1885,7 @@ BAD_POOL_BODY = {
 }
 
 
-class TestSnapshotAdoption(IscsiTestCase):
+class TestSnapshotAdoption(TrueNASAPIClientTestCase):
     """get_snapshot and rename_snapshot -- the snapshot half of #20."""
 
     def test_get_snapshot_encodes_the_id(self):
