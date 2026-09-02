@@ -72,6 +72,8 @@ tests/
     conftest.py    # fixtures, teardown, skip-if-unconfigured
     iscsi_probe.py # speaks the iSCSI login exchange over a plain socket
     test_*.py
+  fixtures/        # not tests; inputs the CI jobs lint against
+    shellcheck-probe.yml  # deliberately broken, proves shellcheck is on
 tools/
   find_orphans.py  # reconciliation CLI; reads .env and OS_* for Cinder
   check_workflows.py  # refuses `${{ }}` interpolated into a `run:` body
@@ -109,8 +111,11 @@ python tools/check_workflows.py                # no ${{ }} in a run: body
 ```
 
 `actionlint` needs `shellcheck` on `PATH` to check the bash inside `run:`
-bodies, and silently skips it otherwise — `nix-shell -p actionlint shellcheck`
-gets both. CI runs it from a pinned image that already bundles it.
+bodies, and silently skips it otherwise — no warning, exit 0 — `nix-shell -p actionlint shellcheck`
+gets both. CI runs it from a pinned image that already bundles it, and proves
+it did by linting `tests/fixtures/shellcheck-probe.yml`, which must report
+SC2045 — otherwise a green `Lint (workflows)` would mean "no bash was checked"
+rather than "the bash is clean".
 
 Use `python -m pytest`, not bare `pytest` — see the packaging note above.
 

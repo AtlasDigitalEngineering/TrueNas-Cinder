@@ -1,0 +1,20 @@
+# Not a real workflow. A deliberately broken one, used by the
+# `Lint (workflows)` job to prove shellcheck is active inside the
+# actionlint image (#82).
+#
+# actionlint drops every shellcheck finding *silently* when shellcheck is
+# not available -- no warning, exit 0 -- so a job that only runs it
+# cannot tell "the bash is clean" from "the bash was never checked".
+# Linting this file must produce a shellcheck finding, or the guarantee
+# is gone.
+#
+# It lives outside .github/workflows so GitHub never runs it and the
+# repo-wide actionlint pass never reads it.
+name: shellcheck probe
+on: workflow_dispatch
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      # SC2045 (iterating over ls), SC2086 (unquoted), SC2035 (bare glob).
+      - run: for f in $(ls *.txt); do echo $f; done
