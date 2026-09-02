@@ -77,6 +77,13 @@ jobs:
               - violations of an explicit AGENTS.md rule
               - missing or wrong tests for behaviour the PR introduces
               - broken/failing CI caused by this change
+              - a claim that restates a finding documented elsewhere in
+                this repo but drops its qualifications. Measurements in
+                this repo are carefully hedged ("only the read roles were
+                measured", "inference, not measurement"); a summary that
+                loses the hedge asserts something nobody established.
+                Check restatements against their source, not against
+                whether they sound right.
 
             **Summary comment only** (`gh pr comment`) — EVERYTHING else.
             Never post these inline:
@@ -94,6 +101,30 @@ jobs:
             not inline. If you find nothing blocking, post ONLY the summary
             and no inline comments at all; that is the expected outcome for a
             good PR, not a sign you missed something.
+
+            ## Hold non-blocking claims to the same standard
+
+            A wrong observation costs the author a round trip to disprove,
+            and non-blocking ones have been where the wrong claims land —
+            an assertion about a regex that did not behave as described, a
+            "you missed this" for something already fixed in the branch, a
+            misalignment that was correctly aligned. Each read as a finding
+            and was not one.
+
+            So: check it before posting it, whether it blocks or not. If
+            you did not verify something, either verify it or say plainly
+            that you did not. "I did not check X" is useful; a confident
+            wrong claim is worse than silence.
+
+            ## Look for checks that cannot fail
+
+            A recurring defect class here is the thing that reports success
+            without having done its job — a test whose assertion is
+            satisfied by an empty search, a guard whose pattern never
+            matches, a linter silently missing the tool it delegates to
+            (#38, #47, #74, #82). When a PR adds a test or a check, ask
+            what would make it pass vacuously, and whether anything
+            demonstrates it can fail.
           claude_args: |
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
 
