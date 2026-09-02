@@ -626,7 +626,7 @@ appliance, from `cinder-volume`. The initiator is somewhere else. An address
 that `cinder-volume` can reach and a compute node cannot passes every check
 this driver makes, then costs ~130s per attach and silently drops that
 attachment to a single path with no dm node (#64, measured). Do not add a
-reachability probe here and call it solved -- it would be testing the wrong
+reachability probe here and call it solved — it would be testing the wrong
 host, which is worse than not testing, because it reads as a guarantee.
 
 **Never derive portal ordering from the appliance.** Posting groups for portals
