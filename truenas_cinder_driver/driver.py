@@ -306,11 +306,22 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         tooz's file driver puts these in a path -- so `https://nas:443/`
         and `https://nas/` both yield `nas`.
 
+        **Distinct hosts can collapse to one identifier**, and that is
+        accepted rather than overlooked. `nas_one` and `nas-one` both
+        render `nas-one`; an IPv6 literal loses its brackets and colons,
+        so `[fe80::1]` becomes `fe80--1`. Two appliances sharing a lock
+        name over-serialises -- they wait for each other unnecessarily --
+        which is the safe direction to be wrong in. Under-serialising
+        would be the bug, and no collision here can cause it. If the
+        cosmetics or the contention ever matter, append a hash of the
+        full host rather than widening the character set, which would put
+        a `:` or `/` into a lock path.
+
         Args:
-            url: The configured ``truenas_api_url``
+            url: The configured ``truenas_api_url``.
 
         Returns:
-            A short, stable identifier
+            A short, stable identifier.
         """
         host = urlsplit(url).hostname or url
         return re.sub(r'[^a-z0-9.-]', '-', host.lower()) or 'truenas'
@@ -1747,9 +1758,7 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
             entry['reason_not_safe'] = _(
                 'in use: %(count)d live iSCSI session(s) from %(who)s') % {
                     'count': len(live),
-                    'who': ', '.join(sorted(
-                        session.get('initiator') or '?'
-                        for session in live))}
+                    'who': self._describe_sessions(live)}
             return entry
 
         if self.configuration.truenas_adopt_removes_export:
@@ -2069,10 +2078,7 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
                   "first; this is refused whatever "
                   "truenas_adopt_removes_export is set to.")
                 % {'pool': pool, 'name': name, 'count': len(sessions),
-                   'initiators': ', '.join(sorted(
-                       {'%s (%s)' % (session.get('initiator'),
-                                     session.get('initiator_addr'))
-                        for session in sessions}))})
+                   'initiators': self._describe_sessions(sessions)})
 
         described = ', '.join(
             ['target %s' % target['id'] for target in targets]
@@ -2137,6 +2143,37 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
             return []
         return self._sessions_matching(targets,
                                        self.client.get_iscsi_sessions())
+
+    @staticmethod
+    def _describe_sessions(sessions):
+        """Name the initiators holding sessions, once each.
+
+        Deduplicated: the count beside this in every message already
+        carries multiplicity, so `2 live iSCSI session(s) from iqn.x`
+        says one initiator holds two, and says it better than
+        `from iqn.x, iqn.x` does.
+
+        The address is included because it is what the operator does
+        something with — the next step after reading this is going to a
+        host and stopping whatever is attached.
+
+        One helper rather than two formattings: the listing and the
+        refusal describe the same condition, and they had already
+        drifted apart into a deduplicating one and a repeating one
+        (#95).
+
+        Args:
+            sessions: Session rows from ``/iscsi/global/sessions``
+
+        Returns:
+            A sorted, comma-separated description
+        """
+        # A set, not a generator: deduplication is the whole point, and
+        # `sorted(generator)` silently keeps the repeats.
+        return ', '.join(sorted({
+            '%s (%s)' % (session.get('initiator') or '?',
+                         session.get('initiator_addr') or '?')
+            for session in sessions}))
 
     def _sessions_matching(self, targets, sessions):
         """Return which of these sessions are served by these targets.
