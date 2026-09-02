@@ -25,11 +25,22 @@ which lands in tracebacks. The client rejects such a URL outright.
 
 ## The API key needs `FULL_ADMIN`
 
-Least privilege was attempted and does not work on this release. A key whose
-account holds only the eleven roles the driver's calls map to is refused with
-HTTP 403; the same key with `FULL_ADMIN` succeeds. Verified A-B-A. The eleven
-are listed in [configuration.md](configuration.md), for retrying on a future
-release.
+Least privilege was attempted and does not work on this release — not even
+`READONLY_ADMIN` for a plain read.
+
+**What was measured:** a throwaway account was granted one role set at a time
+and the same requests replayed with its key. `FULL_ADMIN` answered 200;
+`SHARING_ADMIN`, `READONLY_ADMIN`, `POOL_READ`, `DATASET_READ`,
+`SHARING_ISCSI_READ`, and all five read roles together each answered 403. Run
+as `FULL_ADMIN → others → FULL_ADMIN`, so it is not an artefact of ordering or
+caching.
+
+**What was not:** the write and delete roles. That they would also fail is
+inference — a short one, since an account that cannot complete `GET /pool`
+under `READONLY_ADMIN` will not complete a write under `DATASET_WRITE`, but
+inference rather than measurement. The full table and the eleven-role set worth
+retrying on a future release are in
+[configuration.md](configuration.md).
 
 The two auth failures need opposite fixes, so the client distinguishes them:
 
@@ -84,8 +95,14 @@ appliance to test against.
 ## Behaviours worth knowing
 
 Each of these contradicted an initial assumption and is asserted by the
-functional suite, so a change in a future TrueNAS release fails loudly rather
-than silently invalidating the client.
+functional suite, so a change in a future TrueNAS release mostly fails loudly
+rather than silently invalidating the client.
+
+*Mostly*, because a few of those assertions **skip** rather than run when the
+appliance is not in the required state — the reload-on-a-stopped-service check
+skips on any appliance whose iSCSI service is up, which is every working one.
+`pytest -rs` lists what skipped; a run reporting `1 skipped` is not the same as
+a run that checked everything.
 
 **"Object not found" has two forms.** Some endpoints answer 404 with
 `{"message": ""}`; others answer 422 with an errno inside a structured body.
