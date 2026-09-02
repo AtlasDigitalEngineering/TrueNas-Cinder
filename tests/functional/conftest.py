@@ -276,6 +276,33 @@ def portal_addresses(client, portals):
 
 
 @pytest.fixture
+def owned_initiator_groups(client, names, cleanup):
+    """Remove the initiator groups this test's exports create, last.
+
+    The driver creates groups and never removes one -- another volume may
+    still be attached through it, and there is no lifecycle event that
+    says otherwise -- so the suite owns them.
+
+    Registered as a fixture rather than inside a test body so it runs
+    *after* every export the test registered: a group is still referenced
+    by any target built on it, and `cleanup` unwinds in reverse
+    registration order. Deleting it first asks the appliance to remove
+    something in use.
+
+    Matched by IQN rather than by id because the group under test may not
+    exist yet when this registers -- concurrent exports are what create
+    it, and how many of them there are is the thing being asserted.
+    """
+    def drop():
+        for group in client.get_initiator_groups():
+            if group.get("initiators") == [names.iqn]:
+                client._make_request(
+                    "DELETE", "/iscsi/initiator/id/%s" % group["id"])
+
+    cleanup("initiator groups holding %s" % names.iqn, drop)
+
+
+@pytest.fixture
 def cleanup(client):
     """Collect teardown callables, run in reverse order.
 

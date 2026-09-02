@@ -57,15 +57,19 @@ truenas_cinder_driver/
   driver.py        # TrueNASISCSIDriver — config, setup validation, stats
 tests/
   __init__.py
-  unit/            # api_client; runs on `requests` alone, no Cinder
+  unit/            # no Cinder, no appliance; runs on `requests` alone
     __init__.py
     test_api_client.py
+    test_reconcile.py
+    test_find_orphans.py
+    test_iscsi_probe.py
   driver/          # driver; needs Cinder installed
     __init__.py
     test_driver.py
   functional/      # live appliance; skipped unless .env configures one
     __init__.py
     conftest.py    # fixtures, teardown, skip-if-unconfigured
+    iscsi_probe.py # speaks the iSCSI login exchange over a plain socket
     test_*.py
 tools/
   find_orphans.py  # reconciliation CLI; reads .env and OS_* for Cinder
@@ -384,6 +388,24 @@ Each test creates what it needs and removes it in a fixture, so cleanup runs
 whether the test passed, failed or raised. Nothing is asserted about the
 appliance's *global* state: assertions are scoped to objects the test created,
 because these run against appliances that have other work on them (#69).
+
+**It logs in for real.** `tests/functional/iscsi_probe.py` speaks the iSCSI
+login exchange (RFC 7143 §11) over a plain socket, so `test_iscsi_login.py`
+and the parallel-attach test can assert that an export is *usable*, not merely
+present. Everything else in the suite reads the appliance's own configuration
+back, which a driver bug that built the wrong thing consistently would also
+satisfy.
+
+Deliberately not `iscsiadm`: that needs `root`, `open-iscsi` and the
+`iscsi_tcp` module, none of which exist on the NixOS workstation, and it
+leaves node records behind. A socket needs none of them and leaves nothing — a
+session is a TCP connection, and closing it ends the session. The probe stops
+short of SCSI, so it proves the login and not the data path; the #20
+end-to-end run covers that with Nova, os-brick and a booted image.
+
+One appliance behaviour to know before reading a failure: ctld answers both
+"no such target" and "your IQN is not in the access list" with status class 2,
+detail 3. It does not distinguish them on purpose, and neither does the probe.
 
 It asserts the pipeline, snapshot and rename traps listed above rather than
 merely exercising them — the wrong forms are asserted to still be wrong, so a
