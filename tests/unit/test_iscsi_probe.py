@@ -71,7 +71,13 @@ class _FakeTarget(object):
 
     def __exit__(self, *exc):
         self._thread.join(timeout=5)
+        alive = self._thread.is_alive()
         self._sock.close()
+        # Only when the test is otherwise passing: a fake target that hung
+        # is a real finding, but reporting it over an exception already on
+        # its way out would replace the failure with its own.
+        if exc[0] is None:
+            assert not alive, "the fake target never finished its script"
 
     def _serve(self):
         connection, _peer = self._sock.accept()
