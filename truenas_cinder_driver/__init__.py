@@ -1,8 +1,13 @@
 """
 TrueNAS Cinder Driver package.
 
-This package implements a Cinder volume driver for TrueNAS Scale,
-supporting both iSCSI and NFS storage protocols.
+This package implements a Cinder volume driver for TrueNAS Scale over
+iSCSI: zvols as volumes, with the iSCSI export built and torn down per
+attach.
+
+**iSCSI only.** There is no NFS support and none is planned for v1. An
+earlier version of this docstring claimed both protocols; nothing ever
+implemented NFS.
 """
 
 # Single source of truth. pyproject.toml reads this attribute for the

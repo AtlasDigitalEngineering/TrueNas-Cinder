@@ -93,10 +93,18 @@ tox.ini            # envlist = py312, driver, flake8; functional is opt-in
 abandoned and deleted — merging it would have reverted the whole API client.
 See #26.
 
-There is **no** `setup.py` / `pyproject.toml` / `setup.cfg` — the package is
-not installable, so tests import `truenas_cinder_driver` only because the repo
-root is on `sys.path`. That is why CI and tox invoke `python -m pytest` rather
-than bare `pytest`. Issue #23 fixes this properly.
+The package **is** installable — `pyproject.toml` declares a setuptools build
+backend, and `uv pip install -e '.[driver]'` puts a real `dist-info` in the
+venv (#23). Tests no longer depend on the repo root being the working
+directory; `python -m pytest` from anywhere resolves the package from the
+install.
+
+**Bare `pytest` works now** — it did not before #23, and the old instruction
+here said so. What remains is a preference, not a requirement: `python -m`
+puts the *current* directory first on `sys.path`, so `python -m pytest` tests
+the working tree ahead of anything installed. With an editable install the two
+coincide; they would not for a contributor who also has a released version in
+the same environment. CI and tox use `python -m` for that reason.
 
 ## Commands
 
@@ -118,7 +126,7 @@ it did by linting `tests/fixtures/shellcheck-probe.yml`, which must report
 SC2045 — otherwise a green `Lint (workflows)` would mean "no bash was checked"
 rather than "the bash is clean".
 
-Use `python -m pytest`, not bare `pytest` — see the packaging note above.
+Prefer `python -m pytest` over bare `pytest` — see the packaging note above. Both work.
 
 **Use the flake.** `nix develop` gives the whole development environment.
 It comes in two halves, and the split is worth understanding:
@@ -178,7 +186,7 @@ suite keeps a 3.10 leg in CI as breadth, but nothing needs 3.10 locally.
   class, and would not have caught that `SanDriver.check_for_setup_error()`
   demands SSH credentials this driver never uses.
 
-Use `python -m pytest`, not bare `pytest` — see the packaging note above.
+Prefer `python -m pytest` over bare `pytest` — see the packaging note above. Both work.
 
 **Environment caveats.** Don't assume a usable interpreter is on `PATH` — the
 dev machines differ:
