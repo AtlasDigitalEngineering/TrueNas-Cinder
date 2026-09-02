@@ -465,6 +465,32 @@ and not inherited by the next expression added to that step.
 `tools/check_workflows.py` enforces the stricter rule, and
 `test_this_repository_is_clean` fails on a new one (#81).
 
+**Restating a finding loses its hedges. Re-read the source, or link to it.**
+The rules above cover claims you make first-hand — verify, don't assume, prove
+it against reality. They do not cover the more common failure: repeating a
+finding that already exists in this repo, from memory, in a new place.
+
+Twice in one session a document asserted more than its source did. Both times
+the measurement was fine and correctly qualified where it was taken —
+`configuration.md` says outright "inference, not measurement" — and the
+qualification was lost in transcription. A summary that drops the hedge asserts
+something nobody established, and it is harder to catch than a fabrication
+because every individual word came from somewhere real.
+
+So, when a claim already exists elsewhere in the repo:
+
+- **Prefer a link to a restatement.** `docs/api-reference.md` would have been
+  immune if it had pointed at `configuration.md` instead of summarising it.
+  Linking cannot drift; summarising can.
+- If you must restate, open the source and carry its qualifications with it.
+  "Verified" and "verified for the read paths, inferred for the rest" are
+  different claims.
+- Say which it is. A labelled inference is useful; an inference wearing a
+  measurement's clothes is not.
+
+The review prompt treats a restatement that drops its qualifications as a
+blocking finding, so this is enforced rather than remembered.
+
 **Never construct an operator-facing exception directly.** `driver.py` builds
 `InvalidInput`, `VolumeBackendAPIException` and `ManageExistingInvalidReference`
 through `_config_error`, `_backend_error` and `_bad_reference`, which prefix
