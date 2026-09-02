@@ -20,6 +20,7 @@ built -- because a pipeline that races leaves configuration the appliance
 accepted and no initiator can use, which raises nothing.
 """
 
+import re
 import threading
 
 import pytest
@@ -97,12 +98,41 @@ def test_concurrent_reloads_are_serialised_without_error(
     assert client.get_iscsi_service()["state"] == "RUNNING"
 
 
-def test_the_lock_id_identifies_this_appliance(driver, config):
-    # Locks are per appliance. Two backends pointing at different boxes
-    # must not serialise against each other.
-    host = config[0].split("//", 1)[-1].split("/", 1)[0].split(":", 1)[0]
+def test_the_lock_id_identifies_this_appliance(driver):
+    """Properties, not a second parser (#99).
 
-    assert driver.lock_id == host.lower()
+    This used to hand-parse the host out of the configured URL and
+    compare. A test that reimplements the thing it tests can only agree
+    or disagree with it, and reproduces its bugs when it agrees — and
+    this one disagreed for two real URL shapes:
+
+        https://[fe80::1]/   driver 'fe80--1'   hand-parse '[fe80'
+        http://nas_one/      driver 'nas-one'   hand-parse 'nas_one'
+
+    So against an IPv6-addressed or underscore-named appliance the
+    *test* failed, not the driver. The properties below hold for
+    hostnames, IPv4 and IPv6 alike; `TestApplianceLockId` in the driver
+    suite covers the exact values.
+    """
+    lock_id = driver.lock_id
+
+    # Non-empty, or the lock name degenerates to a bare prefix shared by
+    # every appliance — which is under-serialising, the unsafe direction.
+    assert lock_id
+
+    # tooz's file driver puts this in a path, so nothing outside the safe
+    # set may survive.
+    assert re.fullmatch(r'[a-z0-9.-]+', lock_id), lock_id
+
+    # A different appliance must not share this one's lock.
+    assert driver._appliance_lock_id('https://not-this-appliance') != lock_id
+
+    # Port-stability and the exact values live in the driver suite's
+    # `TestApplianceLockId`, where the inputs are literal. Deriving a
+    # second URL from the configured one here would mean parsing it,
+    # which is the mistake this test was rewritten to stop making --
+    # the first attempt at that mangled `https://[::1]/` into
+    # `https://[:8443::1]/` and raised inside `urlsplit`.
 
 
 ATTACHES = 4

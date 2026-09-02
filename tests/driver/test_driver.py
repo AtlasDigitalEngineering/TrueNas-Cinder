@@ -467,6 +467,41 @@ class TestApplianceLockId(DriverTestCase):
         self.assertTrue(
             tnd.TrueNASISCSIDriver._appliance_lock_id('nas.example'))
 
+    def test_an_ipv6_literal_yields_a_usable_name(self):
+        """The shape that broke the functional test (#99).
+
+        Brackets and colons cannot survive into a lock path, so they are
+        replaced like any other unsafe character. Ugly but functional,
+        and asserted here rather than left to whatever a hand-written
+        parser in a test happens to produce.
+        """
+        for url, expected in (('https://[::1]/', '--1'),
+                              ('https://[fe80::1]:443/', 'fe80--1')):
+            with self.subTest(url=url):
+                got = tnd.TrueNASISCSIDriver._appliance_lock_id(url)
+
+                self.assertEqual(got, expected)
+                self.assertRegex(got, r'^[a-z0-9.-]+$')
+
+    def test_a_port_does_not_change_an_ipv6_name_either(self):
+        self.assertEqual(
+            tnd.TrueNASISCSIDriver._appliance_lock_id('https://[fe80::1]/'),
+            tnd.TrueNASISCSIDriver._appliance_lock_id(
+                'https://[fe80::1]:443/'))
+
+    def test_hosts_differing_only_in_punctuation_collide(self):
+        """Documented, not accidental (#99).
+
+        `nas_one` and `nas-one` render the same name, so two appliances
+        would share a lock. That over-serialises -- they wait for each
+        other needlessly -- which is the safe direction. Under-serialising
+        would be the bug, and no collision here can cause it. Asserted so
+        that anyone changing the character set sees the consequence.
+        """
+        self.assertEqual(
+            tnd.TrueNASISCSIDriver._appliance_lock_id('https://nas_one/'),
+            tnd.TrueNASISCSIDriver._appliance_lock_id('https://nas-one/'))
+
     def test_two_appliances_do_not_share_a_lock(self):
         self.assertNotEqual(
             tnd.TrueNASISCSIDriver._appliance_lock_id('https://a.example'),
@@ -1172,6 +1207,10 @@ class TestLocking(ExportTestCase):
     pipeline build, by contrast, ran five ways concurrently without
     failing, so it is deliberately not serialised -- see
     `_reload_exports`.
+
+    The third reload call site, on the adoption path, is covered by
+    `TestAdoptionSafetyGate.test_the_adoption_reload_takes_a_lock`, which
+    is where the mocks for an already-exported zvol live.
     """
 
     def test_the_initiator_group_lookup_takes_a_lock(self):
@@ -2277,6 +2316,23 @@ class TestAdoptionSafetyGate(AdoptionTestCase):
         driver.client.delete_target.assert_not_called()
         driver.client.delete_extent.assert_not_called()
 
+    def test_the_adoption_reload_takes_a_lock(self):
+        """The third reload call site, and the only one without a test.
+
+        `_reload_exports` is proven twice over by `TestLocking`, and this
+        call site is a plain call to it — so this is symmetry rather than
+        a gap. It is here because dropping the wrapper for a direct
+        `client.reload_iscsi_service()` on this path would break nothing
+        else that anyone would notice (#99).
+        """
+        driver = self._export_the_source(
+            self._driver(truenas_adopt_removes_export=True))
+        driver.lock_id = 'nas.example.com'
+
+        driver.manage_existing(FakeVolume(), self._ref())
+
+        self.assertIn('truenas-nas.example.com-reload', self.lock_names())
+
     def test_a_live_session_is_refused_even_with_removal_enabled(self):
         # The one case no configuration may authorise: renaming a zvol out
         # from under a connected initiator breaks it mid-write.
@@ -2502,6 +2558,63 @@ class TestManageableVolumes(ManageableTestCase):
 
         self.assertEqual(
             driver._parse_existing_ref(entry['reference']), 'vm-100-disk-0')
+
+    def test_a_nested_zvol_round_trips_through_adoption(self):
+        """The one line the listing does not share with adoption (#95).
+
+        The listing derives the name itself —
+        `zvol['name'][len(pool) + 1:]` — and a slip in that slice shows
+        only on nested zvols, which is the shape a hand-provisioned disk
+        most often has. `manage_existing` would reject a malformed
+        reference rather than act on it, but "the listing hands out a
+        reference adoption rejects" is a poor way to find that out.
+        """
+        driver = self._driver()
+        driver.client.list_zvols.return_value = [
+            {'name': f'{POOL}/proxmox/vm-100-disk-0',
+             'volsize': {'parsed': 10 * 1024 ** 3}},
+        ]
+
+        entry, = self._listing(driver)
+
+        self.assertEqual(entry['reference'],
+                         {'source-name': f'{POOL}/proxmox/vm-100-disk-0'})
+        # And adoption accepts what the listing produced, rather than the
+        # two agreeing only in this test's imagination.
+        self.assertEqual(driver._parse_existing_ref(entry['reference']),
+                         'proxmox/vm-100-disk-0')
+
+    def test_one_initiator_holding_two_sessions_is_named_once(self):
+        # The count already says there are two. Repeating the IQN invites
+        # the reader to wonder whether two different things are being
+        # described (#95).
+        driver = self._export_the_source(self._driver())
+        driver.client.get_iscsi_sessions.return_value = [
+            {'initiator': 'iqn.a', 'initiator_addr': '10.0.0.1',
+             'target': f'{BASENAME}:vm-100-disk-0'},
+            {'initiator': 'iqn.a', 'initiator_addr': '10.0.0.1',
+             'target': f'{BASENAME}:vm-100-disk-0'},
+        ]
+
+        entry, = self._listing(driver)
+
+        self.assertFalse(entry['safe_to_manage'])
+        self.assertIn('2 live iSCSI session(s)', entry['reason_not_safe'])
+        self.assertEqual(entry['reason_not_safe'].count('iqn.a'), 1)
+
+    def test_the_listing_names_the_host_like_the_refusal_does(self):
+        # Both messages describe the same condition and had drifted into
+        # naming different things. The address is what the operator acts
+        # on: it says which host to go and stop.
+        driver = self._export_the_source(self._driver())
+        driver.client.get_iscsi_sessions.return_value = [
+            {'initiator': 'iqn.a', 'initiator_addr': '10.0.0.7',
+             'target': f'{BASENAME}:vm-100-disk-0'},
+        ]
+
+        entry, = self._listing(driver)
+
+        self.assertIn('10.0.0.7', entry['reason_not_safe'])
 
     def test_the_size_is_the_zvols_own_rounded_up(self):
         driver = self._driver()
