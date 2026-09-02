@@ -52,6 +52,7 @@ an earlier version of this file said Jammy, which put the driver tests on
                            #   + workflow lint (actionlint, shellcheck)
   workflows/image.yml      # build + publish the cinder-volume image on tag
   workflows/claude-code-review.yml
+  scripts/count-review-posts.sh  # proves the review actually reached the PR
 truenas_cinder_driver/
   __init__.py      # exports TrueNASAPIClient, the exception hierarchy, __version__
   api_client.py    # TrueNASAPIClient + TrueNASAPIError hierarchy — REST wrapper
@@ -806,6 +807,31 @@ directly — follows this flow:
    file. Set up as of 2026-07-26 via `/install-github-app`, which added the
    Claude GitHub App and the repo secret `CLAUDE_CODE_OAUTH_TOKEN` (not a raw
    `ANTHROPIC_API_KEY`).
+
+   **A green review check does not mean a review happened.** The action can
+   run to completion, exit 0, and publish nothing — measured at roughly one
+   run in eleven (#38). Nothing distinguishes that from a clean review: the
+   check is green, `mergeStateStatus` is `CLEAN`, and there are no unresolved
+   threads. The workflow therefore counts what the reviewer has published
+   before and after, and fails the job when the count has not moved. Re-running
+   the job has succeeded every time so far. Do not weaken that step to a
+   warning — a warning restores exactly the ambiguity it exists to remove.
+
+   **A PR that edits `claude-code-review.yml` gets no review at all**, and is
+   failed for it. The action validates that the workflow file matches the copy
+   on the default branch and declines to run when it does not, so a PR cannot
+   rewrite its own review. It skips in seconds and posts nothing.
+
+   That is correct of the action and it leaves a hole: any PR could dodge
+   review by including a one-character edit to that file. The guard therefore
+   **fails** such a PR rather than excusing it. Nothing in it was reviewed, and
+   the property worth having is that the review cannot be made to disappear
+   quietly — a notice would be quiet.
+
+   A genuine prompt change goes red too, and needs a deliberate merge. Prompt
+   changes are rare; a silent bypass would not be. **Change the review prompt
+   in its own small PR and never bundle it with work you want reviewed** — the
+   bundled work would go unreviewed and the PR would be red either way.
 
    It **cannot** approve, merge, or push commits — but it is *not* purely
    advisory: because the ruleset sets `required_review_thread_resolution: true`,
