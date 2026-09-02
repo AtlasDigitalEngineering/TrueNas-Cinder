@@ -147,7 +147,7 @@ def find_orphans(
             # mapping so that every class in the report is a list of rows
             # and every renderer takes one (#97).
             report["duplicate_initiator_groups"].append({
-                "ids": [group["id"] for group in members],
+                "ids": [member["id"] for member in members],
                 "initiators": sorted(iqns),
             })
         if connector_iqns is not None and iqns and not (iqns & connector_iqns):
