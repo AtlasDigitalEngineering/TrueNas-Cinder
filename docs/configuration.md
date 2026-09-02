@@ -423,6 +423,22 @@ only **lowercase alphanumerics plus `.`, `-` and `:`**, so the default
 driver validates the rendered name against the appliance at startup rather than
 letting it fail at the first attach.
 
+## Snapshot naming needs a prefix
+
+`snapshot_name_template` must have literal text before its `%s` — the default
+`snapshot-%s` does. **A template that is only `%s` is refused at startup.**
+
+That is not fussiness about style. The prefix is the only thing distinguishing
+a snapshot this driver created from one a periodic snapshot or replication task
+created, and the delete path depends on the distinction: it refuses to delete a
+volume while snapshots it does not own still exist, and it will not delete
+those snapshots itself. Unable to tell them apart, the driver either blocks
+deletes it could safely have done, or reports its own snapshots as somebody
+else's and sends you looking for a replication task that is not there.
+
+Failing at startup says so once, while the configuration is still in front of
+you.
+
 ## Options this driver does not use
 
 `san_ip`, `san_login`, `san_password` and `san_private_key` come from the

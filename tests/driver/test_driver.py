@@ -20,6 +20,8 @@ import pathlib
 import unittest
 from unittest import mock
 
+import requests
+
 from cinder import coordination
 from cinder import exception
 
@@ -187,53 +189,216 @@ class TestDoSetup(DriverTestCase):
         request.assert_not_called()
 
 
+class TestSnapshotNameTemplate(DriverTestCase):
+    """One definition of the Cinder snapshot prefix (#89).
+
+    There were two, and they disagreed for a template with no literal
+    prefix: attribution answered "cannot tell" for everything, while
+    clone-source naming substituted a hardcoded `snapshot-`. A snapshot
+    this driver created was then reported as somebody else's in the
+    busy-delete message, sending the operator to hunt for a periodic
+    task that does not exist.
+    """
+
+    def test_the_default_template_yields_its_prefix(self):
+        self.assertEqual(self._driver()._snapshot_prefix(), 'snapshot-')
+
+    def test_a_custom_prefix_is_honoured(self):
+        driver = self._driver(snapshot_name_template='snap_%s')
+
+        self.assertEqual(driver._snapshot_prefix(), 'snap_')
+
+    def test_both_helpers_derive_from_the_same_prefix(self):
+        # The disagreement was possible because the split was written
+        # twice. Asserted on a custom template, since the default hid it.
+        driver = self._driver(snapshot_name_template='snap_%s')
+
+        self.assertTrue(driver._is_cinder_snapshot('snap_abc'))
+        self.assertTrue(
+            driver._clone_source_prefix().startswith('snap_'))
+
+    def test_a_prefix_less_template_is_refused_at_setup(self):
+        """Refused rather than limped along with.
+
+        Nothing in such a name distinguishes a snapshot this driver made
+        from one a replication task made, and `delete_volume` depends on
+        that distinction — it refuses while foreign snapshots exist and
+        will not delete snapshots it does not own. Unable to tell, it
+        either blocks deletes it could have done or calls its own
+        snapshots foreign.
+        """
+        driver = self._driver(snapshot_name_template='%s')
+
+        with self.assertRaises(exception.InvalidInput) as caught:
+            driver.check_for_setup_error()
+
+        message = str(caught.exception)
+        self.assertIn('snapshot_name_template', message)
+        self.assertIn('periodic snapshot or replication task', message)
+        # And says what a working one looks like.
+        self.assertIn('snapshot-%s', message)
+
+    def test_a_valid_template_does_not_trip_the_check(self):
+        # The check must not be satisfied by refusing everything.
+        driver = self._driver(snapshot_name_template='snap_%s')
+
+        driver.check_for_setup_error()
+
+
+class TestDescribeSessions(DriverTestCase):
+    """How live sessions are named in both messages (#95, #110)."""
+
+    def test_one_initiator_on_two_paths_is_named_twice(self):
+        """Multipath, which is this driver's normal configuration.
+
+        Deduplication is on the (initiator, address) pair, so a host
+        attached over two paths is listed once per path. That is
+        deliberate: two paths are two sessions to go and stop, and
+        collapsing them to one host would hide half of what has to be
+        detached. Asserted so a later "simplify" to dedupe on the
+        initiator alone fails rather than quietly losing a path.
+        """
+        driver = self._driver()
+
+        described = driver._describe_sessions([
+            {'initiator': 'iqn.a', 'initiator_addr': '10.0.0.1'},
+            {'initiator': 'iqn.a', 'initiator_addr': '10.0.0.2'},
+        ])
+
+        self.assertIn('10.0.0.1', described)
+        self.assertIn('10.0.0.2', described)
+        self.assertEqual(described.count('iqn.a'), 2)
+
+    def test_the_same_session_seen_twice_is_named_once(self):
+        driver = self._driver()
+
+        described = driver._describe_sessions([
+            {'initiator': 'iqn.a', 'initiator_addr': '10.0.0.1'},
+            {'initiator': 'iqn.a', 'initiator_addr': '10.0.0.1'},
+        ])
+
+        self.assertEqual(described.count('iqn.a'), 1)
+
+    def test_a_session_missing_its_fields_still_renders(self):
+        # The appliance has returned nulls here; a message that raises
+        # while explaining a refusal is worse than a vague one.
+        driver = self._driver()
+
+        described = driver._describe_sessions([{}])
+
+        self.assertIn('?', described)
+
+
 class TestAuthFailureMessages(DriverTestCase):
     """The line an operator reads when the service will not start.
 
     #59 is the case that matters: a Sharing Admin key produced "check that
     it is a valid, unrevoked key", so the obvious next step was to reissue
     the key -- which cannot help, because the key was never the problem.
+
+    **The remedy wording belongs to the client** (#93). It used to be
+    written twice, once there and once in a driver wrapper, so a startup
+    failure showed both. The client's version is asserted in
+    `tests/unit/test_api_client.py`; what is asserted here is that the
+    driver adds context without restating or swallowing it, and — in
+    `TestAuthMessageAsRendered` below — what the two layers actually
+    produce together.
     """
 
     def _fail_with(self, status):
         driver = self._driver()
         driver.client.get_pool_list.side_effect = (
-            api_client.TrueNASAPIAuthError('HTTP %s' % status,
+            api_client.TrueNASAPIAuthError('the client said this',
                                            status_code=status))
         with self.assertRaises(exception.InvalidInput) as caught:
             driver.check_for_setup_error()
         return str(caught.exception)
 
-    def test_403_tells_the_operator_not_to_reissue_the_key(self):
+    def test_the_clients_message_survives_intact(self):
+        # The driver no longer composes a remedy, so anything the client
+        # said has to reach the operator verbatim.
+        for status in (401, 403, None):
+            with self.subTest(status=status):
+                self.assertIn('the client said this',
+                              self._fail_with(status))
+
+    def test_the_driver_says_what_it_was_doing(self):
+        # Context is the driver's half of the split: an auth error at
+        # startup and one mid-operation read the same otherwise.
+        self.assertIn('Cannot start', self._fail_with(403))
+
+    def test_the_driver_adds_no_second_remedy(self):
+        """The defect #93 records: two explanations of one fix.
+
+        Asserted on the driver's own contribution rather than on the
+        whole string, since the client's remedy legitimately contains
+        these words.
+        """
         message = self._fail_with(403)
+        driver_added = message.replace('the client said this', '')
 
-        self.assertIn('do not reissue', message)
-        self.assertIn('FULL_ADMIN', message)
+        for word in ('FULL_ADMIN', 'reissue', 'revoked', 'role'):
+            self.assertNotIn(word, driver_added)
 
-    def test_401_tells_the_operator_to_issue_a_new_key(self):
-        message = self._fail_with(401)
 
-        self.assertIn('Issue a new key', message)
+class TestAuthMessageAsRendered(DriverTestCase):
+    """What the operator actually sees, through both layers (#93).
+
+    Every other test here mocks the client, so the client's half of the
+    message never runs. That is exactly how a split like this rots: each
+    layer is tested against its own half and nobody checks the sentence
+    they add up to. This drives a **real** client with only `requests`
+    mocked, and reads the string off the exception.
+    """
+
+    def _rendered(self, status):
+        driver = tnd.TrueNASISCSIDriver(configuration=self._configuration())
+        driver.do_setup(None)
+
+        # Shaped the way the client detects a failure: it calls
+        # `raise_for_status()` and catches `requests.HTTPError`. A bare
+        # MagicMock auto-creates a truthy `.ok` and raises nothing, so
+        # setup would sail past this and fail somewhere unrelated.
+        response = mock.MagicMock()
+        response.status_code = status
+        response.json.return_value = {}
+        response.text = ''
+        response.content = b''
+        response.headers = {}
+        response.raise_for_status.side_effect = requests.HTTPError(
+            '%s Error' % status)
+        with mock.patch.object(driver.client.session, 'request',
+                               return_value=response):
+            with self.assertRaises(exception.InvalidInput) as caught:
+                driver.check_for_setup_error()
+        return str(caught.exception)
+
+    def test_a_403_names_the_option_the_remedy_and_the_endpoint(self):
+        message = self._rendered(403)
+
+        self.assertIn('truenas_api_key', message)   # what they edit
+        self.assertIn('FULL_ADMIN', message)        # what to do
+        self.assertIn('do not reissue', message)    # what not to do
+        self.assertIn('/pool', message)             # what failed
+        self.assertIn('Cannot start', message)      # when
+
+    def test_a_401_names_the_opposite_remedy(self):
+        message = self._rendered(401)
+
+        self.assertIn('truenas_api_key', message)
+        self.assertIn('Issue a new one', message)
         self.assertIn('not a role problem', message)
 
-    def test_the_two_messages_are_not_interchangeable(self):
-        # A wrapper that mentioned both remedies would satisfy each
-        # assertion above while telling the operator to try both things --
-        # which is what the single previous message effectively did.
-        unauthorised = self._fail_with(401)
-        forbidden = self._fail_with(403)
+    def test_the_remedy_is_stated_once(self):
+        """The duplication #93 exists to remove.
 
-        self.assertNotEqual(unauthorised, forbidden)
-        self.assertNotIn('do not reissue', unauthorised)
-        self.assertNotIn('Issue a new key', forbidden)
+        Both layers naming FULL_ADMIN is how it read before: one fix,
+        described twice, in different words.
+        """
+        message = self._rendered(403)
 
-    def test_an_auth_error_with_no_status_is_treated_as_a_bad_key(self):
-        # status_code is optional on the exception. Defaulting to the
-        # role branch would tell someone their roles are wrong on the
-        # strength of no evidence at all.
-        message = self._fail_with(None)
-
-        self.assertIn('Issue a new key', message)
+        self.assertEqual(message.count('FULL_ADMIN'), 1)
+        self.assertEqual(message.lower().count('reissue'), 1)
 
 
 class TestSetupValidation(DriverTestCase):
@@ -257,7 +422,17 @@ class TestSetupValidation(DriverTestCase):
 
         driver.check_for_setup_error()
 
-    def test_bad_api_key_names_the_option(self):
+    def test_an_auth_failure_is_a_configuration_error(self):
+        """The type, not the wording.
+
+        This asserted that the message names `truenas_api_key`, which the
+        driver used to add itself. Under #93 the client owns that, and
+        this test mocks the client — so it would have been asserting a
+        string it also supplied. The property is real and is checked
+        through both layers in `TestAuthMessageAsRendered`; what belongs
+        here is that an auth failure is `InvalidInput` (operator-fixable)
+        rather than a backend error.
+        """
         driver = self._driver()
         driver.client.get_pool_list.side_effect = (
             api_client.TrueNASAPIAuthError('HTTP 401'))
@@ -265,7 +440,7 @@ class TestSetupValidation(DriverTestCase):
         with self.assertRaises(exception.InvalidInput) as caught:
             driver.check_for_setup_error()
 
-        self.assertIn('truenas_api_key', str(caught.exception))
+        self.assertIn('HTTP 401', str(caught.exception))
 
     def test_unreachable_appliance_is_a_backend_error(self):
         # Not InvalidInput: the configuration may be perfectly correct.

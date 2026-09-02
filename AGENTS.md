@@ -465,6 +465,20 @@ and not inherited by the next expression added to that step.
 `tools/check_workflows.py` enforces the stricter rule, and
 `test_this_repository_is_clean` fails on a new one (#81).
 
+**The client owns operator-facing remedies; the driver adds context.**
+`api_client._raise_for_status` composes the remedy for a status — it
+distinguishes 401 from 403, names `truenas_api_key` and says what to do and
+what not to do. Driver call sites prefix what they were attempting and append
+the exception unchanged; they do not restate the fix.
+
+Both used to write one, so a startup auth failure showed two differently-worded
+explanations of the same remedy (#93). The split is not obvious from either
+side alone, which is why `TestAuthMessageAsRendered` drives a real client with
+only `requests` mocked and reads the finished string: every other test mocks
+the client, so the client's half never runs, and each layer would otherwise be
+tested against its own contribution with nobody checking the sentence they add
+up to.
+
 **Restating a finding loses its hedges. Re-read the source, or link to it.**
 The rules above cover claims you make first-hand — verify, don't assume, prove
 it against reality. They do not cover the more common failure: repeating a
