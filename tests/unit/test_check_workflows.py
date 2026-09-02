@@ -101,6 +101,54 @@ class TestInterpolationIsFound(unittest.TestCase):
         self.assertEqual(lines_of(text), [2])
 
 
+class TestShapesThatCouldHideAScript(unittest.TestCase):
+    """False negatives. The failure mode that matters most.
+
+    A false positive is noisy and gets noticed. A block header this
+    scanner does not recognise is read as an ordinary scalar, so the
+    script under it is never scanned -- and the checker reports success
+    over exactly the thing it exists to find.
+    """
+
+    def test_a_comment_after_the_block_indicator(self):
+        # `run: | # build it` is a block. Requiring end-of-line after
+        # the `|` makes it look like a plain scalar instead, and the
+        # interpolation two lines down goes unseen.
+        text = (
+            "        run: | # build it\n"
+            "          echo start\n"
+            "          v='${{ steps.a.outputs.b }}'\n"
+        )
+
+        self.assertEqual(lines_of(text), [3])
+
+    def test_a_comment_after_a_folded_indicator_with_chomping(self):
+        text = (
+            "        run: >- # folded\n"
+            "          echo '${{ github.ref }}'\n"
+        )
+
+        self.assertEqual(lines_of(text), [2])
+
+    def test_the_two_patterns_agree_about_what_a_block_is(self):
+        """BLOCK and INLINE must partition, not overlap or leave a gap.
+
+        A header both reject is the dangerous case: no block opens, and
+        nothing scans what follows.
+        """
+        for header in ('run: |', 'run: |-', 'run: > # note',
+                       'run: |2', 'run: | # x', 'run: >+'):
+            with self.subTest(header=header):
+                line = '        %s' % header
+
+                self.assertIsNotNone(
+                    checker.BLOCK.match(line),
+                    'no block opens, so its script is never scanned')
+                self.assertIsNone(
+                    checker.INLINE.match(line),
+                    'read as an inline script as well as a block')
+
+
 class TestYamlFieldsAreNotFlagged(unittest.TestCase):
     """Expressions belong in YAML fields. Only scripts are the problem."""
 
@@ -144,6 +192,25 @@ class TestYamlFieldsAreNotFlagged(unittest.TestCase):
             "        uses: docker/build-push-action@v6\n"
             "        with:\n"
             "          tags: ${{ steps.version.outputs.image }}\n"
+        )
+
+        self.assertEqual(lines_of(text), [])
+
+    def test_a_compact_list_item_step_keeps_its_own_keys_out(self):
+        """The step's `env:` sits *inside* the dash's indentation.
+
+        `- run: |` puts `run:` two columns right of the dash, and the
+        step's sibling keys line up with `run:`, not with the dash. A
+        floor taken from the leading whitespace is therefore two columns
+        too shallow, and every key after the block reads as script --
+        reporting the recommended fix as the defect, which is the way
+        this checker gets switched off.
+        """
+        text = (
+            "      - run: |\n"
+            "          echo hello\n"
+            "        env:\n"
+            "          FOO: ${{ steps.a.outputs.b }}\n"
         )
 
         self.assertEqual(lines_of(text), [])

@@ -38,11 +38,23 @@ import sys
 EXPRESSION = re.compile(r'\$\{\{')
 
 # `run:` introducing a block scalar -- `|`, `>`, and their chomping and
-# indentation indicators (`|-`, `>+`, `|2`).
-BLOCK = re.compile(r'^(\s*)-?\s*run:\s*[|>][-+0-9]*\s*$')
+# indentation indicators (`|-`, `>+`, `|2`), optionally with a trailing
+# comment. The comment matters: `run: | # build it` is a block, and a
+# pattern that insists on end-of-line after the indicator treats it as an
+# ordinary scalar, so the script that follows is never scanned at all.
+#
+# Group 1 runs to the start of `run:`, dash included, because that is the
+# column a sibling key returns to. Capturing only the leading whitespace
+# puts the block's floor two columns too far left for the compact
+# `- run: |` form, and then the step's own `env:` is read as shell -- so
+# the recommended fix gets reported as the defect.
+BLOCK = re.compile(r'^(\s*(?:-\s+)?)run:\s*[|>][-+0-9]*\s*(?:#.*)?$')
 
-# `run:` with the script on the same line.
-INLINE = re.compile(r'^(\s*)-?\s*run:\s+(?![|>][-+0-9]*\s*$)(.+?)\s*$')
+# `run:` with the script on the same line. The lookahead has to reject
+# exactly what BLOCK accepts, or the two disagree about which shape a
+# line is.
+INLINE = re.compile(
+    r'^(\s*(?:-\s+)?)run:\s+(?![|>][-+0-9]*\s*(?:#.*)?$)(.+?)\s*$')
 
 
 def offending_lines(text):
@@ -70,6 +82,8 @@ def offending_lines(text):
 
         match = BLOCK.match(line)
         if match:
+            # The column `run:` starts at, so a sibling key at the same
+            # column closes the block and anything deeper is script.
             block_indent = len(match.group(1))
             continue
 

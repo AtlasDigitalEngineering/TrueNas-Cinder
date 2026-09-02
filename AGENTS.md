@@ -49,6 +49,7 @@ an earlier version of this file said Jammy, which put the driver tests on
 .github/
   CODEOWNERS               # * @setkeh
   workflows/test.yml       # unit (3.12, 3.10) + driver (3.12) + flake8
+                           #   + workflow lint (actionlint, shellcheck)
   workflows/image.yml      # build + publish the cinder-volume image on tag
   workflows/claude-code-review.yml
 truenas_cinder_driver/
