@@ -2217,6 +2217,18 @@ class TestAuthMapping(TrueNASAPIClientTestCase):
         with self.assertRaises(TrueNASAPIError):
             self.client.get_pool_list()
 
+    def test_403_names_the_config_option_too(self):
+        # The startup path no longer adds this itself (#93), so the
+        # client's 403 has to carry it: `truenas_api_key` is the thing
+        # the operator edits, and naming only the account leaves them
+        # hunting for which key it means.
+        self._set_error(403, text="Forbidden")
+
+        with self.assertRaises(TrueNASAPIAuthError) as caught:
+            self.client.get_pool_list()
+
+        self.assertIn("truenas_api_key", str(caught.exception))
+
     def test_403_says_the_key_is_valid_and_the_role_is_not(self):
         # The remedies are opposite. An operator told to check their key
         # will reissue a key that was never the problem, and hit the same

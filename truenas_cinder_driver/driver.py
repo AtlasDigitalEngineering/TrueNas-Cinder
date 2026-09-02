@@ -346,6 +346,7 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         self._resolve_portal()
         self._resolve_iscsi_global()
         self._require_usable_volume_name_template()
+        self._require_attributable_snapshot_names()
         LOG.info(self._tagged(
             'TrueNAS driver setup validated: pool %(pool)s, portal '
             '%(portal)s, addresses %(addresses)s.'),
@@ -361,9 +362,9 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
 
         Raises:
             InvalidInput: If the API key is rejected, or accepted but
-                unprivileged. The two get different messages, because the
-                remedies are opposite -- this is the line an operator
-                actually reads when the service refuses to start, so
+                unprivileged. The client distinguishes the two and states
+                the remedy, because they are opposite -- this is the line
+                an operator reads when the service refuses to start, and
                 leading with "check your key" when the key is fine sends
                 them to reissue it and meet the identical error (#59).
             VolumeBackendAPIException: If the appliance cannot be reached
@@ -371,17 +372,12 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         try:
             return self.client.get_pool_list()
         except api_client.TrueNASAPIAuthError as exc:
-            if exc.status_code == 403:
-                reason = _('The TrueNAS account behind truenas_api_key does '
-                           'not have the role this driver needs. The key '
-                           'itself is valid, so do not reissue it -- grant '
-                           'that account FULL_ADMIN. %s') % exc
-            else:
-                reason = _('TrueNAS rejected truenas_api_key: it is wrong, '
-                           'revoked or expired. Issue a new key and set '
-                           'truenas_api_key. This is not a role '
-                           'problem. %s') % exc
-            raise self._config_error(reason)
+            # Context, not a second remedy. The client's message already
+            # distinguishes 401 from 403, names `truenas_api_key` and says
+            # what to do; restating it here produced two differently-worded
+            # explanations of the same fix in one startup failure (#93).
+            raise self._config_error(
+                _('Cannot start: %s') % exc)
         except api_client.TrueNASAPIError as exc:
             raise self._backend_error(
                 _('Cannot reach the TrueNAS appliance at '
@@ -1073,6 +1069,67 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
                 {'dataset': dataset, 'count': len(names),
                  'names': ', '.join(names)})
 
+    def _snapshot_prefix(self):
+        """The literal text `snapshot_name_template` puts before the id.
+
+        The single definition of "does this name look like Cinder's".
+        There were two, and they disagreed for a template with no prefix:
+        attribution answered "cannot tell" while clone-source naming
+        substituted a hardcoded `snapshot-`. A driver-created snapshot was
+        then reported as somebody else's in the busy-delete message,
+        sending the operator to look for a replication task that does not
+        exist (#89).
+
+        `check_for_setup_error` refuses a prefix-less template, so this
+        never returns empty in a running deployment.
+
+        Returns:
+            The prefix, from configuration or the default template
+        """
+        return self._snapshot_name_template().split('%s')[0]
+
+    def _snapshot_name_template(self):
+        """`snapshot_name_template`, or Cinder's default if unset.
+
+        Split out so the prefix check and the message that reports it
+        failing cannot disagree about which template they are talking
+        about — the same duplication, one level up, that this issue
+        exists to remove (#89).
+
+        Returns:
+            The configured template, or the default
+        """
+        return (self.configuration.safe_get('snapshot_name_template')
+                or DEFAULT_SNAPSHOT_NAME_TEMPLATE)
+
+    def _require_attributable_snapshot_names(self):
+        """Refuse a template that makes snapshot attribution impossible.
+
+        With no literal prefix before the placeholder, nothing in a
+        snapshot's name distinguishes one this driver created from one a
+        periodic task did. That is not a cosmetic loss: `delete_volume`
+        refuses while foreign snapshots exist and names them, and the
+        driver will not delete snapshots it does not own. Unable to tell,
+        it either refuses to delete volumes it could have, or reports
+        its own snapshots as foreign.
+
+        Failing here says so once, at the moment the configuration can be
+        fixed, rather than degrading several messages quietly (#89).
+
+        Raises:
+            InvalidInput: If the template has no literal prefix
+        """
+        if not self._snapshot_prefix():
+            raise self._config_error(
+                _('snapshot_name_template = %(template)r has no text '
+                  'before its %%s placeholder, so a snapshot this driver '
+                  'created cannot be told apart from one taken by a '
+                  'periodic snapshot or replication task. Set '
+                  'snapshot_name_template in cinder.conf to a form that '
+                  'starts with a literal prefix, such as %(suggestion)r.')
+                % {'template': self._snapshot_name_template(),
+                   'suggestion': DEFAULT_SNAPSHOT_NAME_TEMPLATE})
+
     def _is_cinder_snapshot(self, snapshot_name):
         """Decide whether a snapshot name looks like one Cinder created.
 
@@ -1087,9 +1144,12 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         Returns:
             True if the name carries the template's prefix
         """
-        template = (self.configuration.safe_get('snapshot_name_template')
-                    or DEFAULT_SNAPSHOT_NAME_TEMPLATE)
-        prefix = template.split('%s')[0]
+        prefix = self._snapshot_prefix()
+        # The guard survives `check_for_setup_error` refusing a
+        # prefix-less template: this is also reachable from tests and
+        # from a driver built by hand, and "everything is Cinder's" is
+        # the dangerous answer -- it would authorise deleting somebody
+        # else's snapshots.
         return bool(prefix) and snapshot_name.startswith(prefix)
 
     # ------------------------------------------------------------------
@@ -1547,10 +1607,7 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         Returns:
             The prefix, carrying ``snapshot_name_template``'s own
         """
-        template = (self.configuration.safe_get('snapshot_name_template')
-                    or DEFAULT_SNAPSHOT_NAME_TEMPLATE)
-        prefix = template.split('%s')[0] or 'snapshot-'
-        return '%sclone-src-' % prefix
+        return '%sclone-src-' % self._snapshot_prefix()
 
     def _clone_source_snapshot_name(self, volume):
         """Name the snapshot a clone is taken from.

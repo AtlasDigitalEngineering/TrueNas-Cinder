@@ -416,11 +416,16 @@ class TrueNASAPIClient:
                     # path can be opened. "the roles listed in the docs"
                     # also reads as the eleven-role table, which is
                     # documented as *not* working today.
+                    # Names `truenas_api_key` so this stands alone at
+                    # startup, where it is the option the operator edits.
+                    # The driver used to add that itself and restate the
+                    # whole remedy around this one, so an operator saw
+                    # both (#93). One remedy, owned here.
                     message = (
-                        f"{message}. The key was accepted, so it is valid -- "
-                        f"the account it belongs to lacks the role this "
-                        f"call needs. Grant that account FULL_ADMIN; do not "
-                        f"reissue the key."
+                        f"{message}. The key was accepted, so it is valid "
+                        f"-- the account behind truenas_api_key lacks the "
+                        f"role this call needs. Grant that account "
+                        f"FULL_ADMIN; do not reissue the key."
                     )
                 else:
                     message = (

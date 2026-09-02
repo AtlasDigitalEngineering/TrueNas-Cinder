@@ -86,6 +86,13 @@ appliance reboot.
 The driver does not create a portal. With exactly one it discovers it and logs
 which. With several it refuses to guess — set `truenas_iscsi_portal_id`.
 
+### `snapshot_name_template = '%s' has no text before its %s placeholder`
+
+The prefix is what tells a Cinder snapshot apart from one a periodic snapshot
+or replication task took, and the delete path needs that distinction — see
+[configuration.md](configuration.md). Set a template with a literal prefix,
+such as the default `snapshot-%s`.
+
 ### `iSCSI portal N is bound to 0.0.0.0, which is not an address a compute node can connect to`
 
 Either rebind the portal to a static address, or set
