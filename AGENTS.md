@@ -431,7 +431,10 @@ re-checked against a new TrueNAS release, not taken on trust.
 `InvalidInput`, `VolumeBackendAPIException` and `ManageExistingInvalidReference`
 through `_config_error`, `_backend_error` and `_bad_reference`, which prefix
 `[<volume_backend_name>]` so a message from a multi-backend deployment says
-which appliance it is about. Log lines an operator acts on — every `LOG.error`
+which appliance it is about. With no `volume_backend_name` the tag falls back
+to the URL's **hostname** and never the URL — tagging with the raw URL printed
+inline credentials into the very message that rejects them (#61), so
+`_url_identity` is the only thing that may derive an identifier from it. Log lines an operator acts on — every `LOG.error`
 and `LOG.warning`, and every `LOG` call in the setup path — wrap their message
 in `self._tagged(...)` for the same reason.
 

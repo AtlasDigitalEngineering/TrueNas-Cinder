@@ -122,23 +122,58 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
     def backend_name(self):
         """Name this backend the way the operator wrote it down.
 
-        `volume_backend_name` in preference to the appliance URL: it is
-        the name in their `cinder.conf`, it is what
-        `openstack volume service list` shows, and it keeps hostnames out
-        of log lines that may be shipped somewhere less private than the
-        controller.
+        `volume_backend_name` in preference to anything derived from the
+        URL: it is the name in their `cinder.conf`, it is what
+        `openstack volume service list` shows, and it names the backend
+        without putting appliance addressing into log lines that may be
+        shipped somewhere less private than the controller.
 
         Read from configuration on each use rather than resolved in
         `do_setup`. Several of the messages that need it are raised *by*
         setup, so anything resolved there is resolved too late to name
         the failure setup produced.
 
+        Never raises. It runs while a failure message is being built, so
+        an exception here would replace the operator's actual problem
+        with a less useful one.
+
         Returns:
             The backend identifier, never empty
         """
-        return (self.configuration.safe_get('volume_backend_name')
-                or self.configuration.safe_get('truenas_api_url')
-                or self.__class__.__name__)
+        configured = self.configuration.safe_get('volume_backend_name')
+        if configured:
+            return configured
+        return (self._url_identity(
+            self.configuration.safe_get('truenas_api_url'))
+            or self.__class__.__name__)
+
+    @staticmethod
+    def _url_identity(url):
+        """Reduce a URL to its host, dropping anything secret.
+
+        **The host, never the whole URL.** A `truenas_api_url` carrying
+        inline credentials is rejected by `do_setup` -- and that refusal
+        is itself an operator-facing message, so tagging it with the raw
+        URL printed the password immediately before the sentence
+        explaining that inline credentials leak (#61). The one message
+        written to prevent the leak was leaking.
+
+        `urlsplit` is where a malformed URL raises, so the failure is
+        caught here rather than in the middle of composing somebody
+        else's error.
+
+        Args:
+            url: The configured ``truenas_api_url``, possibly unset
+
+        Returns:
+            The hostname, or None if there is not one to be had
+        """
+        if not url:
+            return None
+        try:
+            return urlsplit(url).hostname
+        except ValueError:
+            return None
 
     def _tagged(self, message):
         """Prefix a message with the backend it came from.
@@ -335,8 +370,7 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
                            'revoked or expired. Issue a new key and set '
                            'truenas_api_key. This is not a role '
                            'problem. %s') % exc
-            raise self._config_error(
-                reason)
+            raise self._config_error(reason)
         except api_client.TrueNASAPIError as exc:
             raise self._backend_error(
                 _('Cannot reach the TrueNAS appliance at '

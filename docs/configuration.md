@@ -128,7 +128,10 @@ with the backend it came from:
 
 The name is `volume_backend_name` from your `cinder.conf` — the same string
 `openstack volume service list` shows as `host@backend`. Without it set the
-prefix falls back to `truenas_api_url`.
+prefix falls back to the appliance's **hostname** — the host only, never the
+whole URL, so a `truenas_api_url` that carries inline credentials cannot put
+them in a log line. (Such a URL is rejected at startup anyway; the point is
+that the message doing the rejecting must not print what it is rejecting.)
 
 With one backend this is redundant. With two it is the difference between
 knowing which appliance to go and look at and checking both, because the

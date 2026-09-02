@@ -489,10 +489,48 @@ class TestBackendIdentity(DriverTestCase):
         # cinder.conf and what `openstack volume service list` prints.
         self.assertEqual(self._driver().backend_name, 'truenas-iscsi')
 
-    def test_without_a_backend_name_the_url_identifies_it(self):
+    def test_without_a_backend_name_the_host_identifies_it(self):
         driver = self._driver(volume_backend_name=None)
 
-        self.assertEqual(driver.backend_name, API_URL)
+        # The host, not the URL: see the credential test below.
+        self.assertEqual(driver.backend_name, 'truenas.example.com')
+
+    def test_the_tag_never_carries_inline_credentials(self):
+        """The message that rejects them must not print them (#61).
+
+        `do_setup` refuses a `truenas_api_url` with a userinfo component,
+        because requests turns it into a Basic header that overwrites the
+        Bearer key and keeps it in `response.url` (#11). Tagging that
+        refusal with the raw URL printed the password immediately before
+        the sentence explaining that inline credentials leak.
+
+        Asserted on the password rather than on the whole URL, so that
+        any future identifier that happens to include the userinfo fails
+        here however it is formatted.
+        """
+        driver = self._driver(
+            volume_backend_name=None,
+            truenas_api_url='https://admin:sup3rs3cret@truenas.example.com')
+
+        with self.assertRaises(exception.InvalidInput) as caught:
+            driver.do_setup(None)
+
+        message = str(caught.exception)
+        self.assertNotIn('sup3rs3cret', message)
+        self.assertNotIn('admin:', message)
+        # Still identifies the appliance, or the tag is worthless.
+        self.assertIn('[truenas.example.com]', message)
+
+    def test_a_malformed_url_does_not_replace_the_real_error(self):
+        """`backend_name` runs while a failure is being reported.
+
+        Raising here would swap the operator's actual problem for a
+        parse error inside the driver's own logging.
+        """
+        driver = self._driver(volume_backend_name=None,
+                              truenas_api_url='https://[not-an-ipv6/')
+
+        self.assertEqual(driver.backend_name, 'TrueNASISCSIDriver')
 
     def test_with_neither_it_still_names_something(self):
         # Never empty: `[] The iSCSI service is STOPPED` would be worse
