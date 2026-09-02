@@ -48,6 +48,10 @@ truenas_pool = tank
 # portal binds 0.0.0.0 or ::. Listing more than one advertises multipath:
 # the driver binds the target to every portal and Cinder presents them as
 # target_portals / target_iqns / target_luns.
+#
+# Every address listed here must be reachable from every compute node.
+# One that is not costs ~130s on EVERY attach and silently drops you to a
+# single path -- see "When an advertised address is unreachable" below.
 #truenas_iscsi_portal_addresses = 10.20.21.81,10.40.96.182
 
 # Leave enabled. Fix the appliance certificate rather than turning this off.
@@ -116,6 +120,100 @@ The two look alike and need opposite fixes, so the driver distinguishes them:
 A `403` at startup now reads `The key was accepted, so it is valid -- the
 account it belongs to lacks the role this call needs.` That is the case an
 operator is most likely to hit, and reissuing the key will not fix it.
+
+## Multipath is failover, not aggregation
+
+Two addresses give you a second path to fail over to. They do **not** give you
+twice the bandwidth. With both healthy, `multipath -ll` on the compute node
+shows one path per group, and only one group is `active`:
+
+```
+36589cfc000000bd171773cfe1fa9cce3 dm-6 TrueNAS,iSCSI Disk
+size=1.0G features='0' hwhandler='0' wp=rw
+|-+- policy='service-time 0' prio=1 status=active
+| `- 4:0:0:0 sde 8:64 active ready running
+`-+- policy='service-time 0' prio=1 status=enabled
+  `- 5:0:0:0 sdf 8:80 active ready running
+```
+
+I/O goes down the `active` group; `enabled` is standby. Size the storage plane
+for one path's throughput, not the sum.
+
+## When an advertised address is unreachable
+
+Every address in `truenas_iscsi_portal_addresses` must be reachable from every
+compute node. An address that is not does **not** break attaches — but it is
+not free either, and what it costs is easy to miss.
+
+Measured on a Kolla 2025.1 all-in-one with `volume_use_multipath = true`, two
+portal addresses, blocking one at a time with `iptables` (#64):
+
+| Condition | Attach | Wall clock |
+|---|---|---|
+| both addresses reachable | succeeds | 14.5s |
+| second address rejects (TCP reset) | succeeds | 144.4s |
+| second address black-holed (dropped) | succeeds | 144.1s |
+| **first** address black-holed | succeeds | 144.5s |
+| both reachable again (control) | succeeds | 14.5s |
+
+Three things follow, and none of them is "avoid multiple addresses".
+
+**It degrades, it does not break.** os-brick logs in to every portal in
+parallel and returns as soon as any one produces a device. Losing an address
+does not fail the attach, and it does not matter which one you lose — the
+first-listed address has no special status here.
+
+**It costs ~130 seconds on every attach.** That is not this driver's timeout
+and not Cinder's. It is open-iscsi's, from `iscsid.conf`:
+
+```
+node.conn[0].timeo.login_timeout       = 15
+node.session.initial_login_retry_max   = 8      # 15 x 8 = 120s
+```
+
+The connector waits for every path attempt to conclude, and a path that cannot
+connect takes the full retry budget to say so. How the address fails makes no
+difference: a TCP reset and a black hole both cost the same 120s, because the
+retry count dominates, not the per-attempt failure. Lower those two values if
+you need attaches to fail faster, understanding that you are also lowering the
+tolerance of a healthy but slow path.
+
+Detach is unaffected — 8.3s in every case above.
+
+**You lose multipath, and nothing tells you.** This is the part worth acting
+on. When a path fails at attach time the compute log says:
+
+```
+Failed to connect to iSCSI portal 10.40.96.182:3260.
+No dm was created, connection to volume is probably bad and will perform poorly.
+```
+
+No device-mapper node is created, so the instance gets a plain single-path
+device. The volume still reports `in-use`, `openstack server show` looks
+healthy, and there is no user message — the warning exists only in
+`nova-compute.log`. A deployment configured for failover therefore has none,
+and the first indication is the outage it was supposed to survive.
+
+So the check is reachability, before and after any network change:
+
+```bash
+# from every compute node, for every address in truenas_iscsi_portal_addresses
+for ip in 10.20.21.81 10.40.96.182; do
+  timeout 5 bash -c "cat < /dev/null > /dev/tcp/$ip/3260" \
+    && echo "$ip:3260 reachable" || echo "$ip:3260 UNREACHABLE"
+done
+```
+
+and, after an attach that is meant to be multipathed, that it actually is:
+
+```bash
+sudo multipath -ll          # expect one path per group
+sudo iscsiadm -m session    # expect one session per address, per volume
+```
+
+A volume attached while an address was down keeps its single path until it is
+detached and re-attached. Fixing the network does not repair an existing
+attachment.
 
 ## Reading the log with more than one backend
 

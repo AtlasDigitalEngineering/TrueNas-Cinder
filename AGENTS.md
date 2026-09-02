@@ -620,6 +620,15 @@ semicolons, so there is one code path rather than two, and the `,<tag>` field is
 discarded by the parser — it is cosmetic, and cannot represent the per-portal
 tags TrueNAS actually assigns.
 
+**Setup validation cannot vouch for the data path.**
+`check_for_setup_error` resolves the portal and its addresses by asking the
+appliance, from `cinder-volume`. The initiator is somewhere else. An address
+that `cinder-volume` can reach and a compute node cannot passes every check
+this driver makes, then costs ~130s per attach and silently drops that
+attachment to a single path with no dm node (#64, measured). Do not add a
+reachability probe here and call it solved -- it would be testing the wrong
+host, which is worse than not testing, because it reads as a guarantee.
+
 **Never derive portal ordering from the appliance.** Posting groups for portals
 `[11, 12]` returns them as `[12, 11]` (#45). The first portal in
 `provider_location` becomes the singular `target_portal` a non-multipath
