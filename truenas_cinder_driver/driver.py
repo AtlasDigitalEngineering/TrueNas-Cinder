@@ -1086,9 +1086,21 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         Returns:
             The prefix, from configuration or the default template
         """
-        template = (self.configuration.safe_get('snapshot_name_template')
-                    or DEFAULT_SNAPSHOT_NAME_TEMPLATE)
-        return template.split('%s')[0]
+        return self._snapshot_name_template().split('%s')[0]
+
+    def _snapshot_name_template(self):
+        """`snapshot_name_template`, or Cinder's default if unset.
+
+        Split out so the prefix check and the message that reports it
+        failing cannot disagree about which template they are talking
+        about — the same duplication, one level up, that this issue
+        exists to remove (#89).
+
+        Returns:
+            The configured template, or the default
+        """
+        return (self.configuration.safe_get('snapshot_name_template')
+                or DEFAULT_SNAPSHOT_NAME_TEMPLATE)
 
     def _require_attributable_snapshot_names(self):
         """Refuse a template that makes snapshot attribution impossible.
@@ -1107,8 +1119,6 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         Raises:
             InvalidInput: If the template has no literal prefix
         """
-        template = (self.configuration.safe_get('snapshot_name_template')
-                    or DEFAULT_SNAPSHOT_NAME_TEMPLATE)
         if not self._snapshot_prefix():
             raise self._config_error(
                 _('snapshot_name_template = %(template)r has no text '
@@ -1117,7 +1127,7 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
                   'periodic snapshot or replication task. Set '
                   'snapshot_name_template in cinder.conf to a form that '
                   'starts with a literal prefix, such as %(suggestion)r.')
-                % {'template': template,
+                % {'template': self._snapshot_name_template(),
                    'suggestion': DEFAULT_SNAPSHOT_NAME_TEMPLATE})
 
     def _is_cinder_snapshot(self, snapshot_name):
