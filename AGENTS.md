@@ -49,6 +49,7 @@ an earlier version of this file said Jammy, which put the driver tests on
 .github/
   CODEOWNERS               # * @setkeh
   workflows/test.yml       # unit (3.12, 3.10) + driver (3.12) + flake8
+                           #   + workflow lint (actionlint, shellcheck)
   workflows/image.yml      # build + publish the cinder-volume image on tag
   workflows/claude-code-review.yml
 truenas_cinder_driver/
@@ -63,6 +64,7 @@ tests/
     test_reconcile.py
     test_find_orphans.py
     test_iscsi_probe.py
+    test_check_workflows.py
   driver/          # driver; needs Cinder installed
     __init__.py
     test_driver.py
@@ -71,8 +73,11 @@ tests/
     conftest.py    # fixtures, teardown, skip-if-unconfigured
     iscsi_probe.py # speaks the iSCSI login exchange over a plain socket
     test_*.py
+  fixtures/        # not tests; inputs the CI jobs lint against
+    shellcheck-probe.yml  # deliberately broken, proves shellcheck is on
 tools/
   find_orphans.py  # reconciliation CLI; reads .env and OS_* for Cinder
+  check_workflows.py  # refuses `${{ }}` interpolated into a `run:` body
 .env.example       # template; .env itself is gitignored
 docs/PLANNING.md   # why the project exists, its shape, milestone outcomes
 docs/configuration.md  # sample cinder.conf backend section + prerequisites
@@ -102,7 +107,16 @@ tox -e driver                                  # driver tests, needs Cinder
 tox -e flake8                                  # lint
 python -m pytest tests/unit                    # direct api_client run
 python -m unittest discover -s tests/unit -t . # discover path, also in CI
+actionlint                                     # workflow YAML + its bash
+python tools/check_workflows.py                # no ${{ }} in a run: body
 ```
+
+`actionlint` needs `shellcheck` on `PATH` to check the bash inside `run:`
+bodies, and silently skips it otherwise — no warning, exit 0 — `nix-shell -p actionlint shellcheck`
+gets both. CI runs it from a pinned image that already bundles it, and proves
+it did by linting `tests/fixtures/shellcheck-probe.yml`, which must report
+SC2045 — otherwise a green `Lint (workflows)` would mean "no bash was checked"
+rather than "the bash is clean".
 
 Use `python -m pytest`, not bare `pytest` — see the packaging note above.
 
@@ -426,6 +440,19 @@ somebody runs it.
 
 Extend it when adding client methods — the point is that findings can be
 re-checked against a new TrueNAS release, not taken on trust.
+
+**Never interpolate a workflow expression into a `run:` body.** GitHub
+substitutes `${{ ... }}` as text before any shell sees it, so the value becomes
+part of the script rather than an argument to it. Pass it through `env:` and
+read it as a shell variable.
+
+`actionlint` will not catch this for you. It flags interpolation only for
+expressions it knows are untrusted (`github.event.*`); it says nothing about
+`steps.<id>.outputs.*`, which is what this repo actually uses and which is safe
+*because of where the value came from* — a fact invisible at the point of use
+and not inherited by the next expression added to that step.
+`tools/check_workflows.py` enforces the stricter rule, and
+`test_this_repository_is_clean` fails on a new one (#81).
 
 **Never construct an operator-facing exception directly.** `driver.py` builds
 `InvalidInput`, `VolumeBackendAPIException` and `ManageExistingInvalidReference`

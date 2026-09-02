@@ -112,3 +112,51 @@ jobs:
 
       - name: Run flake8
         run: flake8 truenas_cinder_driver tests tools
+
+  # Nothing linted the shell embedded in workflow YAML, and that file has
+  # produced nine defects -- three of them only in production (#73, #74,
+  # #75). Every one was caught by a human reading it or hand-executing
+  # the extracted script (#82).
+  workflows:
+    name: Lint (workflows)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Pinned rather than :latest. The image bundles shellcheck, which
+      # is where most of the value is -- actionlint alone checks workflow
+      # syntax, shellcheck checks the bash inside every `run:` body.
+      - name: actionlint
+        uses: docker://rhysd/actionlint:1.7.12
+        with:
+          args: -color
+
+      # actionlint drops every shellcheck finding *silently* when
+      # shellcheck is not available -- no warning, exit 0 -- so a green
+      # job cannot be told apart from one that checked no bash at all.
+      # The image above is pinned by tag, and tags are mutable, so this
+      # asserts the guarantee rather than assuming it. The probe is a
+      # deliberately broken workflow that must produce SC2045/SC2086.
+      - name: Prove shellcheck is active inside that image
+        run: |
+          found=$(docker run --rm -v "${PWD}:/repo" --workdir /repo \
+            rhysd/actionlint:1.7.12 \
+            -no-color -oneline tests/fixtures/shellcheck-probe.yml || true)
+          echo "${found}"
+          case "${found}" in
+            *shellcheck*)
+              echo "shellcheck is active inside the actionlint image."
+              ;;
+            *)
+              echo "::error::actionlint ran without shellcheck, so no bash in any run: body was checked. Pin an image that bundles it."
+              exit 1
+              ;;
+          esac
+
+      # actionlint flags an interpolated expression only when it knows
+      # the value is untrusted -- `github.event.*` and friends. It says
+      # nothing about `steps.<id>.outputs.*`, which is what this repo
+      # uses and which is safe only because of where the value came
+      # from. This enforces the stricter rule (#81).
+      - name: No workflow expressions in shell bodies
+        run: python3 tools/check_workflows.py
