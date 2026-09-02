@@ -91,8 +91,16 @@ jobs:
       # rebuilding an existing tag against a newer base image.
       - name: Refuse a tag that disagrees with the package version
         if: github.event_name == 'push'
+        # Through `env:`, never interpolated into the script body. These
+        # values come from the merged source tree and are not attacker
+        # controlled, so this is not a live injection -- but that is a
+        # fact about today's inputs, invisible at the point of use, and
+        # the next expression added here may not share it.
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          IMAGE: ${{ steps.version.outputs.image }}
         run: |
-          version='${{ steps.version.outputs.version }}'
+          version="${VERSION}"
           expected="v${version}"
           # Three outcomes, not two. Reporting a missing `v` as a version
           # mismatch produces "tag 1.0.0 does not match the package version
@@ -103,7 +111,7 @@ jobs:
             echo "::error::Tag ${GITHUB_REF_NAME} is missing the leading 'v'. The version is right; re-tag as ${expected}."
             exit 1
           else
-            echo "::error::Tag ${GITHUB_REF_NAME} disagrees with the package version ${version}, so it would publish ${{ steps.version.outputs.image }}:${version} and overwrite it. Either re-tag as ${expected}, or bump __version__ in truenas_cinder_driver/__init__.py to ${GITHUB_REF_NAME#v} and re-tag."
+            echo "::error::Tag ${GITHUB_REF_NAME} disagrees with the package version ${version}, so it would publish ${IMAGE}:${version} and overwrite it. Either re-tag as ${expected}, or bump __version__ in truenas_cinder_driver/__init__.py to ${GITHUB_REF_NAME#v} and re-tag."
             exit 1
           fi
 
@@ -141,9 +149,12 @@ jobs:
       # all -- so failing the release would make the first publish of every
       # new package permanently red.
       - name: Check the image can be pulled anonymously
+        env:
+          IMAGE: ${{ steps.version.outputs.image }}
+          TAG: ${{ steps.version.outputs.version }}
         run: |
-          image='${{ steps.version.outputs.image }}'
-          tag='${{ steps.version.outputs.version }}'
+          image="${IMAGE}"
+          tag="${TAG}"
           repo="${image#*/}"
           docs='docs/deployment.md, "The first publish creates a private package"'
 
@@ -151,12 +162,19 @@ jobs:
           # so the only way it can affect a release is by not finishing.
           # An unbounded curl against a stalled endpoint would hang the
           # job to its six-hour limit.
-          body=$(mktemp)
-          status=$(curl -s -o "${body}" -w '%{http_code}' \
+          #
+          # Body and status come back together rather than through a
+          # temp file, so there is nothing to clean up. `-w` appends the
+          # status on its own line after the body; the two are split
+          # below.
+          response=$(curl -s -w '\n%{http_code}' \
             --connect-timeout 10 --max-time 30 \
             "https://ghcr.io/token?scope=repository:${repo}:pull" \
-            || echo 000)
-          token=$(jq -r '.token // empty' < "${body}" 2>/dev/null || true)
+            || printf '\n000')
+          status="${response##*$'\n'}"
+          body="${response%$'\n'*}"
+          token=$(printf '%s' "${body}" | jq -r '.token // empty' \
+            2>/dev/null || true)
 
           # One line per annotation: a workflow command stops at the
           # first newline, so a wrapped message loses everything after it.
