@@ -297,9 +297,10 @@ openstack volume manage \
   <pool>/<zvol>
 ```
 
-The reference is the zvol's full path in the pool this backend manages, and it
-may be nested — `Dev-Pool/proxmox/vm-100-disk-0` is fine. Adoption moves it to
-the pool root under Cinder's naming convention.
+The reference is the zvol's full path under whatever `truenas_pool` names, and
+it may be nested — with `truenas_pool = Dev-Pool`,
+`Dev-Pool/proxmox/vm-100-disk-0` is fine. Adoption renames it directly under
+that target, dropping the intermediate path.
 
 ### The export conflict
 

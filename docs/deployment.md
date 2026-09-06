@@ -161,7 +161,7 @@ volume_driver = truenas_cinder_driver.driver.TrueNASISCSIDriver
 volume_backend_name = truenas-iscsi
 truenas_api_url = https://truenas.example.com
 truenas_api_key = <service account API key>
-truenas_pool = tank
+truenas_pool = tank        # or a dataset: tank/cinder
 ```
 
 `truenas_api_key` is `secret=True`, so oslo_config redacts it from logged
