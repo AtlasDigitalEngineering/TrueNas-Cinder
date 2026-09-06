@@ -298,6 +298,31 @@ class TestDatasetAsTarget(DriverTestCase):
         self.assertEqual(stats['pools'][0]['free_capacity_gb'], 96)
         driver.client.get_dataset.assert_not_called()
 
+    def test_a_dataset_that_vanishes_after_startup_says_so(self):
+        # Symmetry with the pool branch: a target that existed at setup
+        # and does not now is a different event from an appliance that
+        # will not answer, and the operator does different things about
+        # each.
+        driver = self._driver(truenas_pool=self.DATASET)
+        driver.client.get_dataset.return_value = self._filesystem()
+        driver.check_for_setup_error()
+        driver.client.get_dataset.side_effect = (
+            api_client.TrueNASAPINotFoundError('gone'))
+
+        with self.assertRaises(
+                exception.VolumeBackendAPIException) as caught:
+            driver.get_volume_stats(refresh=True)
+
+        self.assertIn('has disappeared', str(caught.exception))
+
+    def test_the_option_help_mentions_the_dataset_form(self):
+        # `oslo-config-generator` and `--help` render this, so it is a
+        # documentation surface like any other (#116).
+        option, = [opt for opt in tnd.TrueNASISCSIDriver.get_driver_options()
+                   if opt.name == 'truenas_pool']
+
+        self.assertIn('dataset', option.help)
+
     def test_adoption_references_are_relative_to_the_dataset(self):
         # `_parse_existing_ref` builds both its prefix and its example
         # from the configured value, so it should need no change — pinned

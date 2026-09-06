@@ -53,8 +53,12 @@ truenas_opts = [
                     'Marked secret so oslo_config redacts it from logged '
                     'configuration dumps.'),
     cfg.StrOpt('truenas_pool',
-               help='ZFS pool on the appliance in which volumes are '
-                    'created as zvols. Required.'),
+               help='Where volumes are created as zvols: a ZFS pool '
+                    '(tank), or a dataset inside one (tank/cinder) to '
+                    'keep them together and let a quota or other '
+                    'property apply to just this backend. A dataset '
+                    'must already exist and be a filesystem; the driver '
+                    'validates but never creates it. Required.'),
     cfg.IntOpt('truenas_iscsi_portal_id',
                help='ID of the iSCSI portal to export volumes through. '
                     'Only required when the appliance has more than one '
@@ -408,6 +412,14 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         wanted = self.configuration.truenas_pool
         try:
             dataset = self.client.get_dataset(wanted)
+        except api_client.TrueNASAPINotFoundError:
+            # Matching the pool branch's message: a target that existed
+            # at startup and does not now is a different event from an
+            # appliance that will not answer, and says so.
+            raise self._backend_error(
+                _('Dataset %(wanted)r has disappeared from the '
+                  'appliance. It existed when the driver started.')
+                % {'wanted': wanted})
         except api_client.TrueNASAPIError as exc:
             raise self._backend_error(
                 _('Could not read capacity for truenas_pool = '
