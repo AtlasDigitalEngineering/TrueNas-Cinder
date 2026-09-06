@@ -635,6 +635,46 @@ class TestZvolOperations(TrueNASAPIClientTestCase):
         )
         self.assertEqual(result["name"], "tank/volume1")
 
+    def test_get_dataset_encodes_the_whole_path(self):
+        """The real implementation, at the `requests` boundary (#116).
+
+        Every driver-level test mocks `get_dataset`, and the functional
+        suite that exercises it for real is skipped in CI without an
+        appliance — so without this, a wrong endpoint or a broken
+        `quote()` would pass the entire suite. That is the shape this
+        repo keeps finding, and percent-encoding is a place it has bitten
+        before.
+        """
+        self._set_response({"name": "tank/cinder", "type": "FILESYSTEM"})
+
+        result = self.client.get_dataset("tank/cinder")
+
+        self.session.request.assert_called_once_with(
+            "GET", f"{BASE_URL}/pool/dataset/id/tank%2Fcinder",
+            timeout=DEFAULT_TIMEOUT,
+        )
+        self.assertEqual(result["type"], "FILESYSTEM")
+
+    def test_get_dataset_encodes_every_separator_of_a_nested_path(self):
+        # A single unencoded `/` would address a different endpoint
+        # entirely rather than a nested dataset.
+        self._set_response({"name": "tank/a/b"})
+
+        self.client.get_dataset("tank/a/b")
+
+        self.session.request.assert_called_once_with(
+            "GET", f"{BASE_URL}/pool/dataset/id/tank%2Fa%2Fb",
+            timeout=DEFAULT_TIMEOUT,
+        )
+
+    def test_get_dataset_maps_a_missing_dataset_to_not_found(self):
+        # `_require_dataset_exists` branches on this exact type to tell
+        # "you have not created it" from "the appliance is unwell".
+        self._set_error(404, body={"message": ""})
+
+        self.assertRaises(TrueNASAPINotFoundError,
+                          self.client.get_dataset, "tank/absent")
+
     def test_delete_zvol_sends_recursive_flag(self):
         self._set_response({})
 
