@@ -75,7 +75,7 @@ directly:
 curl -s -X POST "$CINDER_URL/os-volume-manage" \
   -H "X-Auth-Token: $TOKEN" -H 'Content-Type: application/json' \
   -d '{"volume": {"host": "<host>",
-                  "ref": {"source-name": "<pool>/<zvol>"},
+                  "ref": {"source-name": "<target>/<zvol>"},
                   "name": "<name>", "bootable": true,
                   "volume_type": "truenas-iscsi"}}'
 ```
@@ -95,7 +95,8 @@ cinder manageable-list <host>
 cinder snapshot-manageable-list <host>
 ```
 
-Every zvol in the pool, with whether it can be adopted and why not:
+Every zvol under the configured target, with whether it can be adopted and why
+not:
 
 ```
 reference                              size  safe_to_manage  reason_not_safe
@@ -117,6 +118,11 @@ The `reference` is what you pass to `cinder manage`, verbatim.
 
 ## Adopting a volume
 
+**`<target>` below means whatever `truenas_pool` is set to** — a pool (`tank`)
+or a dataset inside one (`tank/cinder`). Every reference is relative to it, and
+adoption renames into it. See
+[configuration.md](configuration.md).
+
 One disk at a time:
 
 ```bash
@@ -125,7 +131,7 @@ cinder manage \
   --name <name-for-cinder> \
   --volume-type truenas-iscsi \
   --bootable \
-  <host> <pool>/<zvol>
+  <host> <target>/<zvol>
 ```
 
 - `--id-type source-name` is the default, but state it — the alternative
@@ -133,8 +139,11 @@ cinder manage \
 - `--bootable` matters when the zvol holds a VM's root disk. Without it Nova
   will not boot from the resulting volume, and the fix afterwards is
   `cinder set-bootable`.
-- The zvol may be nested. `<pool>/vms/vm-100-disk-0` is a valid identifier;
-  adoption moves it to the pool root under Cinder's naming convention.
+- The zvol may be nested. `<target>/vms/vm-100-disk-0` is a valid identifier;
+  adoption renames it directly under the target, dropping the intermediate
+  path. `tank/vms/vm-100-disk-0` becomes `tank/volume-<uuid>` when
+  `truenas_pool = tank`, and `tank/cinder/volume-<uuid>` when it is
+  `tank/cinder`.
 
 ### Shut the disk down first
 
@@ -300,7 +309,7 @@ adopted individually, and they continue to consume space either way.
 cinder snapshot-manage \
   --id-type source-name \
   --name <name-for-cinder> \
-  <volume> <pool>/<zvol>@<snapshot>
+  <volume> <target>/<zvol>@<snapshot>
 ```
 
 The `<volume>` is the **already-adopted** Cinder volume, and the snapshot must
@@ -323,7 +332,7 @@ cinder snapshot-unmanage <snapshot>
 
 Nothing is deleted on the appliance. Cinder removes the iSCSI export it built,
 and the zvol keeps the name Cinder gave it — so it can be adopted again with
-`<pool>/volume-<uuid>` as the identifier.
+`<target>/volume-<uuid>` as the identifier.
 
 This is the rollback. If an adoption turns out to be wrong, unmanage it; the
 disk is exactly where it was, under a different name.

@@ -35,7 +35,9 @@ enabled_backends = truenas-iscsi
 volume_driver = truenas_cinder_driver.driver.TrueNASISCSIDriver
 volume_backend_name = truenas-iscsi
 
-# Required.
+# Required. A pool name (`tank`), or a dataset inside one
+# (`tank/cinder`) to keep the space Cinder manages in its own dataset.
+# See "Pointing Cinder at a dataset" below.
 truenas_api_url = https://truenas.example.com
 truenas_api_key = <service account API key>
 truenas_pool = tank
@@ -295,9 +297,10 @@ openstack volume manage \
   <pool>/<zvol>
 ```
 
-The reference is the zvol's full path in the pool this backend manages, and it
-may be nested — `Dev-Pool/proxmox/vm-100-disk-0` is fine. Adoption moves it to
-the pool root under Cinder's naming convention.
+The reference is the zvol's full path under whatever `truenas_pool` names, and
+it may be nested — with `truenas_pool = Dev-Pool`,
+`Dev-Pool/proxmox/vm-100-disk-0` is fine. Adoption renames it directly under
+that target, dropping the intermediate path.
 
 ### The export conflict
 
@@ -423,6 +426,49 @@ only **lowercase alphanumerics plus `.`, `-` and `:`**, so the default
 `volume-%s` is fine but a template with an underscore or a capital is not. The
 driver validates the rendered name against the appliance at startup rather than
 letting it fail at the first attach.
+
+## Pointing Cinder at a dataset
+
+`truenas_pool` takes a pool name, or a **dataset path** inside one:
+
+```ini
+truenas_pool = tank          # volumes at the pool root
+truenas_pool = tank/cinder   # volumes inside a dedicated dataset
+```
+
+A ZFS pool name cannot contain `/`, so the separator is what distinguishes
+them. Both are validated at startup: a pool must appear in the appliance's pool
+list, and a dataset must exist and be a **filesystem** — pointing at a zvol is
+refused, because volumes are datasets created inside the target and a zvol
+cannot contain one.
+
+**The driver does not create the dataset.** Make it first, in the TrueNAS UI
+under Datasets. Setup validates; it never changes the appliance.
+
+### Why you might want one
+
+- **Properties scoped to Cinder.** A quota, a `recordsize`, or an exclusion
+  from a periodic snapshot task applies to just the space Cinder manages. At
+  the pool root those come from the pool and cover everything else in it.
+- **A shared appliance stays legible.** Without one, `volume-<uuid>` datasets
+  sit interleaved with unrelated ones at the top level.
+- **Adoption keeps its place.** `cinder manage` renames a zvol into
+  `<truenas_pool>/<volume-name>`, so a dataset target adopts in place rather
+  than lifting disks to the pool root.
+
+### Capacity follows the dataset
+
+With a dataset target, the scheduler is given the **dataset's** available
+space, not the pool's. That matters precisely when a quota is doing its job —
+measured on an appliance, a dataset with a 5 GiB quota reports 5 GiB available
+while its pool reported 96 GiB free. Reporting the pool's figure would have
+Cinder place volumes that cannot be created.
+
+### Choose it before the first volume exists
+
+Changing later means a rename per volume plus a Cinder-side update for each.
+Changing to a different *pool* is worse — that is a full `zfs send | zfs recv`
+per volume rather than a metadata-only rename.
 
 ## Snapshot naming needs a prefix
 

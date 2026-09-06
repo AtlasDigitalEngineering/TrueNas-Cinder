@@ -53,8 +53,12 @@ truenas_opts = [
                     'Marked secret so oslo_config redacts it from logged '
                     'configuration dumps.'),
     cfg.StrOpt('truenas_pool',
-               help='ZFS pool on the appliance in which volumes are '
-                    'created as zvols. Required.'),
+               help='Where volumes are created as zvols: a ZFS pool '
+                    '(tank), or a dataset inside one (tank/cinder) to '
+                    'keep them together and let a quota or other '
+                    'property apply to just this backend. A dataset '
+                    'must already exist and be a filesystem; the driver '
+                    'validates but never creates it. Required.'),
     cfg.IntOpt('truenas_iscsi_portal_id',
                help='ID of the iSCSI portal to export volumes through. '
                     'Only required when the appliance has more than one '
@@ -384,15 +388,89 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
                   '%(url)s: %(err)s')
                 % {'url': self.configuration.truenas_api_url, 'err': exc})
 
+    def _dataset_capacity_gb(self):
+        """Capacity of the configured dataset, not of its pool.
+
+        **Not cosmetic.** A quota is the reason to point Cinder at a
+        dataset in the first place, and the two numbers diverge exactly
+        when it is doing its job: measured on the appliance, a dataset
+        with a 5 GiB quota reports 5 GiB available while its pool
+        reported 96 GiB free. Scheduling against the pool would place
+        volumes that cannot be created, turning the quota from a control
+        into a trap (#116).
+
+        `available` already accounts for the quota, so no arithmetic
+        against `quota` is needed -- and none should be added, since a
+        parent's quota bounds a child that has none of its own.
+
+        Returns:
+            ``(total_gb, free_gb)``
+
+        Raises:
+            VolumeBackendAPIException: If the dataset cannot be read
+        """
+        wanted = self.configuration.truenas_pool
+        try:
+            dataset = self.client.get_dataset(wanted)
+        except api_client.TrueNASAPINotFoundError:
+            # Matching the pool branch's message: a target that existed
+            # at startup and does not now is a different event from an
+            # appliance that will not answer, and says so.
+            raise self._backend_error(
+                _('Dataset %(wanted)r has disappeared from the '
+                  'appliance. It existed when the driver started.')
+                % {'wanted': wanted})
+        except api_client.TrueNASAPIError as exc:
+            raise self._backend_error(
+                _('Could not read capacity for truenas_pool = '
+                  '%(wanted)r from the appliance: %(err)s')
+                % {'wanted': wanted, 'err': exc})
+
+        def parsed(field):
+            value = dataset.get(field) or {}
+            return int(value.get('parsed') or 0)
+
+        available = parsed('available')
+        # Total is what this dataset can hold, which is what it has used
+        # plus what it may still use. There is no field for it: `used`
+        # counts children too, and a dataset without a quota simply
+        # shares the pool's remaining space.
+        return (available + parsed('used')) / GIB, available / GIB
+
+    def _targets_a_dataset(self):
+        """Whether `truenas_pool` names a dataset rather than a pool.
+
+        A ZFS pool name cannot contain `/`, so the separator is the whole
+        test. `tank` is a pool; `tank/cinder` is a dataset inside it.
+
+        Returns:
+            True when the configured value is a dataset path
+        """
+        return '/' in (self.configuration.truenas_pool or '')
+
     def _require_pool_exists(self, pools):
-        """Confirm the configured pool is present on the appliance.
+        """Confirm the configured pool or dataset is present.
+
+        `truenas_pool` may name either a pool (`tank`) or a dataset
+        inside one (`tank/cinder`). The rest of the driver has always
+        handled the second -- paths are built as `<target>/<volume>` and
+        addressed through `/pool/dataset/id/<encoded>`, which takes a
+        full ZFS path -- but this check validated against `GET /pool`,
+        which lists pools only, so a dataset was rejected at startup
+        (#116).
 
         Args:
             pools: Pools as returned by the appliance
 
         Raises:
-            InvalidInput: If the configured pool does not exist
+            InvalidInput: If the configured pool or dataset does not
+                exist, or names a zvol rather than a filesystem
+            VolumeBackendAPIException: If the appliance could not answer
         """
+        if self._targets_a_dataset():
+            self._require_dataset_exists()
+            return
+
         wanted = self.configuration.truenas_pool
         names = [pool.get('name') for pool in pools]
         if wanted not in names:
@@ -403,6 +481,46 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
                 % {'wanted': wanted,
                    'names': ', '.join(
                        sorted(name for name in names if name)) or 'none'})
+
+    def _require_dataset_exists(self):
+        """Confirm a configured dataset path exists and is a filesystem.
+
+        Two distinct mistakes, because they need different fixes: a path
+        that names nothing, and a path that names a **zvol**. The second
+        is the more confusing one -- everything the driver does would
+        appear to work right up to the first create, which would try to
+        make a dataset inside a block device.
+
+        Raises:
+            InvalidInput: If the dataset is absent or is not a filesystem
+            VolumeBackendAPIException: If the appliance could not answer
+        """
+        wanted = self.configuration.truenas_pool
+        parent = wanted.split('/', 1)[0]
+        try:
+            dataset = self.client.get_dataset(wanted)
+        except api_client.TrueNASAPINotFoundError:
+            raise self._config_error(
+                _('truenas_pool = %(wanted)r does not exist on the '
+                  'appliance. It names a dataset inside pool '
+                  '%(parent)r, which the driver does not create -- add '
+                  'it in the TrueNAS UI under Datasets, or set '
+                  'truenas_pool to a pool name.')
+                % {'wanted': wanted, 'parent': parent})
+        except api_client.TrueNASAPIError as exc:
+            raise self._backend_error(
+                _('Could not read truenas_pool = %(wanted)r from the '
+                  'appliance: %(err)s')
+                % {'wanted': wanted, 'err': exc})
+
+        kind = dataset.get('type')
+        if kind != 'FILESYSTEM':
+            raise self._config_error(
+                _('truenas_pool = %(wanted)r is a %(kind)s, not a '
+                  'filesystem. Volumes are datasets created inside this '
+                  'one, which a zvol cannot contain. Set truenas_pool '
+                  'to a filesystem dataset or a pool name.')
+                % {'wanted': wanted, 'kind': kind or 'unknown type'})
 
     def _require_iscsi_service_running(self):
         """Confirm the appliance's iSCSI service is running.
@@ -2411,24 +2529,31 @@ class TrueNASISCSIDriver(san.SanISCSIDriver):
         backend_name = (self.configuration.safe_get('volume_backend_name')
                         or self.__class__.__name__)
 
-        try:
-            pools = self.client.get_pool_list()
-        except api_client.TrueNASAPIError as exc:
-            raise self._backend_error(
-                _('Could not read pool capacity from the TrueNAS '
-                  'appliance: %s') % exc)
+        if self._targets_a_dataset():
+            # A dataset is not in `GET /pool`, so that endpoint is not
+            # consulted at all here -- looking it up first would fail on
+            # the pool name it never contains.
+            total_gb, free_gb = self._dataset_capacity_gb()
+        else:
+            try:
+                pools = self.client.get_pool_list()
+            except api_client.TrueNASAPIError as exc:
+                raise self._backend_error(
+                    _('Could not read pool capacity from the TrueNAS '
+                      'appliance: %s') % exc)
 
-        pool = next((entry for entry in pools
-                     if entry.get('name') == pool_name), None)
-        if pool is None:
-            raise self._backend_error(
-                _('Pool %(pool)r has disappeared from the appliance. '
-                  'It existed when the driver started.')
-                % {'pool': pool_name})
+            pool = next((entry for entry in pools
+                         if entry.get('name') == pool_name), None)
+            if pool is None:
+                raise self._backend_error(
+                    _('Pool %(pool)r has disappeared from the appliance. '
+                      'It existed when the driver started.')
+                    % {'pool': pool_name})
 
-        # Bytes. `free` accounts for reservations; `allocated` does not.
-        total_gb = int(pool.get('size') or 0) / GIB
-        free_gb = int(pool.get('free') or 0) / GIB
+            # Bytes. `free` accounts for reservations; `allocated` does
+            # not.
+            total_gb = int(pool.get('size') or 0) / GIB
+            free_gb = int(pool.get('free') or 0) / GIB
 
         self._stats = {
             'volume_backend_name': backend_name,

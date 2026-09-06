@@ -73,7 +73,8 @@ tests/
     __init__.py
     conftest.py    # fixtures, teardown, skip-if-unconfigured
     iscsi_probe.py # speaks the iSCSI login exchange over a plain socket
-    test_*.py
+    test_*.py      # incl. test_dataset_target.py: the whole lifecycle
+                   #   with truenas_pool naming a dataset, not a pool
   fixtures/        # not tests; inputs the CI jobs lint against
     shellcheck-probe.yml  # deliberately broken, proves shellcheck is on
 tools/
@@ -715,7 +716,13 @@ starts with all of them empty, so "restoring" the call fails CI.
 `ISCSIDriver` version reports `total_capacity_gb=0`, `free_capacity_gb=0` and
 `reserved_percentage=100`, which the scheduler's capacity filter rejects — the
 backend would silently accept no volumes at all, and nothing would say why.
-Capacity comes from `GET /pool`, which reports `size` and `free` in bytes.
+Capacity comes from `GET /pool` — `size` and `free`, in bytes — **unless
+`truenas_pool` names a dataset**, in which case it comes from
+`GET /pool/dataset/id/<path>` and is that dataset's `available` and `used`,
+which are `{parsed: …}` shapes rather than plain integers. That branch is not
+cosmetic: a dataset with a quota reports the quota's remaining space while its
+pool reports the whole disk, and scheduling against the pool would place
+volumes that cannot be created (#116).
 
 **The image installs the driver with `--no-deps`, on purpose.** Its only
 runtime dependency is `requests`, which the Kolla base image already carries

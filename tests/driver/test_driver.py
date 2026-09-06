@@ -189,6 +189,164 @@ class TestDoSetup(DriverTestCase):
         request.assert_not_called()
 
 
+class TestDatasetAsTarget(DriverTestCase):
+    """`truenas_pool` may name a dataset, not just a pool (#116).
+
+    A ZFS pool name cannot contain `/`, so the separator decides which
+    is meant. Everything downstream already handled a dataset path —
+    paths are built as `<target>/<volume>` and addressed through
+    `/pool/dataset/id/<encoded>`, which takes a full ZFS path — only the
+    startup check refused it.
+    """
+
+    DATASET = f'{POOL}/cinder'
+
+    def _filesystem(self, available=50 * 1024 ** 3, used=10 * 1024 ** 3):
+        return {'name': self.DATASET, 'type': 'FILESYSTEM',
+                'available': {'parsed': available},
+                'used': {'parsed': used}}
+
+    def test_a_bare_name_is_still_a_pool(self):
+        self.assertFalse(self._driver()._targets_a_dataset())
+
+    def test_a_path_is_a_dataset(self):
+        driver = self._driver(truenas_pool=self.DATASET)
+
+        self.assertTrue(driver._targets_a_dataset())
+
+    def test_a_dataset_that_exists_passes_setup(self):
+        driver = self._driver(truenas_pool=self.DATASET)
+        driver.client.get_dataset.return_value = self._filesystem()
+
+        driver.check_for_setup_error()
+
+        driver.client.get_dataset.assert_any_call(self.DATASET)
+
+    def test_a_missing_dataset_names_the_pool_it_should_be_in(self):
+        # Different remedy from a wrong pool: the pool is fine and the
+        # dataset has to be created, which the driver will not do.
+        driver = self._driver(truenas_pool=self.DATASET)
+        driver.client.get_dataset.side_effect = (
+            api_client.TrueNASAPINotFoundError('not found'))
+
+        with self.assertRaises(exception.InvalidInput) as caught:
+            driver.check_for_setup_error()
+
+        message = str(caught.exception)
+        self.assertIn(self.DATASET, message)
+        self.assertIn(POOL, message)
+        self.assertIn('does not exist', message)
+
+    def test_a_zvol_is_refused_as_a_target(self):
+        """The confusing mistake, caught at startup.
+
+        Pointing at a zvol would look fine until the first create, which
+        would try to make a dataset inside a block device.
+        """
+        driver = self._driver(truenas_pool=self.DATASET)
+        driver.client.get_dataset.return_value = {
+            'name': self.DATASET, 'type': 'VOLUME'}
+
+        with self.assertRaises(exception.InvalidInput) as caught:
+            driver.check_for_setup_error()
+
+        message = str(caught.exception)
+        self.assertIn('VOLUME', message)
+        self.assertIn('not a filesystem', message)
+
+    def test_an_unreadable_dataset_is_an_appliance_error(self):
+        # Not the operator's configuration: distinguishing them decides
+        # whether they go and edit cinder.conf or go and look at the box.
+        driver = self._driver(truenas_pool=self.DATASET)
+        driver.client.get_dataset.side_effect = (
+            api_client.TrueNASAPIError('connection refused'))
+
+        self.assertRaises(exception.VolumeBackendAPIException,
+                          driver.check_for_setup_error)
+
+    def test_capacity_comes_from_the_dataset_not_the_pool(self):
+        """The reason this is not cosmetic (#116).
+
+        Measured on the appliance: a dataset with a 5 GiB quota reports
+        5 GiB available while its pool reported 96 GiB free. Scheduling
+        against the pool would place volumes that cannot be created —
+        the quota becomes a trap rather than a control.
+        """
+        driver = self._driver(truenas_pool=self.DATASET)
+        driver.client.get_dataset.return_value = self._filesystem(
+            available=5 * 1024 ** 3, used=1 * 1024 ** 3)
+        # The pool reports far more, as it does when a quota is at work.
+        driver.client.get_pool_list.return_value = [
+            {'name': POOL, 'size': 100 * 1024 ** 3, 'free': 96 * 1024 ** 3}]
+
+        driver.check_for_setup_error()
+        stats = driver.get_volume_stats(refresh=True)
+
+        reported = stats['pools'][0]
+        self.assertEqual(reported['free_capacity_gb'], 5)
+        self.assertEqual(reported['total_capacity_gb'], 6)
+
+    def test_a_pool_target_still_reports_pool_capacity(self):
+        # Unchanged for every existing deployment.
+        driver = self._driver()
+        driver.client.get_pool_list.return_value = [
+            {'name': POOL, 'size': 100 * 1024 ** 3, 'free': 96 * 1024 ** 3}]
+
+        driver.check_for_setup_error()
+        stats = driver.get_volume_stats(refresh=True)
+
+        self.assertEqual(stats['pools'][0]['free_capacity_gb'], 96)
+        driver.client.get_dataset.assert_not_called()
+
+    def test_a_dataset_that_vanishes_after_startup_says_so(self):
+        # Symmetry with the pool branch: a target that existed at setup
+        # and does not now is a different event from an appliance that
+        # will not answer, and the operator does different things about
+        # each.
+        driver = self._driver(truenas_pool=self.DATASET)
+        driver.client.get_dataset.return_value = self._filesystem()
+        driver.check_for_setup_error()
+        driver.client.get_dataset.side_effect = (
+            api_client.TrueNASAPINotFoundError('gone'))
+
+        with self.assertRaises(
+                exception.VolumeBackendAPIException) as caught:
+            driver.get_volume_stats(refresh=True)
+
+        self.assertIn('has disappeared', str(caught.exception))
+
+    def test_the_option_help_mentions_the_dataset_form(self):
+        # `oslo-config-generator` and `--help` render this, so it is a
+        # documentation surface like any other (#116).
+        option, = [opt for opt in tnd.TrueNASISCSIDriver.get_driver_options()
+                   if opt.name == 'truenas_pool']
+
+        self.assertIn('dataset', option.help)
+
+    def test_adoption_references_are_relative_to_the_dataset(self):
+        # `_parse_existing_ref` builds both its prefix and its example
+        # from the configured value, so it should need no change — pinned
+        # here because "should" is not "does".
+        driver = self._driver(truenas_pool=self.DATASET)
+
+        name = driver._parse_existing_ref(
+            {'source-name': f'{self.DATASET}/vm-100-disk-0'})
+
+        self.assertEqual(name, 'vm-100-disk-0')
+
+    def test_a_reference_in_the_bare_pool_is_refused_for_a_dataset_target(
+            self):
+        # `Dev-Pool/vm-100` is outside `Dev-Pool/cinder`, and adopting it
+        # would rename a zvol into the dataset from elsewhere in the pool.
+        driver = self._driver(truenas_pool=self.DATASET)
+
+        with self.assertRaises(
+                exception.ManageExistingInvalidReference) as caught:
+            driver._parse_existing_ref({'source-name': f'{POOL}/vm-100'})
+
+        self.assertIn(self.DATASET, str(caught.exception))
+
+
 class TestSnapshotNameTemplate(DriverTestCase):
     """One definition of the Cinder snapshot prefix (#89).
 
