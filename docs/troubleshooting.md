@@ -65,8 +65,17 @@ does not work on TrueNAS 25.10; see [configuration.md](configuration.md).
 
 ### `truenas_pool = '...' does not exist on the appliance`
 
-The message lists the pools that do exist. Note this is the *pool* name, not a
-dataset path.
+For a bare name the message lists the pools that do exist.
+
+For a **dataset path** (`tank/cinder`) it names the pool the dataset should be
+in. The driver does not create datasets — make it in the TrueNAS UI under
+Datasets, or set `truenas_pool` to a pool name.
+
+### `truenas_pool = '...' is a VOLUME, not a filesystem`
+
+The path names a zvol. Volumes are datasets created inside the target, and a
+zvol cannot contain one. Point `truenas_pool` at a filesystem dataset or a
+pool. See [configuration.md](configuration.md).
 
 ### `The iSCSI service on the TrueNAS appliance is STOPPED`
 

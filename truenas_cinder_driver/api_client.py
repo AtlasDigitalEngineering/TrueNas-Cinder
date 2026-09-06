@@ -643,6 +643,31 @@ class TrueNASAPIClient:
         }
         return self._make_request("POST", "/pool/dataset", json=payload)
 
+    def get_dataset(self, path: str) -> Dict[str, Any]:
+        """
+        Get any dataset by its full ZFS path.
+
+        The same endpoint :meth:`get_zvol` uses, addressed by a whole path
+        rather than a pool and a name. A zvol *is* a dataset, so this
+        answers for either -- callers tell them apart by ``type``, which
+        is ``VOLUME`` for a zvol and ``FILESYSTEM`` for a filesystem.
+
+        Exists because `truenas_pool` may name a dataset rather than a
+        pool (#116), and a dataset is not in `GET /pool`.
+
+        Args:
+            path: Full ZFS path, e.g. ``tank/cinder``
+
+        Returns:
+            Dataset metadata, including ``type``, ``available`` and
+            ``used``
+
+        Raises:
+            TrueNASAPINotFoundError: If no such dataset exists
+        """
+        return self._make_request(
+            "GET", f"/pool/dataset/id/{quote(path, safe='')}")
+
     def get_zvol(self, pool: str, name: str) -> Dict[str, Any]:
         """
         Get a single zvol by pool and name.

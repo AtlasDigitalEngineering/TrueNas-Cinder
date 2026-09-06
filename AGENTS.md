@@ -73,7 +73,8 @@ tests/
     __init__.py
     conftest.py    # fixtures, teardown, skip-if-unconfigured
     iscsi_probe.py # speaks the iSCSI login exchange over a plain socket
-    test_*.py
+    test_*.py      # incl. test_dataset_target.py: the whole lifecycle
+                   #   with truenas_pool naming a dataset, not a pool
   fixtures/        # not tests; inputs the CI jobs lint against
     shellcheck-probe.yml  # deliberately broken, proves shellcheck is on
 tools/
